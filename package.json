@@ -14,6 +14,7 @@
 	},
 	"files": [
 		"extension.js",
+		"host-operation-lease.js",
 		"workspace-path.js",
 		"readme.md",
 		"LICENSE.txt"

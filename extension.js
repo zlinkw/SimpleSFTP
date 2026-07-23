@@ -4,6 +4,10 @@ const os = require("os");
 const path = require("path");
 const { execFile, spawn } = require("child_process");
 const { resolveWorkspaceLocation } = require("./workspace-path.js");
+const {
+  HostOperationLeaseConflictError,
+  HostOperationLeaseManager,
+} = require("./host-operation-lease.js");
 const APPDATA = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
 const SHARED_SERVER_DIR = path.join(APPDATA, "SimpleSFTP", "server-profiles");
 const SHARED_SERVER_FILE = path.join(SHARED_SERVER_DIR, "servers.json");
@@ -215,6 +219,7 @@ const PATH_CONFIRMATIONS_STATE = "simple-sftp-confirmed-transfer-paths.v1";
 let extensionContext;
 let serverStatusButton;
 let sharedWatcher;
+const hostOperationLease = new HostOperationLeaseManager();
 
 function activate(context) {
   extensionContext = context;
@@ -528,16 +533,18 @@ async function createOrOpenProject(options = {}) {
     const projectName = path.posix.basename(remotePath);
     const localPath = path.join(target.localBase, projectName);
     const selectedTarget = { ...target.sftp, remotePath };
-    await confirmTransferPath({ localPath, sftp: selectedTarget, operation: "创建 SFTP 工作区", detail: "从远端目录同步到本地工作区" });
-    await writeWorkspace({
-      execHost: target.execHost,
-      localPath,
-      projectName,
-      remotePath,
-      sftp: target.sftp,
-      serverLabel: target.label,
-      userName: target.sftp.username,
-      writeAgentsFile,
+    await withHostOperationLease("create-workspace", "创建 SFTP 工作区", localPath, async () => {
+      await confirmTransferPath({ localPath, sftp: selectedTarget, operation: "创建 SFTP 工作区", detail: "从远端目录同步到本地工作区" });
+      await writeWorkspace({
+        execHost: target.execHost,
+        localPath,
+        projectName,
+        remotePath,
+        sftp: target.sftp,
+        serverLabel: target.label,
+        userName: target.sftp.username,
+        writeAgentsFile,
+      });
     });
 
     const action = await vscode.window.showInformationMessage(
@@ -679,6 +686,10 @@ async function maybePromptForHandoff() {
 }
 
 async function syncFromRemote(options = {}) {
+  return withHostOperationLease("sync-from-remote", "远端同步到本地", getWorkspaceRoot(), () => syncFromRemoteCore(options));
+}
+
+async function syncFromRemoteCore(options = {}) {
   try {
     const workspaceFolder = getPrimaryWorkspaceFolder();
     if (!workspaceFolder) {
@@ -727,6 +738,10 @@ async function syncFromRemote(options = {}) {
 }
 
 async function markHandoffReady() {
+  return withHostOperationLease("mark-handoff-ready", "上传并标记交接", getWorkspaceRoot(), () => markHandoffReadyCore());
+}
+
+async function markHandoffReadyCore() {
   try {
     const workspaceFolder = getPrimaryWorkspaceFolder();
     if (!workspaceFolder) {
@@ -784,6 +799,11 @@ async function markHandoffReady() {
 }
 
 async function uploadWorkspace(options = {}) {
+  const localPath = resolveLocalWorkspacePath(options.localPath, "上传工作区");
+  return withHostOperationLease("upload-workspace", "上传工作区", localPath, () => uploadWorkspaceCore(options));
+}
+
+async function uploadWorkspaceCore(options = {}) {
   try {
     const localPath = resolveLocalWorkspacePath(options.localPath, "上传工作区");
     if (!localPath) throw new Error("请先打开工作区，或传入 localPath。");
@@ -849,6 +869,11 @@ async function uploadManifestLocalFilesToRemote({ localPath, sftp, manifest }) {
 }
 
 async function uploadFiles(options = {}) {
+  const localPath = resolveLocalWorkspacePath(options.localBase || options.localPath, "上传指定文件");
+  return withHostOperationLease("upload-files", "上传指定文件", localPath, () => uploadFilesCore(options));
+}
+
+async function uploadFilesCore(options = {}) {
   let tempDir = "";
   try {
     const localBase = resolveLocalWorkspacePath(options.localBase || options.localPath, "上传指定文件");
@@ -1179,6 +1204,11 @@ function mergeIgnorePatterns(...groups) {
 }
 
 async function configureIgnores(options = {}) {
+  const localPath = resolveLocalWorkspacePath(options.localPath, "配置忽略规则");
+  return withHostOperationLease("configure-ignores", "扫描或更新忽略规则", localPath, () => configureIgnoresCore(options));
+}
+
+async function configureIgnoresCore(options = {}) {
   try {
     const workspaceFolder = getPrimaryWorkspaceFolder();
     const hasTargetOptions = Boolean(options && (options.server || options.remotePath || options.host));
@@ -1419,6 +1449,34 @@ function workspaceLocationForFolder(folder) {
 function getWorkspaceRoot(folder = getPrimaryWorkspaceFolder()) {
   const location = workspaceLocationForFolder(folder);
   return location ? location.hostPath : "";
+}
+
+async function withHostOperationLease(actionType, actionLabel, localPath, operation) {
+  if (process.platform !== "win32") {
+    throw new Error("SimpleSFTP 文件副作用必须由 Windows UI Extension Host 执行。");
+  }
+  const folders = Array.isArray(vscode.workspace.workspaceFolders) ? vscode.workspace.workspaceFolders : [];
+  if (folders.length > 1) {
+    throw new Error("检测到多个工作区文件夹，已阻止 SimpleSFTP 宿主副作用操作。请在独立窗口中只打开一个目标项目。");
+  }
+  const folder = folders[0];
+  const location = folder ? workspaceLocationForFolder(folder) : null;
+  const hostProjectPath = String(location && location.hostPath || localPath || "(未打开工作区)");
+  const workspaceUri = String(location && location.editorUri || folder && folder.uri && folder.uri.toString?.(true) || "untitled://simple-sftp/no-workspace");
+  try {
+    return await hostOperationLease.run({
+      pluginId: "simple-local.simple-sftp",
+      workspaceUri,
+      hostProjectPath,
+      actionType,
+      actionLabel,
+    }, operation);
+  } catch (error) {
+    if (error instanceof HostOperationLeaseConflictError) {
+      await vscode.window.showErrorMessage(error.message, { modal: true }, "知道了");
+    }
+    throw error;
+  }
 }
 
 function workspaceHostPathForUri(uri) {
@@ -1815,6 +1873,10 @@ function enqueueWorkspaceUpload(localPath, task) {
 }
 
 async function uploadChangedLocalFiles({ localPath, sftp }) {
+  return withHostOperationLease("upload-on-save", "保存时上传", localPath, () => uploadChangedLocalFilesCore({ localPath, sftp }));
+}
+
+async function uploadChangedLocalFilesCore({ localPath, sftp }) {
   await confirmTransferPath({ localPath, sftp, operation: "保存时上传", detail: "当前工作区内自上次同步后变更的文件" });
   const scanStartedAt = new Date();
   const changedFiles = findChangedLocalFiles({ localPath, sftp });
@@ -1854,6 +1916,10 @@ async function uploadChangedLocalFiles({ localPath, sftp }) {
 }
 
 async function uploadAllLocalToRemote({ localPath, sftp, writeState = true, pathConfirmed = false }) {
+  return withHostOperationLease("upload-all-files", "上传全部本地文件", localPath, () => uploadAllLocalToRemoteCore({ localPath, sftp, writeState, pathConfirmed }));
+}
+
+async function uploadAllLocalToRemoteCore({ localPath, sftp, writeState = true, pathConfirmed = false }) {
   if (!sftp || !sftp.remotePath || !sftp.host) {
     throw new Error("未配置可用的 SFTP 远端路径。");
   }
@@ -2112,6 +2178,10 @@ function createRemoteExtractCommand(remotePath) {
 }
 
 async function downloadRemoteToLocal({ localPath, sftp }) {
+  return withHostOperationLease("download-workspace", "下载远端工作区", localPath, () => downloadRemoteToLocalCore({ localPath, sftp }));
+}
+
+async function downloadRemoteToLocalCore({ localPath, sftp }) {
   if (!sftp || !sftp.remotePath || !sftp.host) {
     throw new Error("未配置可用的 SFTP 远端路径。");
   }

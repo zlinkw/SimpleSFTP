@@ -71,12 +71,12 @@ test("remote workspace paths map to the Windows host while editor files keep rem
 test("all transfer entry points confirm expected host and remote paths before side effects", () => {
   const ordered = [
     ["createOrOpenProject", "confirmTransferPath", "writeWorkspace"],
-    ["syncFromRemote", "confirmTransferPath", "downloadRemoteToLocal"],
-    ["markHandoffReady", "confirmTransferPath", "writeRemoteHandoffMarker"],
-    ["uploadWorkspace", "confirmTransferPath", "readRemoteCodeManifest"],
-    ["uploadFiles", "confirmTransferPath", "fs.mkdtempSync"],
-    ["configureIgnores", "confirmTransferPath", "getRemoteIgnoreCandidates"],
-    ["uploadChangedLocalFiles", "confirmTransferPath", "findChangedLocalFiles"],
+    ["syncFromRemoteCore", "confirmTransferPath", "downloadRemoteToLocal"],
+    ["markHandoffReadyCore", "confirmTransferPath", "writeRemoteHandoffMarker"],
+    ["uploadWorkspaceCore", "confirmTransferPath", "readRemoteCodeManifest"],
+    ["uploadFilesCore", "confirmTransferPath", "fs.mkdtempSync"],
+    ["configureIgnoresCore", "confirmTransferPath", "getRemoteIgnoreCandidates"],
+    ["uploadChangedLocalFilesCore", "confirmTransferPath", "findChangedLocalFiles"],
   ];
   for (const [name, gate, effect] of ordered) {
     const body = extractFunction(name);
@@ -86,6 +86,25 @@ test("all transfer entry points confirm expected host and remote paths before si
   assert.match(source, /\{ modal: true \}, "仅本次继续", "此后该路径不再提醒", "取消"/);
   assert.match(source, /本地宿主位置：\$\{localPath\}/);
   assert.match(source, /远端预期位置：\$\{String\(sftp && sftp\.remotePath/);
+});
+
+test("all host file side effects acquire the shared operation lease", () => {
+  const leased = [
+    "createOrOpenProject",
+    "syncFromRemote",
+    "markHandoffReady",
+    "uploadWorkspace",
+    "uploadFiles",
+    "configureIgnores",
+    "uploadChangedLocalFiles",
+    "uploadAllLocalToRemote",
+    "downloadRemoteToLocal",
+  ];
+  for (const name of leased) {
+    assert.match(extractFunction(name), /withHostOperationLease\(/, `${name} missing host operation lease`);
+  }
+  assert.match(source, /pluginId: "simple-local\.simple-sftp"/);
+  assert.match(source, /showErrorMessage\(error\.message, \{ modal: true \}, "知道了"\)/);
 });
 
 test("remote saves and workspace configuration use mapped host paths", () => {
