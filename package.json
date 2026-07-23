@@ -2,7 +2,7 @@
 	"name": "simple-sftp",
 	"displayName": "SimpleSFTP",
 	"description": "为远端项目创建本地 SFTP 同步工作区，并提供低频文件上传下载能力。",
-	"version": "0.1.2",
+	"version": "0.1.3",
 	"publisher": "simple-local",
 	"extensionKind": [
 		"ui"
@@ -10,7 +10,7 @@
 	"license": "MIT",
 	"scripts": {
 		"test": "node --check extension.js && node --test test/*.test.js",
-		"package": "npm exec -- @vscode/vsce package --no-dependencies --out simple-sftp-0.1.2.vsix --allow-missing-repository"
+		"package": "npm exec -- @vscode/vsce package --no-dependencies --out simple-sftp-0.1.3.vsix --allow-missing-repository"
 	},
 	"files": [
 		"extension.js",
