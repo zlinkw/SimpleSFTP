@@ -4,6 +4,9 @@
 	"description": "为远端项目创建本地 SFTP 同步工作区，并提供低频文件上传下载能力。",
 	"version": "0.1.2",
 	"publisher": "simple-local",
+	"extensionKind": [
+		"ui"
+	],
 	"license": "MIT",
 	"scripts": {
 		"test": "node --check extension.js && node --test test/*.test.js",
@@ -11,6 +14,7 @@
 	},
 	"files": [
 		"extension.js",
+		"workspace-path.js",
 		"readme.md",
 		"LICENSE.txt"
 	],
@@ -89,6 +93,18 @@
 		"configuration": {
 			"title": "SimpleSFTP",
 			"properties": {
+				"simpleSftp.workspaceHostRoot": {
+					"type": "string",
+					"default": "",
+					"scope": "application",
+					"description": "可选 Windows 宿主工作区根目录。仅用于将 Dev Container 工作区映射到 UI Extension Host；普通 Windows 工作区无需配置。"
+				},
+				"simpleSftp.workspaceContainerRoot": {
+					"type": "string",
+					"default": "",
+					"scope": "application",
+					"description": "可选 Dev Container 工作区根目录，例如 /workspaces。远程工作区上传下载必须同时配置宿主根。"
+				},
 				"simpleSftp.remoteBase": {
 					"type": "string",
 					"default": "",
