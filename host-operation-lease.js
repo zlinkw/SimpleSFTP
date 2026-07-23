@@ -177,17 +177,15 @@ class HostOperationLeaseManager {
     let handle;
     try {
       handle = await fs.promises.open(this.leasePath, "r+");
-      const current = parseHostOperationLeaseRecord(await handle.readFile("utf8"));
+      const currentText = await handle.readFile("utf8");
+      const current = parseHostOperationLeaseRecord(currentText);
       if (!current || current.leaseId !== leaseId || current.windowId !== this.windowId) throw new HostOperationLeaseLostError();
       const now = this.now();
-      const next = {
-        ...current,
-        heartbeatAt: new Date(now).toISOString(),
-        expiresAt: new Date(release ? now : now + this.ttlMs).toISOString(),
-        ...(release ? { releasedAt: new Date(now).toISOString() } : {}),
-      };
-      await handle.truncate(0);
-      await handle.write(`${JSON.stringify(next, null, 2)}\n`, 0, "utf8");
+      const heartbeatAt = new Date(now).toISOString();
+      const expiresAt = new Date(release ? now : now + this.ttlMs).toISOString();
+      // Keep JSON length stable. Truncating first exposes empty or partial lease data to another window.
+      await writeLeaseTimestamp(handle, currentText, "heartbeatAt", heartbeatAt);
+      await writeLeaseTimestamp(handle, currentText, "expiresAt", expiresAt);
       await handle.sync();
     } catch (error) {
       if (hasErrorCode(error, "ENOENT")) throw new HostOperationLeaseLostError();
@@ -196,6 +194,14 @@ class HostOperationLeaseManager {
       await handle?.close().catch(() => undefined);
     }
   }
+}
+
+async function writeLeaseTimestamp(handle, text, field, value) {
+  const match = new RegExp(`"${field}"\\s*:\\s*"([^"]+)"`).exec(text);
+  const offset = match ? match.index + match[0].indexOf(match[1]) : -1;
+  if (offset < 0 || match[1].length !== value.length) throw new HostOperationLeaseLostError("宿主操作租约格式已变化，当前窗口不能继续提交副作用操作。");
+  const bytes = Buffer.from(value, "utf8");
+  await handle.write(bytes, 0, bytes.length, offset);
 }
 
 function defaultHostOperationLeasePath(localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local")) {

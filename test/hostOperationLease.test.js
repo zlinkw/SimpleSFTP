@@ -64,6 +64,21 @@ test("heartbeat keeps the shared lease alive", async () => {
   }
 });
 
+test("heartbeat renewal never exposes partial lease JSON", async () => {
+  const f = fixture();
+  try {
+    const holder = await f.manager("window-a", { ttlMs: 120, heartbeatMs: 5 }).acquire(f.input());
+    for (let index = 0; index < 40; index += 1) {
+      const record = parseHostOperationLeaseRecord(fs.readFileSync(f.leasePath, "utf8"));
+      assert.ok(record, `invalid lease record at iteration ${index}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await holder.release();
+  } finally {
+    f.cleanup();
+  }
+});
+
 test("expired lease can be taken over after a crashed window", async () => {
   const f = fixture();
   try {
