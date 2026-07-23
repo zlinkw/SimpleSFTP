@@ -198,7 +198,8 @@ class HostOperationLeaseManager {
 
 async function writeLeaseTimestamp(handle, text, field, value) {
   const match = new RegExp(`"${field}"\\s*:\\s*"([^"]+)"`).exec(text);
-  const offset = match ? match.index + match[0].indexOf(match[1]) : -1;
+  const valueOffset = match ? match.index + match[0].indexOf(match[1]) : -1;
+  const offset = valueOffset < 0 ? -1 : Buffer.byteLength(text.slice(0, valueOffset), "utf8");
   if (offset < 0 || match[1].length !== value.length) throw new HostOperationLeaseLostError("宿主操作租约格式已变化，当前窗口不能继续提交副作用操作。");
   const bytes = Buffer.from(value, "utf8");
   await handle.write(bytes, 0, bytes.length, offset);
