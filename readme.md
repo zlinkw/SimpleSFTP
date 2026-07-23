@@ -15,6 +15,8 @@
 - 目标级 ignore：编排器传入目标时，ignore 可写入 `zlk_cluster/sftp-target-ignores.json`，不同 Hub/Worker 目标可独立保护。
 - 编排器 manifest 同步：支持 `SimpleExperiment` 调用 `uploadWorkspace` 分发代码，并用 manifest 控制上传文件和远端 prune。
 - 只读目标查看：`SimpleSFTP：查看当前目标` 可显示当前本地目录、远端路径、SSH host、user 和 port。
+- Dev Container 兼容：插件运行于 Windows UI Extension Host 时，将 `/workspaces/<项目>` 映射为 `D:\GitRepo\<项目>`；文件上传、下载、忽略扫描和本地状态写入均使用宿主路径，编辑器仍使用原远程 URI。
+- 文件位置强确认：每次上传、下载、交接、忽略扫描或创建同步工作区前，都会显示本地宿主路径、远端预期路径和文件范围；用户可选择“此后该路径不再提醒”。
 - VS Code UI：状态栏按钮、Explorer 侧边栏视图和命令面板命令均可用。
 
 ## 命令
@@ -36,6 +38,8 @@
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
+| `simpleSftp.workspaceHostRoot` | 空 | Dev Container 工作区对应的 Windows 宿主根目录，例如 `D:\GitRepo`；普通 Windows 工作区无需配置。 |
+| `simpleSftp.workspaceContainerRoot` | 空 | Dev Container 工作区根目录，例如 `/workspaces`；远程工作区必须与宿主根同时配置。 |
 | `simpleSftp.remoteBase` | 空 | 默认远端项目根目录。 |
 | `simpleSftp.localBase` | 空 | 默认本地项目根目录。 |
 | `simpleSftp.sshHost` | 空 | SSH host alias，用于目录浏览和同步。 |
@@ -63,6 +67,14 @@
 - `zlk_cluster/sftp-target-ignores.json`：目标级 ignore 状态。
 
 ## 同步语义
+
+### Dev Container 工作区
+
+插件必须运行在 Windows UI Extension Host。配置 `simpleSftp.workspaceHostRoot=D:\GitRepo` 和 `simpleSftp.workspaceContainerRoot=/workspaces` 后，容器 URI `/workspaces/<项目>` 会映射到 Windows 宿主路径 `D:\GitRepo\<项目>`。Node 文件操作、`tar` 工作目录和本地状态文件使用宿主路径；打开 `.vscode/sftp.json` 等项目文件时保留 `vscode-remote` URI。缺少配置或路径越界时，上传、下载和相关远端操作会在确认窗口前阻断。
+
+### 文件位置确认
+
+文件传输确认窗口展示本地宿主位置、远端预期位置、服务器、远程工作区 URI 和文件范围。选择“仅本次继续”只放行当前操作；选择“此后该路径不再提醒”按本地宿主路径、服务器、端口和远端路径记忆确认。确认记录保存在 VS Code 用户状态，不写入项目或远端目录。
 
 ### 远端同步到本地
 
