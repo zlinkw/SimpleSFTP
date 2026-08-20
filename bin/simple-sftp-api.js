@@ -17,6 +17,9 @@ async function main(argv) {
     console.error("Usage: simple-sftp-api <method> --json <params.json>");
     return 2;
   }
+  if (method === "self-check") {
+    return runSelfCheck();
+  }
   const paramsFile = option(rest, "--json") || option(rest, "--params");
   let params = {};
   if (paramsFile) {
@@ -50,6 +53,67 @@ async function main(argv) {
   }
   console.log(JSON.stringify({ ok: true, result: result && result.result }, null, 2));
   return 0;
+}
+
+async function runSelfCheck() {
+  const checks = [{ name: "cli", ok: true, detail: process.execPath }];
+  if (!fs.existsSync(discoveryPath)) {
+    checks.push({ name: "discovery", ok: false, detail: `missing discovery: ${discoveryPath}` });
+    checks.push({ name: "listener", ok: false, detail: "missing listener: discovery file absent" });
+  } else {
+    let discovery;
+    try {
+      discovery = readDiscovery();
+      checks.push({ name: "discovery", ok: true, detail: discoveryPath });
+    } catch (error) {
+      checks.push({ name: "discovery", ok: false, detail: error.message });
+    }
+    if (discovery) {
+      checks.push(await checkListener(discovery));
+    } else {
+      checks.push({ name: "listener", ok: false, detail: "missing listener: discovery invalid" });
+    }
+  }
+  const ok = checks.every((item) => item.ok);
+  console.log(JSON.stringify({ ok, status: ok ? "ok" : "missing", checks }, null, 2));
+  return ok ? 0 : 1;
+}
+
+function checkListener(discovery) {
+  const url = new URL("/api/v1/health", String(discovery.baseUrl));
+  return new Promise((resolve) => {
+    const req = http.request(
+      {
+        hostname: url.hostname,
+        port: url.port || 80,
+        path: url.pathname,
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${String(discovery.token)}`,
+        },
+        timeout: 3_000,
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (chunk) => chunks.push(chunk));
+        res.on("end", () => {
+          try {
+            const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            if (res.statusCode === 200 && body && body.ok === true) {
+              resolve({ name: "listener", ok: true, detail: `${body.name || discovery.name} ${body.version || discovery.version}` });
+            } else {
+              resolve({ name: "listener", ok: false, detail: `missing listener: HTTP ${res.statusCode}` });
+            }
+          } catch {
+            resolve({ name: "listener", ok: false, detail: `missing listener: invalid health response (HTTP ${res.statusCode})` });
+          }
+        });
+      }
+    );
+    req.on("timeout", () => req.destroy(new Error("health request timed out")));
+    req.on("error", (error) => resolve({ name: "listener", ok: false, detail: `missing listener: ${error.message}` }));
+    req.end();
+  });
 }
 
 function readDiscovery() {

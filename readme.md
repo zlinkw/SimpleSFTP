@@ -1,6 +1,6 @@
 # SimpleSFTP
 
-`SimpleSFTP` 是一个本地 VS Code 扩展，用于在 Windows 本地编辑项目，并通过系统 `ssh`、`tar` 与远端 Linux 项目目录同步。当前版本为 `0.2.0`。
+`SimpleSFTP` 是一个本地 VS Code 扩展，用于在 Windows 本地编辑项目，并通过系统 `ssh`、`tar` 与远端 Linux 项目目录同步。当前版本为 `0.2.2`。
 
 ## 最新功能
 
@@ -247,13 +247,13 @@ npm run package
 手动打包：
 
 ```powershell
-npx --yes @vscode/vsce package --no-dependencies --out simple-sftp-0.2.0.vsix --allow-missing-repository
+npx --yes @vscode/vsce package --no-dependencies --out simple-sftp-0.2.2.vsix --allow-missing-repository
 ```
 
 安装 VSIX：
 
 ```powershell
-code --install-extension .\simple-sftp-0.2.0.vsix --force
+code --install-extension .\simple-sftp-0.2.2.vsix --force
 ```
 
 安装后不需要重启 VS Code；如果当前 extension host 已加载旧版本，VS Code 可能需要之后自然刷新或下次启动才使用新版运行时代码。

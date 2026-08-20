@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const http = require("node:http");
 const net = require("node:net");
@@ -73,6 +74,24 @@ function request(port, requestOptions, body) {
 
 function rpcPayload(method, params = {}) {
   return JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
+}
+
+function runCli(args, extraEnv = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, args, {
+      env: { ...process.env, ...extraEnv },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
 }
 
 async function rpc(port, token, method, params = {}) {
@@ -225,6 +244,34 @@ test("CLI reads the SimpleSFTP discovery file", () => {
   } finally {
     delete process.env.SIMPLE_SFTP_API_FILE;
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("SimpleSFTP self-check reports missing discovery and listener", async () => {
+  const missing = path.join(os.tmpdir(), `simple-sftp-self-check-${process.pid}-${Date.now()}.json`);
+  const result = await runCli([path.join(__dirname, "../bin/simple-sftp-api.js"), "self-check"], {
+    SIMPLE_SFTP_API_FILE: missing,
+  });
+  assert.equal(result.code, 1, result.stderr || "");
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.status, "missing");
+  assert.ok(parsed.checks.some((item) => item.name === "discovery" && !item.ok && item.detail.includes("missing discovery")));
+  assert.ok(parsed.checks.some((item) => item.name === "listener" && !item.ok && item.detail.includes("missing listener")));
+});
+
+test("SimpleSFTP self-check passes with live listener", async () => {
+  const f = await startServer({});
+  try {
+    const result = await runCli([path.join(__dirname, "../bin/simple-sftp-api.js"), "self-check"], {
+      SIMPLE_SFTP_API_FILE: path.join(f.root, "api.json"),
+    });
+    assert.equal(result.code, 0, result.stderr || "");
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.ok, true);
+    assert.ok(parsed.checks.every((item) => item.ok));
+  } finally {
+    await f.cleanup();
   }
 });
 
