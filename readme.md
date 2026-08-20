@@ -1,6 +1,6 @@
 # SimpleSFTP
 
-`SimpleSFTP` 是一个本地 VS Code 扩展，用于在 Windows 本地编辑项目，并通过系统 `ssh`、`tar` 与远端 Linux 项目目录同步。当前版本为 `0.1.3`。
+`SimpleSFTP` 是一个本地 VS Code 扩展，用于在 Windows 本地编辑项目，并通过系统 `ssh`、`tar` 与远端 Linux 项目目录同步。当前版本为 `0.2.0`。
 
 ## 最新功能
 
@@ -17,6 +17,7 @@
 - 只读目标查看：`SimpleSFTP：查看当前目标` 可显示当前本地目录、远端路径、SSH host、user 和 port。
 - Dev Container 兼容：插件运行于 Windows UI Extension Host 时，将 `/workspaces/<项目>` 映射为 `D:\GitRepo\<项目>`；文件上传、下载、忽略扫描和本地状态写入均使用宿主路径，编辑器仍使用原远程 URI。
 - 文件位置强确认：每次上传、下载、交接、忽略扫描或创建同步工作区前，都会显示本地宿主路径、远端预期路径和文件范围；用户可选择“此后该路径不再提醒”。
+- 本机 AI API：通过 `127.0.0.1` 暴露 JSON-RPC 2.0 HTTP 接口和 `simple-sftp-api` CLI，支持参数化完成服务器、项目和上传下载操作，并保留确认门禁。
 - VS Code UI：状态栏按钮、Explorer 侧边栏视图和命令面板命令均可用。
 
 ## 命令
@@ -163,6 +164,66 @@ manifest prune 只删除上一版 manifest 中存在、当前 manifest 中消失
 
 用于为 Hub/Worker 目标配置 ignore。目标级 ignore 不覆盖普通工作区 `.vscode/sftp.json`，而是写入 `zlk_cluster/sftp-target-ignores.json`。
 
+## 本机 API 与 CLI
+
+SimpleSFTP 会在 VS Code extension host 启动时尝试监听 `127.0.0.1:19766`。若端口被占用会向上顺延，实际地址、端口、token、pid 和版本写入：
+
+```text
+%APPDATA%\SimpleSFTP\api.json
+```
+
+端点：
+
+- `POST /api/v1/rpc`：JSON-RPC 2.0 调用。
+- `GET /api/v1/health`：服务健康信息。
+- `GET /api/v1/capabilities`：方法列表和确认门禁说明。
+- `GET /api/v1/openapi.json`：OpenAPI 3.0 文档。
+- `GET /api/v1/events`：有界 SSE 事件流。
+
+请求必须使用 `Authorization: Bearer <token>`，服务只接受本机回环连接。CLI 自动读取 discovery 文件：
+
+```powershell
+simple-sftp-api status
+simple-sftp-api servers.list
+simple-sftp-api upload.workspace --json upload.json
+```
+
+`upload.json` 示例：
+
+```json
+{
+  "localPath": "D:\\GitRepo\\demo",
+  "remotePath": "/data/demo",
+  "server": {
+    "host": "127.0.0.1",
+    "user": "demo",
+    "port": 22
+  },
+  "confirm": true,
+  "pathConfirmed": true
+}
+```
+
+危险操作必须显式传 `confirm: true`。SFTP 路径动作还需要 `pathConfirmed: true`，或者本地宿主路径、服务器和远端路径已存在于既有“不再提醒”记录中。缺少确认时返回 `CONFIRM_REQUIRED` 和目标预览，不会触发上传、下载、目录写入或远端任务。
+
+公开方法：
+
+- `status`
+- `servers.list`
+- `servers.setActive`
+- `servers.importSshConfig`
+- `remote.listDirs`
+- `target.show`
+- `project.create`
+- `sync.fromRemote`
+- `upload.workspace`
+- `upload.files`
+- `handoff.markReady`
+- `ignores.configure`
+- `confirmations.reset`
+
+`ignores.configure` 可通过 `ignore` 全量替换规则，也可通过 `patterns`、`add`、`remove` 增量修改。`handoff.markReady` 使用 `upload: true` 表示上传全部后写入交接标记，默认仅标记。
+
 ## SSH 与端口
 
 所有 SSH 命令通过系统 `ssh` 执行。host 可为普通主机名，也可为 `user@host` 格式。若 host 已包含 `@`，扩展不会重复拼接 username。
@@ -186,13 +247,13 @@ npm run package
 手动打包：
 
 ```powershell
-npx --yes @vscode/vsce package --no-dependencies --out simple-sftp-0.1.3.vsix --allow-missing-repository
+npx --yes @vscode/vsce package --no-dependencies --out simple-sftp-0.2.0.vsix --allow-missing-repository
 ```
 
 安装 VSIX：
 
 ```powershell
-code --install-extension .\simple-sftp-0.1.3.vsix --force
+code --install-extension .\simple-sftp-0.2.0.vsix --force
 ```
 
 安装后不需要重启 VS Code；如果当前 extension host 已加载旧版本，VS Code 可能需要之后自然刷新或下次启动才使用新版运行时代码。

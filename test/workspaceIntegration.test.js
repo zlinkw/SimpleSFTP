@@ -84,8 +84,8 @@ test("all transfer entry points confirm expected host and remote paths before si
     assert.ok(body.indexOf(gate) < body.indexOf(effect), `${name} confirms after ${effect}`);
   }
   assert.match(source, /\{ modal: true \}, "仅本次继续", "此后该路径不再提醒", "取消"/);
-  assert.match(source, /本地宿主位置：\$\{localPath\}/);
-  assert.match(source, /远端预期位置：\$\{String\(sftp && sftp\.remotePath/);
+  assert.match(source, /本地宿主位置：\$\{preview\.localPath\}/);
+  assert.match(source, /远端预期位置：\$\{preview\.remotePath\}/);
 });
 
 test("all host file side effects acquire the shared operation lease", () => {

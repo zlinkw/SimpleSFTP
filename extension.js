@@ -4,10 +4,12 @@ const os = require("os");
 const path = require("path");
 const { execFile, spawn } = require("child_process");
 const { resolveWorkspaceLocation } = require("./workspace-path.js");
+const { LocalApiServer, confirmationRequired } = require("./api-server.js");
 const {
   HostOperationLeaseConflictError,
   HostOperationLeaseManager,
 } = require("./host-operation-lease.js");
+const PACKAGE_JSON = require("./package.json");
 const APPDATA = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
 const SHARED_SERVER_DIR = path.join(APPDATA, "SimpleSFTP", "server-profiles");
 const SHARED_SERVER_FILE = path.join(SHARED_SERVER_DIR, "servers.json");
@@ -217,6 +219,7 @@ const SAVE_UPLOAD_STATE = "simple-sftp-upload-state.json";
 const TARGET_IGNORE_STATE = "sftp-target-ignores.json";
 const PATH_CONFIRMATIONS_STATE = "simple-sftp-confirmed-transfer-paths.v1";
 let extensionContext;
+let localApiServer;
 let serverStatusButton;
 let sharedWatcher;
 const hostOperationLease = new HostOperationLeaseManager();
@@ -315,6 +318,27 @@ function activate(context) {
   void maybePromptForHandoff().catch((error) => {
     vscode.window.showWarningMessage(`SimpleSFTP 工作区路径检查失败：${formatError(error)}`);
   });
+  startLocalApiServer(context);
+}
+
+function startLocalApiServer(context) {
+  const server = new LocalApiServer({
+    name: "SimpleSFTP",
+    version: String(PACKAGE_JSON.version || "0.2.0"),
+    preferredPort: 19766,
+    discoveryPath: path.join(APPDATA, "SimpleSFTP", "api.json"),
+    methods: createLocalApiMethods(),
+  });
+  localApiServer = server;
+  context.subscriptions.push({
+    dispose: () => {
+      void server.dispose().catch(() => undefined);
+    },
+  });
+  void server.start().catch((error) => {
+    console.warn(`SimpleSFTP local API failed to start: ${formatError(error)}`);
+  });
+  return server;
 }
 
 function createStatusButton(text, tooltip, command, priority) {
@@ -428,6 +452,13 @@ async function openSharedServerConfig() {
 }
 
 async function importSharedSshConfig() {
+  const result = importSharedSshConfigCore();
+  updateServerStatusButton();
+  vscode.window.showInformationMessage(`已导入 ${result.imported} 个 SSH 配置。`);
+  return result;
+}
+
+function importSharedSshConfigCore() {
   const imported = readProfilesFromSshConfig();
   const data = readSharedServers();
   const byId = new Map(data.servers.map((item) => [item.id, item]));
@@ -435,8 +466,7 @@ async function importSharedSshConfig() {
   const next = { ...data, servers: [...byId.values()] };
   if (!next.activeServerId && next.servers[0]) next.activeServerId = next.servers[0].id;
   writeSharedServers(next);
-  updateServerStatusButton();
-  vscode.window.showInformationMessage(`已导入 ${imported.length} 个 SSH 配置。`);
+  return { ok: true, imported: imported.length, activeServerId: next.activeServerId };
 }
 
 function readProfilesFromSshConfig() {
@@ -527,14 +557,26 @@ async function createOrOpenProject(options = {}) {
     const target = resolveCreateProjectTarget(getActiveSharedServer(), cfg, options);
     const writeAgentsFile = cfg.get("writeAgentsFile");
 
-    const remotePath = await pickRemoteDirectory({ remoteBase: target.remoteBase, sftp: target.sftp });
-    if (!remotePath) return;
+    const remotePath = options.apiMode
+      ? String(options.remotePath || "").trim().replace(/\/+$/, "")
+      : await pickRemoteDirectory({ remoteBase: target.remoteBase, sftp: target.sftp });
+    if (!remotePath) {
+      const message = "缺少远端项目目录 remotePath。";
+      if (options.apiMode) throw new Error(message);
+      return;
+    }
 
     const projectName = path.posix.basename(remotePath);
-    const localPath = path.join(target.localBase, projectName);
+    const localPath = String(options.localPath || path.join(target.localBase, projectName)).trim();
     const selectedTarget = { ...target.sftp, remotePath };
     await withHostOperationLease("create-workspace", "创建 SFTP 工作区", localPath, async () => {
-      await confirmTransferPath({ localPath, sftp: selectedTarget, operation: "创建 SFTP 工作区", detail: "从远端目录同步到本地工作区" });
+      await confirmTransferPath({
+        localPath,
+        sftp: selectedTarget,
+        operation: "创建 SFTP 工作区",
+        detail: "从远端目录同步到本地工作区",
+        options,
+      });
       await writeWorkspace({
         execHost: target.execHost,
         localPath,
@@ -546,6 +588,17 @@ async function createOrOpenProject(options = {}) {
         writeAgentsFile,
       });
     });
+
+    if (options.apiMode) {
+      return {
+        ok: true,
+        localPath,
+        remotePath,
+        host: selectedTarget.host,
+        username: selectedTarget.username || "",
+        port: normalizeSshPort(selectedTarget.port, 22),
+      };
+    }
 
     const action = await vscode.window.showInformationMessage(
       `已创建 SFTP 工作区：${localPath}`,
@@ -560,6 +613,7 @@ async function createOrOpenProject(options = {}) {
       await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(localPath), false);
     }
   } catch (error) {
+    if (options.apiMode) throw error;
     vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
   }
 }
@@ -601,23 +655,25 @@ function assertCreateProjectTarget({ host, remoteBase, localBase }) {
   if (missing.length) throw new Error(`SFTP 项目目标配置缺失：${missing.join("、")}。`);
 }
 
-async function showCurrentTarget() {
+async function showCurrentTarget(options = {}) {
   const workspaceFolder = getPrimaryWorkspaceFolder();
-  if (!workspaceFolder) {
-    vscode.window.showInformationMessage("当前未打开工作区。");
-    return null;
+  if (!workspaceFolder && !options.localPath) {
+    if (!options.apiMode) vscode.window.showInformationMessage("当前未打开工作区。");
+    return { ok: false, error: "当前未打开工作区。请传入 localPath。" };
   }
-  const localPath = getWorkspaceRoot();
+  const localPath = String(options.localPath || getWorkspaceRoot()).trim();
   const sftp = readSftpConfig(localPath);
   if (!sftp || !sftp.remotePath || !sftp.host) {
-    vscode.window.showInformationMessage("当前工作区没有可用的 .vscode/sftp.json 目标。");
-    return null;
+    if (!options.apiMode) vscode.window.showInformationMessage("当前工作区没有可用的 .vscode/sftp.json 目标。");
+    return { ok: false, error: "当前工作区没有可用的 .vscode/sftp.json 目标。" };
   }
   const location = workspaceLocationForFolder(workspaceFolder);
   const summary = `${formatSftpTargetSummary(localPath, sftp)}${location && location.remote ? ` | 工作区 ${location.editorUri}` : ""}`;
-  const action = await vscode.window.showInformationMessage(summary, "打开 sftp.json");
-  if (action === "打开 sftp.json") {
-    await openWorkspaceRelativeFile(".vscode/sftp.json");
+  if (!options.apiMode) {
+    const action = await vscode.window.showInformationMessage(summary, "打开 sftp.json");
+    if (action === "打开 sftp.json") {
+      await openWorkspaceRelativeFile(".vscode/sftp.json");
+    }
   }
   return {
     ok: true,
@@ -686,30 +742,35 @@ async function maybePromptForHandoff() {
 }
 
 async function syncFromRemote(options = {}) {
-  return withHostOperationLease("sync-from-remote", "远端同步到本地", getWorkspaceRoot(), () => syncFromRemoteCore(options));
+  const localPath = resolveLocalWorkspacePath(options.localPath, "远端同步到本地");
+  return withHostOperationLease("sync-from-remote", "远端同步到本地", localPath, () => syncFromRemoteCore({ ...options, localPath }));
 }
 
 async function syncFromRemoteCore(options = {}) {
   try {
     const workspaceFolder = getPrimaryWorkspaceFolder();
-    if (!workspaceFolder) {
-      vscode.window.showErrorMessage("请先打开 SimpleSFTP 工作区。");
-      return;
+    if (!workspaceFolder && !options.localPath) {
+      const message = "请先打开 SimpleSFTP 工作区，或传入 localPath。";
+      if (options.apiMode) throw new Error(message);
+      vscode.window.showErrorMessage(message);
+      return { ok: false, error: message };
     }
 
-    const localPath = getWorkspaceRoot();
+    const localPath = String(options.localPath || getWorkspaceRoot()).trim();
     const sftp = readSftpConfig(localPath);
     if (!sftp) {
-      vscode.window.showErrorMessage("当前工作区未找到 .vscode/sftp.json。");
-      return;
+      const message = "当前工作区未找到 .vscode/sftp.json。";
+      if (options.apiMode) throw new Error(message);
+      vscode.window.showErrorMessage(message);
+      return { ok: false, error: message };
     }
 
-    await confirmTransferPath({ localPath, sftp, operation: "远端同步到本地", detail: "远端项目文件覆盖到当前工作区" });
+    await confirmTransferPath({ localPath, sftp, operation: "远端同步到本地", detail: "远端项目文件覆盖到当前工作区", options });
 
     const cfg = vscode.workspace.getConfiguration("simpleSftp");
     const markerName = cfg.get("handoffMarkerName") || DEFAULT_HANDOFF_MARKER;
     const marker = await readRemoteHandoffMarker(sftp, markerName).catch(() => null);
-    if (options.confirmMarker !== false && marker) {
+    if (!options.apiMode && options.confirmMarker !== false && marker) {
       const action = await vscode.window.showInformationMessage(
         `上次交接上传：${marker.device || "未知设备"}，时间 ${formatTime(marker.markedAt)}。是否继续从远端同步到本地？`,
         "继续",
@@ -731,42 +792,61 @@ async function syncFromRemoteCore(options = {}) {
       mode: "remoteToLocal",
       remotePath: sftp.remotePath,
     });
+    if (options.apiMode) {
+      return {
+        ok: true,
+        localPath,
+        remotePath: sftp.remotePath,
+        downloadedAt: syncStartedAt.toISOString(),
+      };
+    }
     vscode.window.showInformationMessage("SimpleSFTP 已完成远端到本地同步。");
   } catch (error) {
+    if (options.apiMode) throw error;
     vscode.window.showErrorMessage(`启动远端到本地同步失败：${formatError(error)}`);
   }
 }
 
-async function markHandoffReady() {
-  return withHostOperationLease("mark-handoff-ready", "上传并标记交接", getWorkspaceRoot(), () => markHandoffReadyCore());
+async function markHandoffReady(options = {}) {
+  const localPath = resolveLocalWorkspacePath(options.localPath, "上传并标记交接");
+  return withHostOperationLease("mark-handoff-ready", "上传并标记交接", localPath, () => markHandoffReadyCore({ ...options, localPath }));
 }
 
-async function markHandoffReadyCore() {
+async function markHandoffReadyCore(options = {}) {
   try {
     const workspaceFolder = getPrimaryWorkspaceFolder();
-    if (!workspaceFolder) {
-      vscode.window.showErrorMessage("请先打开 SimpleSFTP 工作区。");
-      return;
+    const localPath = String(options.localPath || getWorkspaceRoot() || "").trim();
+    if (!workspaceFolder && !localPath) {
+      const message = "请先打开 SimpleSFTP 工作区，或由调用方传入 localPath。";
+      if (options.apiMode) throw new Error(message);
+      vscode.window.showErrorMessage(message);
+      return { ok: false, error: message };
     }
-
-    const localPath = getWorkspaceRoot();
     const sftp = readSftpConfig(localPath);
     if (!sftp || !sftp.remotePath || !sftp.host) {
-      vscode.window.showErrorMessage("当前工作区没有可用的 .vscode/sftp.json。");
-      return;
+      const message = "当前工作区没有可用的 .vscode/sftp.json。";
+      if (options.apiMode) throw new Error(message);
+      vscode.window.showErrorMessage(message);
+      return { ok: false, error: message };
     }
 
-    await confirmTransferPath({ localPath, sftp, operation: "写入交接标记", detail: "远端项目交接标记；若选择上传则包含全部本地文件" });
+    await confirmTransferPath({ localPath, sftp, operation: "写入交接标记", detail: "远端项目交接标记；若选择上传则包含全部本地文件", options });
 
-    const action = await vscode.window.showInformationMessage(
-      "是否先上传全部本地代码，再把该项目标记为可交接到下一台设备？",
-      "上传全部并标记",
-      "仅标记",
-      "取消"
-    );
-    if (!action || action === "取消") return;
+    let uploadRequested = false;
+    if (options.apiMode) {
+      uploadRequested = options.upload === true;
+    } else {
+      const action = await vscode.window.showInformationMessage(
+        "是否先上传全部本地代码，再把该项目标记为可交接到下一台设备？",
+        "上传全部并标记",
+        "仅标记",
+        "取消"
+      );
+      if (!action || action === "取消") return { ok: false, cancelled: true };
+      uploadRequested = action === "上传全部并标记";
+    }
 
-    if (action === "上传全部并标记") {
+    if (uploadRequested) {
       await uploadAllLocalToRemote({ localPath, sftp, pathConfirmed: true });
     }
 
@@ -778,8 +858,8 @@ async function markHandoffReadyCore() {
       device: getDeviceName(),
       user: os.userInfo().username,
       markedAt: new Date().toISOString(),
-      uploadRequested: action === "上传全部并标记",
-      uploadMode: action === "上传全部并标记" ? "all" : "none",
+      uploadRequested,
+      uploadMode: uploadRequested ? "all" : "none",
     };
 
     const cfg = vscode.workspace.getConfiguration("simpleSftp");
@@ -790,10 +870,18 @@ async function markHandoffReadyCore() {
       ...marker,
     });
 
-    vscode.window.showInformationMessage(
-      `SimpleSFTP 已由 ${marker.device} 写入交接标记。`
-    );
+    if (options.apiMode) {
+      return {
+        ok: true,
+        localPath,
+        remotePath: sftp.remotePath,
+        markedAt: marker.markedAt,
+        uploadRequested,
+      };
+    }
+    vscode.window.showInformationMessage(`SimpleSFTP 已由 ${marker.device} 写入交接标记。`);
   } catch (error) {
+    if (options.apiMode) throw error;
     vscode.window.showErrorMessage(`写入交接标记失败：${formatError(error)}`);
   }
 }
@@ -811,7 +899,7 @@ async function uploadWorkspaceCore(options = {}) {
     if (!sftp || !sftp.remotePath || !sftp.host) {
       throw new Error("未提供可用的 SFTP 目标。");
     }
-    await confirmTransferPath({ localPath, sftp, operation: "上传工作区", detail: options.manifest ? "manifest 指定代码文件" : "当前工作区内未被忽略的文件" });
+    await confirmTransferPath({ localPath, sftp, operation: "上传工作区", detail: options.manifest ? "manifest 指定代码文件" : "当前工作区内未被忽略的文件", options });
     const state = createCodeSyncState(sftp, options);
     const manifest = getManagedManifest(options.manifest);
     const previousManifest = manifest && options.pruneManagedFiles !== false
@@ -843,6 +931,7 @@ async function uploadWorkspaceCore(options = {}) {
       deletedRemoteFiles: prune.deleted,
     };
   } catch (error) {
+    if (options.apiMode) throw error;
     const message = `上传工作区失败：${formatError(error)}`;
     vscode.window.showErrorMessage(message);
     return { ok: false, error: message };
@@ -882,7 +971,7 @@ async function uploadFilesCore(options = {}) {
     if (!sftp || !sftp.remotePath || !sftp.host) throw new Error("没有可用的 SFTP 上传目标。");
     const files = Array.isArray(options.files) ? options.files : [];
     if (!files.length && !options.manifest) throw new Error("没有要上传的文件。");
-    await confirmTransferPath({ localPath: localBase, sftp, operation: "上传指定文件", detail: filesSummary(options.files) });
+    await confirmTransferPath({ localPath: localBase, sftp, operation: "上传指定文件", detail: filesSummary(options.files), options });
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-files-"));
     const relativePaths = [];
     for (const item of files) {
@@ -923,6 +1012,7 @@ async function uploadFilesCore(options = {}) {
       uploadedAt: new Date().toISOString(),
     };
   } catch (error) {
+    if (options.apiMode) throw error;
     const message = `上传指定文件失败：${formatError(error)}`;
     vscode.window.showErrorMessage(message);
     return { ok: false, error: message };
@@ -1225,45 +1315,66 @@ async function configureIgnoresCore(options = {}) {
       return { ok: false, error: message };
     }
 
-    await confirmTransferPath({ localPath, sftp, operation: "扫描或更新忽略规则", detail: "远端候选扫描及目标级忽略状态" });
+    await confirmTransferPath({ localPath, sftp, operation: "扫描或更新忽略规则", detail: "远端候选扫描及目标级忽略状态", options });
 
-    const currentIgnores = new Set(Array.isArray(sftp.ignore) ? sftp.ignore : []);
-    const detectedRemoteItems = await getRemoteIgnoreCandidates(sftp).catch((error) => {
-      vscode.window.showWarningMessage(
-        `无法扫描远端忽略候选项：${formatError(error)}`
-      );
-      return [];
-    });
-
-    const items = buildIgnoreQuickPickItems(currentIgnores, detectedRemoteItems);
-    const selected = await vscode.window.showQuickPick(items, {
-      canPickMany: true,
-      ignoreFocusOut: true,
-      matchOnDescription: true,
-      matchOnDetail: true,
-      placeHolder: "选择不需要同步的远端文件、文件夹或规则组",
-      title: `配置忽略规则：${sftp.remotePath}`,
-    });
-    if (!selected) return { ok: false, cancelled: true };
-
-    const nextIgnores = new Set();
-    for (const item of selected) {
-      if (!item.patterns) continue;
-      for (const pattern of item.patterns) {
-        nextIgnores.add(pattern);
+    const nextIgnores = new Set(Array.isArray(sftp.ignore) ? sftp.ignore : []);
+    if (options.apiMode) {
+      if (Array.isArray(options.ignore)) {
+        nextIgnores.clear();
+        for (const pattern of options.ignore) {
+          const value = String(pattern || "").trim();
+          if (value) nextIgnores.add(value.replace(/\\/g, "/"));
+        }
+      } else {
+        for (const group of [options.patterns, options.add]) {
+          for (const pattern of Array.isArray(group) ? group : []) {
+            const value = String(pattern || "").trim();
+            if (value) nextIgnores.add(value.replace(/\\/g, "/"));
+          }
+        }
+        for (const pattern of Array.isArray(options.remove) ? options.remove : []) {
+          const value = String(pattern || "").trim();
+          if (value) nextIgnores.delete(value.replace(/\\/g, "/"));
+        }
       }
-    }
+    } else {
+      const currentIgnores = new Set(nextIgnores);
+      const detectedRemoteItems = await getRemoteIgnoreCandidates(sftp).catch((error) => {
+        vscode.window.showWarningMessage(
+          `无法扫描远端忽略候选项：${formatError(error)}`
+        );
+        return [];
+      });
 
-    const custom = await vscode.window.showInputBox({
-      title: "可选：自定义忽略规则",
-      prompt: "多个规则用英文逗号分隔；留空则不追加。",
-      placeHolder: "示例：*.tmp, debug_outputs, experiments/cache",
-      ignoreFocusOut: true,
-    });
-    if (custom) {
-      for (const pattern of custom.split(",")) {
-        const value = pattern.trim();
-        if (value) nextIgnores.add(value.replace(/\\/g, "/"));
+      const items = buildIgnoreQuickPickItems(currentIgnores, detectedRemoteItems);
+      const selected = await vscode.window.showQuickPick(items, {
+        canPickMany: true,
+        ignoreFocusOut: true,
+        matchOnDescription: true,
+        matchOnDetail: true,
+        placeHolder: "选择不需要同步的远端文件、文件夹或规则组",
+        title: `配置忽略规则：${sftp.remotePath}`,
+      });
+      if (!selected) return { ok: false, cancelled: true };
+      nextIgnores.clear();
+      for (const item of selected) {
+        if (!item.patterns) continue;
+        for (const pattern of item.patterns) {
+          nextIgnores.add(pattern);
+        }
+      }
+
+      const custom = await vscode.window.showInputBox({
+        title: "可选：自定义忽略规则",
+        prompt: "多个规则用英文逗号分隔；留空则不追加。",
+        placeHolder: "示例：*.tmp, debug_outputs, experiments/cache",
+        ignoreFocusOut: true,
+      });
+      if (custom) {
+        for (const pattern of custom.split(",")) {
+          const value = pattern.trim();
+          if (value) nextIgnores.add(value.replace(/\\/g, "/"));
+        }
       }
     }
 
@@ -1274,18 +1385,21 @@ async function configureIgnoresCore(options = {}) {
       fs.writeFileSync(sftpPath, `${JSON.stringify(sftp, null, 2)}\n`, "utf8");
     }
 
-    const action = await vscode.window.showInformationMessage(
-      `已更新 SFTP 忽略规则：${sftp.ignore.length} 条。`,
-      hasTargetOptions ? "打开目标忽略状态" : "打开 sftp.json"
-    );
-    if (action === "打开 sftp.json") {
-      await openWorkspaceRelativeFile(".vscode/sftp.json");
-    }
-    if (action === "打开目标忽略状态") {
-      await openWorkspaceRelativeFile(`zlk_cluster/${TARGET_IGNORE_STATE}`);
+    if (!options.apiMode) {
+      const action = await vscode.window.showInformationMessage(
+        `已更新 SFTP 忽略规则：${sftp.ignore.length} 条。`,
+        hasTargetOptions ? "打开目标忽略状态" : "打开 sftp.json"
+      );
+      if (action === "打开 sftp.json") {
+        await openWorkspaceRelativeFile(".vscode/sftp.json");
+      }
+      if (action === "打开目标忽略状态") {
+        await openWorkspaceRelativeFile(`zlk_cluster/${TARGET_IGNORE_STATE}`);
+      }
     }
     return { ok: true, targetId: targetIgnoreKey(options, sftp), remotePath: sftp.remotePath, ignore: sftp.ignore };
   } catch (error) {
+    if (options.apiMode) throw error;
     const message = `配置忽略规则失败：${formatError(error)}`;
     vscode.window.showErrorMessage(message);
     return { ok: false, error: message };
@@ -1558,12 +1672,21 @@ function transferPathConfirmationKey(localPath, sftp) {
   return `${local}|${host}:${port}|${remote}`;
 }
 
-async function confirmTransferPath({ localPath, sftp, operation, detail }) {
+async function confirmTransferPath({ localPath, sftp, operation, detail, options = {} }) {
   const key = transferPathConfirmationKey(localPath, sftp);
   const remembered = extensionContext && extensionContext.globalState
     ? extensionContext.globalState.get(PATH_CONFIRMATIONS_STATE, [])
     : [];
   if (Array.isArray(remembered) && remembered.includes(key)) return true;
+  const preview = createTransferPreview({ localPath, sftp, operation, detail });
+
+  if (options && options.apiMode) {
+    const requires = [];
+    if (options.confirm !== true) requires.push("confirm");
+    if (options.pathConfirmed !== true) requires.push("pathConfirmed");
+    if (requires.length) throw confirmationRequired({ ...preview, requires });
+    return true;
+  }
 
   const currentLocation = (() => {
     try { return workspaceLocationForFolder(getPrimaryWorkspaceFolder()); } catch { return null; }
@@ -1572,18 +1695,19 @@ async function confirmTransferPath({ localPath, sftp, operation, detail }) {
     const relative = path.win32.relative(currentLocation.hostPath, path.win32.normalize(String(localPath || "")));
     return relative === "" || (!relative.startsWith(`..${path.win32.sep}`) && relative !== ".." && !path.win32.isAbsolute(relative));
   })();
-  const answer = await vscode.window.showWarningMessage([
-    "【SimpleSFTP 文件位置确认】",
-    "",
-    `操作：${operation || "文件传输"}`,
-    `本地宿主位置：${localPath}`,
-    `远端预期位置：${String(sftp && sftp.remotePath || "-")}`,
-    `服务器：${String(sftp && sftp.username || "")}${sftp && sftp.username ? "@" : ""}${String(sftp && sftp.host || "-")}:${normalizeSshPort(sftp && sftp.port, 22)}`,
-    currentUriMatches ? `远程工作区 URI：${currentLocation.editorUri}` : "",
-    detail ? `文件范围：${detail}` : "",
-    "",
-    "请确认本地宿主位置和远端预期位置均正确后再继续。",
-  ].filter(Boolean).join("\n"), { modal: true }, "仅本次继续", "此后该路径不再提醒", "取消");
+  const answer = await vscode.window.showWarningMessage(
+    [
+      "【SimpleSFTP 文件位置确认】",
+      "",
+      `操作：${preview.operation}`,
+      `本地宿主位置：${preview.localPath}`,
+      `远端预期位置：${preview.remotePath}`,
+      `服务器：${preview.username}${preview.username ? "@" : ""}${preview.host}:${preview.port}`,
+      currentUriMatches ? `远程工作区 URI：${currentLocation.editorUri}` : "",
+      preview.detail ? `文件范围：${preview.detail}` : "",
+      "",
+      "请确认本地宿主位置和远端预期位置均正确后再继续。",
+    ].filter(Boolean).join("\n"), { modal: true }, "仅本次继续", "此后该路径不再提醒", "取消");
   if (answer === "此后该路径不再提醒") {
     if (extensionContext && extensionContext.globalState) {
       const next = [...new Set([...(Array.isArray(remembered) ? remembered : []), key])].slice(-100);
@@ -1593,6 +1717,335 @@ async function confirmTransferPath({ localPath, sftp, operation, detail }) {
   }
   if (answer === "仅本次继续") return true;
   throw new Error("用户取消了 SimpleSFTP 文件位置确认。");
+}
+
+function createTransferPreview({ localPath, sftp, operation, detail }) {
+  return {
+    operation: operation || "文件传输",
+    detail: detail || "",
+    localPath: String(localPath || ""),
+    remotePath: String(sftp && sftp.remotePath || ""),
+    host: String(sftp && sftp.host || ""),
+    port: normalizeSshPort(sftp && sftp.port, 22),
+    username: String(sftp && sftp.username || ""),
+  };
+}
+
+function createLocalApiMethods() {
+  return {
+    status: async () => {
+      const active = getActiveSharedServer();
+      return {
+        ok: true,
+        plugin: "SimpleSFTP",
+        version: String(PACKAGE_JSON.version || "0.2.0"),
+        activeServer: active ? publicServerRecord(active) : null,
+        api: localApiServer
+          ? { port: localApiServer.port, pid: localApiServer.startedAt ? process.pid : 0, startedAt: localApiServer.startedAt }
+          : null,
+      };
+    },
+    "servers.list": async () => {
+      const data = readSharedServers();
+      return {
+        ok: true,
+        activeServerId: data.activeServerId,
+        servers: data.servers.map(publicServerRecord),
+      };
+    },
+    "servers.setActive": async (params = {}) => {
+      const id = String(params.id || params.serverId || "").trim();
+      const data = readSharedServers();
+      const server = data.servers.find((item) => item && item.id === id);
+      if (!server) throw new Error("未找到指定服务器：" + (id || "-"));
+      requireApiConfirmation(params, {
+        method: "servers.setActive",
+        operation: "切换 SimpleSFTP 活动服务器",
+        sftp: server,
+        localPath: "",
+        pathRequired: false,
+      });
+      writeSharedServers({ ...data, activeServerId: id });
+      updateServerStatusButton();
+      publishLocalApiEvent("servers.setActive", { activeServerId: id });
+      return { ok: true, activeServerId: id, server: publicServerRecord(server) };
+    },
+    "servers.importSshConfig": async (params = {}) => {
+      requireApiConfirmation(params, {
+        method: "servers.importSshConfig",
+        operation: "导入并行 SSH 配置",
+        sftp: null,
+        localPath: "",
+        pathRequired: false,
+      });
+      const result = importSharedSshConfigCore();
+      updateServerStatusButton();
+      publishLocalApiEvent("servers.importSshConfig", result);
+      return result;
+    },
+    "remote.listDirs": async (params = {}) => {
+      const remotePath = String(params.remotePath || "").trim();
+      if (!remotePath) throw new Error("缺少远端目录 remotePath。");
+      const sftp = apiTransferSftp(params);
+      sftp.remotePath = remotePath;
+      requireApiConfirmation(params, {
+        method: "remote.listDirs",
+        operation: "列出远端目录",
+        sftp,
+        localPath: String(params.localPath || ""),
+        pathRequired: true,
+      });
+      const dirs = await listRemoteDirs(sftp, remotePath);
+      publishLocalApiEvent("remote.listDirs", { remotePath, count: dirs.length });
+      return { ok: true, remotePath, dirs };
+    },
+    "target.show": async (params = {}) => {
+      return showCurrentTarget({ ...params, apiMode: true });
+    },
+    "project.create": async (params = {}) => {
+      const remotePath = String(params.remotePath || "").trim();
+      if (!remotePath) throw new Error("缺少远端项目目录 remotePath。");
+      const sftp = apiTransferSftp(params);
+      sftp.remotePath = remotePath;
+      requireApiConfirmation(params, {
+        method: "project.create",
+        operation: "创建 SFTP 工作区",
+        sftp,
+        localPath: String(params.localPath || ""),
+        pathRequired: true,
+      });
+      const result = await createOrOpenProject({ ...params, apiMode: true });
+      publishLocalApiEvent("project.create", {
+        localPath: result && result.localPath,
+        remotePath: result && result.remotePath,
+      });
+      return result;
+    },
+    "sync.fromRemote": async (params = {}) => {
+      const localPath = String(params.localPath || "").trim();
+      if (!localPath) throw new Error("缺少本地工作区 localPath。");
+      const sftp = apiTransferSftp({ ...params, localPath });
+      requireApiConfirmation(params, {
+        method: "sync.fromRemote",
+        operation: "远端同步到本地",
+        sftp: { ...sftp, remotePath: sftp.remotePath || params.remotePath || "" },
+        localPath,
+        pathRequired: true,
+      });
+      const result = await syncFromRemote({ ...params, apiMode: true, localPath });
+      publishLocalApiEvent("sync.fromRemote", {
+        localPath,
+        remotePath: result && result.remotePath,
+      });
+      return result;
+    },
+    "upload.workspace": async (params = {}) => {
+      const localPath = String(params.localPath || "").trim();
+      const sftp = apiTransferSftp(params);
+      requireApiConfirmation(params, {
+        method: "upload.workspace",
+        operation: "上传工作区",
+        sftp,
+        localPath,
+        pathRequired: true,
+      });
+      const result = await uploadWorkspace({ ...params, apiMode: true });
+      publishLocalApiEvent("upload.workspace", {
+        targetId: result && result.targetId,
+        remotePath: result && result.remotePath,
+        uploadedAt: result && result.uploadedAt,
+      });
+      return result;
+    },
+    "upload.files": async (params = {}) => {
+      if (!Array.isArray(params.files) && !params.manifest) {
+        throw new Error("缺少上传文件列表 files 或 manifest。");
+      }
+      const localBase = String(params.localBase || params.localPath || "").trim();
+      const sftp = apiTransferSftp(params);
+      requireApiConfirmation(params, {
+        method: "upload.files",
+        operation: "上传指定文件",
+        sftp,
+        localPath: localBase,
+        pathRequired: true,
+      });
+      const result = await uploadFiles({ ...params, apiMode: true });
+      publishLocalApiEvent("upload.files", {
+        remotePath: result && result.remotePath,
+        files: result && result.files,
+        uploadedAt: result && result.uploadedAt,
+      });
+      return result;
+    },
+    "handoff.markReady": async (params = {}) => {
+      const localPath = String(params.localPath || "").trim();
+      if (!localPath) throw new Error("缺少本地工作区 localPath。");
+      const sftp = readSftpConfig(localPath) || apiTransferSftp(params);
+      requireApiConfirmation(params, {
+        method: "handoff.markReady",
+        operation: "上传并标记交接",
+        sftp,
+        localPath,
+        pathRequired: true,
+      });
+      const result = await markHandoffReady({ ...params, apiMode: true, localPath });
+      publishLocalApiEvent("handoff.markReady", {
+        localPath,
+        remotePath: result && result.remotePath,
+        markedAt: result && result.markedAt,
+      });
+      return result;
+    },
+    "ignores.configure": async (params = {}) => {
+      const localPath = String(params.localPath || "").trim();
+      const sftp = apiTransferSftp(params);
+      requireApiConfirmation(params, {
+        method: "ignores.configure",
+        operation: "配置 SFTP 忽略规则",
+        sftp,
+        localPath,
+        pathRequired: true,
+      });
+      const result = await configureIgnores({ ...params, apiMode: true });
+      publishLocalApiEvent("ignores.configure", {
+        targetId: result && result.targetId,
+        remotePath: result && result.remotePath,
+        ignore: result && result.ignore,
+      });
+      return result;
+    },
+    "confirmations.reset": async (params = {}) => {
+      requireApiConfirmation(params, {
+        method: "confirmations.reset",
+        operation: "重置 SimpleSFTP 路径免提醒记录",
+        sftp: null,
+        localPath: "",
+        pathRequired: false,
+      });
+      const previous = extensionContext && extensionContext.globalState
+        ? extensionContext.globalState.get(PATH_CONFIRMATIONS_STATE, [])
+        : [];
+      if (extensionContext && extensionContext.globalState) {
+        await extensionContext.globalState.update(PATH_CONFIRMATIONS_STATE, []);
+      }
+      publishLocalApiEvent("confirmations.reset", { resetCount: previous.length });
+      return { ok: true, resetCount: previous.length };
+    },
+  };
+}
+
+function requireApiConfirmation(params, { method, operation, sftp, localPath, pathRequired }) {
+  const preview = buildApiConfirmationPreview({ method, operation, sftp, localPath, pathRequired });
+  const requires = [];
+  if (params.confirm !== true) requires.push("confirm");
+  if (pathRequired && params.pathConfirmed !== true && !isRememberedTransferPath(localPath, sftp)) {
+    requires.push("pathConfirmed");
+  }
+  if (requires.length) throw confirmationRequired({ ...preview, requires });
+  return true;
+}
+
+function buildApiConfirmationPreview({ method, operation, sftp, localPath, pathRequired }) {
+  return {
+    method,
+    operation,
+    requires: [
+      "confirm",
+      ...(pathRequired ? ["pathConfirmed"] : []),
+    ],
+    target: createTransferPreview({
+      localPath,
+      sftp,
+      operation,
+      detail: "",
+    }),
+  };
+}
+
+function isRememberedTransferPath(localPath, sftp) {
+  if (!localPath || !sftp || !sftp.host || !sftp.remotePath) return false;
+  const key = transferPathConfirmationKey(localPath, sftp);
+  const remembered = extensionContext && extensionContext.globalState
+    ? extensionContext.globalState.get(PATH_CONFIRMATIONS_STATE, [])
+    : [];
+  return Array.isArray(remembered) && remembered.includes(key);
+}
+
+function apiTransferSftp(params = {}) {
+  const active = getActiveSharedServer() || {};
+  const incoming = params.server && typeof params.server === "object" ? params.server : {};
+  const shared = sharedServerForOptions(params, incoming);
+  const merged = { ...active, ...shared, ...incoming, ...params };
+  const host = firstNonEmpty(
+    incoming.transferHost,
+    incoming.resolvedHost,
+    shared.transferHost,
+    shared.resolvedHost,
+    merged.sftpHost,
+    merged.sshHost,
+    merged.host,
+    merged.sshConfigHost,
+    merged.sshConfigAlias,
+    active.host,
+    active.sshConfigHost
+  );
+  const username = String(
+    incoming.user ||
+    incoming.username ||
+    shared.user ||
+    shared.username ||
+    merged.user ||
+    merged.username ||
+    ""
+  ).trim();
+  const port = normalizeSshPort(
+    incoming.sshPort || incoming.port || shared.sshPort || shared.port || merged.sshPort || merged.port,
+    22
+  );
+  const remotePath = String(
+    incoming.remotePath ||
+    incoming.remoteBase ||
+    shared.remotePath ||
+    shared.remoteBase ||
+    merged.remotePath ||
+    merged.remoteBase ||
+    active.remotePath ||
+    ""
+  ).replace(/\/+$/, "");
+  return {
+    name: String(incoming.id || incoming.label || shared.id || shared.label || merged.id || merged.label || host || "simple-sftp-target"),
+    host,
+    port,
+    username,
+    remotePath,
+  };
+}
+
+function publicServerRecord(item) {
+  if (!item) return null;
+  return {
+    id: item.id || "",
+    label: item.label || item.id || "",
+    host: firstNonEmpty(item.sftpHost, item.sshHost, item.host, item.sshConfigHost, item.sshConfigAlias),
+    user: item.user || item.username || "",
+    port: normalizeSshPort(item.sshPort || item.port, 22),
+    remotePath: String(item.remotePath || item.remoteBase || "").replace(/\/+$/, ""),
+    sshConfigHost: item.sshConfigHost || item.sshConfigAlias || "",
+    source: item.source || "",
+    enabled: item.enabled !== false,
+  };
+}
+
+function publishLocalApiEvent(type, data) {
+  if (!localApiServer) return null;
+  return localApiServer.publish({
+    type,
+    data: {
+      ...(data || {}),
+      publishedAt: new Date().toISOString(),
+    },
+  });
 }
 
 function filesSummary(files) {
@@ -2438,7 +2891,12 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-function deactivate() {}
+async function deactivate() {
+  if (localApiServer) {
+    await localApiServer.dispose().catch(() => undefined);
+    localApiServer = undefined;
+  }
+}
 
 module.exports = {
   activate,
@@ -2452,6 +2910,9 @@ module.exports = {
     createAgentsManagedBlock,
     createSshCommandTemplate,
     createWorkspaceTargetName,
+    createTransferPreview,
+    createLocalApiMethods,
+    isRememberedTransferPath,
     resolveCreateProjectTarget,
     getSshArgs,
     getSshTarget,
