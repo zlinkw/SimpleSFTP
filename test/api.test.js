@@ -238,11 +238,18 @@ test("SimpleSFTP source has an explicit API confirmation gate and no scp/rsync",
 test("SimpleSFTP exposes the planned public API methods", () => {
   const methods = [
     "status",
+    "config.list",
+    "config.get",
+    "config.set",
+    "config.reset",
     "servers.list",
+    "servers.save",
+    "servers.delete",
     "servers.setActive",
     "servers.importSshConfig",
     "remote.listDirs",
     "target.show",
+    "target.update",
     "project.create",
     "sync.fromRemote",
     "upload.workspace",
@@ -257,4 +264,14 @@ test("SimpleSFTP exposes the planned public API methods", () => {
       : new RegExp(`"${method.replace(/\./g, "\\.")}": async`);
     assert.match(extensionSource, pattern, `missing API method ${method}`);
   }
+});
+
+test("SimpleSFTP config and server API helpers are defined and validate types", () => {
+  assert.match(extensionSource, /function simpleSftpConfigSchema\(\)/);
+  assert.match(extensionSource, /function validateSimpleSftpConfigValue\(key, value\)/);
+  assert.match(extensionSource, /需要 boolean/);
+  assert.match(extensionSource, /function serverIdFromLabel\(label\)/);
+  assert.match(extensionSource, /function sanitizeServerProfile\(input, existing = \{\}\)/);
+  assert.match(extensionSource, /servers\.save.*sanitizeServerProfile/s);
+  assert.match(extensionSource, /target\.update.*updateWorkspaceTarget/s);
 });

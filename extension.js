@@ -14,6 +14,9 @@ const APPDATA = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roami
 const SHARED_SERVER_DIR = path.join(APPDATA, "SimpleSFTP", "server-profiles");
 const SHARED_SERVER_FILE = path.join(SHARED_SERVER_DIR, "servers.json");
 const LEGACY_SHARED_SERVER_FILE = path.join(APPDATA, "ZLK", "server-profiles", "servers.json");
+const API_CONFIG_NAMESPACE = "simpleSftp";
+const API_CONFIG_PREFIX = `${API_CONFIG_NAMESPACE}.`;
+const SIMPLE_SFTP_CONFIG_KEYS = new Set(Object.keys(PACKAGE_JSON.contributes?.configuration?.properties || {}));
 
 const DEFAULT_HANDOFF_MARKER = ".simple-sftp-handoff.json";
 const AGENTS_BLOCK_START = "<!-- SIMPLE_SFTP_START -->";
@@ -690,6 +693,61 @@ function formatSftpTargetSummary(localPath, sftp) {
   const user = sftp.username ? `${sftp.username}@` : "";
   const port = normalizeSshPort(sftp.port, 22);
   return `SimpleSFTP 目标：${user}${sftp.host}:${port} ${sftp.remotePath} -> ${localPath}`;
+}
+
+async function updateWorkspaceTarget(options = {}) {
+  const localPath = String(options.localPath || getWorkspaceRoot()).trim();
+  if (!localPath)
+    throw new Error("target.update 缺少本地工作区 localPath。");
+  return withHostOperationLease("update-target", "更新 SFTP 工作区目标", localPath, () =>
+    updateWorkspaceTargetCore({ ...options, localPath })
+  );
+}
+
+async function updateWorkspaceTargetCore(options = {}) {
+  const localPath = String(options.localPath || "").trim();
+  if (!localPath)
+    throw new Error("target.update 缺少本地工作区 localPath。");
+  const patch = options.patch && typeof options.patch === "object" && !Array.isArray(options.patch)
+    ? options.patch
+    : {};
+  const existing = readSftpConfig(localPath) || {};
+  const host = String(patch.host || patch.hostname || existing.host || "").trim();
+  const remotePath = String(patch.remotePath || existing.remotePath || "").trim().replace(/\/+$/, "");
+  if (!host)
+    throw new Error("target.update 缺少目标主机 host。");
+  if (!remotePath)
+    throw new Error("target.update 缺少远端路径 remotePath。");
+  const port = normalizeSshPort(patch.port ?? patch.sshPort ?? existing.port, 22);
+  const username = String(patch.username ?? patch.user ?? existing.username ?? existing.user ?? "").trim();
+  const ignore = Array.isArray(patch.ignore) ? patch.ignore : Array.isArray(existing.ignore) ? existing.ignore : DEFAULT_IGNORES;
+  const sftp = {
+    ...existing,
+    ...patch,
+    name: String(patch.name || existing.name || `${host}-simple-sftp-target`).trim(),
+    host,
+    protocol: "sftp",
+    port,
+    username,
+    remotePath,
+    uploadOnSave: typeof patch.uploadOnSave === "boolean" ? patch.uploadOnSave : Boolean(existing.uploadOnSave),
+    downloadOnOpen: typeof patch.downloadOnOpen === "boolean" ? patch.downloadOnOpen : Boolean(existing.downloadOnOpen),
+    useTempFile: typeof patch.useTempFile === "boolean" ? patch.useTempFile : Boolean(existing.useTempFile),
+    openSsh: true,
+    ignore,
+  };
+  const configPath = path.join(localPath, ".vscode", "sftp.json");
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, `${JSON.stringify(sftp, null, 2)}\n`, "utf8");
+  return {
+    ok: true,
+    localPath,
+    host,
+    username,
+    port,
+    remotePath,
+    ignoreCount: ignore.length,
+  };
 }
 
 async function maybePromptForHandoff() {
@@ -1745,6 +1803,69 @@ function createLocalApiMethods() {
           : null,
       };
     },
+    "config.list": async () => {
+      const config = vscode.workspace.getConfiguration(API_CONFIG_NAMESPACE);
+      const schema = simpleSftpConfigSchema();
+      return {
+        namespace: API_CONFIG_NAMESPACE,
+        keys: Object.entries(schema)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([key, item]) => ({
+            key,
+            type: item.type || "",
+            scope: item.scope || "",
+            default: item.default,
+            value: simpleSftpConfigValue(config, key),
+          })),
+      };
+    },
+    "config.get": async (params = {}) => {
+      const key = String(params.key || "").trim();
+      const schema = simpleSftpConfigSchema()[key];
+      if (!schema)
+        throw new Error(`未知 SimpleSFTP 配置：${key}`);
+      const config = vscode.workspace.getConfiguration(API_CONFIG_NAMESPACE);
+      return {
+        key,
+        type: schema.type || "",
+        scope: schema.scope || "",
+        default: schema.default,
+        value: simpleSftpConfigValue(config, key),
+      };
+    },
+    "config.set": async (params = {}) => {
+      const key = String(params.key || "").trim();
+      if (!SIMPLE_SFTP_CONFIG_KEYS.has(key))
+        throw new Error(`未知 SimpleSFTP 配置：${key}`);
+      requireApiConfirmation(params, {
+        method: "config.set",
+        operation: `修改 SimpleSFTP 配置 ${key}`,
+        sftp: null,
+        localPath: "",
+        pathRequired: false,
+      });
+      validateSimpleSftpConfigValue(key, params.value);
+      const config = vscode.workspace.getConfiguration(API_CONFIG_NAMESPACE);
+      await config.update(simpleSftpConfigSuffix(key), params.value, vscode.ConfigurationTarget.Global);
+      publishLocalApiEvent("config.set", { key, value: simpleSftpConfigValue(config, key) });
+      return { ok: true, key, value: simpleSftpConfigValue(config, key) };
+    },
+    "config.reset": async (params = {}) => {
+      const key = String(params.key || "").trim();
+      if (!SIMPLE_SFTP_CONFIG_KEYS.has(key))
+        throw new Error(`未知 SimpleSFTP 配置：${key}`);
+      requireApiConfirmation(params, {
+        method: "config.reset",
+        operation: `重置 SimpleSFTP 配置 ${key}`,
+        sftp: null,
+        localPath: "",
+        pathRequired: false,
+      });
+      const config = vscode.workspace.getConfiguration(API_CONFIG_NAMESPACE);
+      await config.update(simpleSftpConfigSuffix(key), undefined, vscode.ConfigurationTarget.Global);
+      publishLocalApiEvent("config.reset", { key });
+      return { ok: true, key, reset: true };
+    },
     "servers.list": async () => {
       const data = readSharedServers();
       return {
@@ -1752,6 +1873,57 @@ function createLocalApiMethods() {
         activeServerId: data.activeServerId,
         servers: data.servers.map(publicServerRecord),
       };
+    },
+    "servers.save": async (params = {}) => {
+      const incoming = params.server && typeof params.server === "object" && !Array.isArray(params.server)
+        ? params.server
+        : params;
+      const data = readSharedServers();
+      const incomingId = String(incoming.id || "").trim();
+      const existing = data.servers.find((item) =>
+        incomingId ? item.id === incomingId : Boolean(incoming.label && item.label === incoming.label)
+      );
+      const server = sanitizeServerProfile(
+        incomingId || !existing ? incoming : { ...incoming, id: existing.id },
+        existing || {}
+      );
+      requireApiConfirmation(params, {
+        method: "servers.save",
+        operation: existing ? "更新 SimpleSFTP 服务器配置" : "新增 SimpleSFTP 服务器配置",
+        sftp: server,
+        localPath: "",
+        pathRequired: false,
+      });
+      const servers = existing
+        ? data.servers.map((item) => item.id === server.id ? server : item)
+        : [...data.servers, server];
+      const activeServerId = params.setActive === true || (data.activeServerId === server.id) || (!data.activeServerId && !existing)
+        ? server.id
+        : data.activeServerId;
+      writeSharedServers({ ...data, servers, activeServerId });
+      updateServerStatusButton();
+      publishLocalApiEvent("servers.save", { id: server.id, activeServerId });
+      return { ok: true, server: publicServerRecord(server), activeServerId };
+    },
+    "servers.delete": async (params = {}) => {
+      const id = String(params.id || params.serverId || "").trim();
+      const data = readSharedServers();
+      const server = data.servers.find((item) => item.id === id);
+      if (!server)
+        throw new Error("未找到指定服务器：" + (id || "-"));
+      requireApiConfirmation(params, {
+        method: "servers.delete",
+        operation: "删除 SimpleSFTP 服务器配置",
+        sftp: server,
+        localPath: "",
+        pathRequired: false,
+      });
+      const servers = data.servers.filter((item) => item.id !== id);
+      const activeServerId = data.activeServerId === id ? (servers[0]?.id || "") : data.activeServerId;
+      writeSharedServers({ ...data, servers, activeServerId });
+      updateServerStatusButton();
+      publishLocalApiEvent("servers.delete", { id, activeServerId });
+      return { ok: true, deletedId: id, activeServerId };
     },
     "servers.setActive": async (params = {}) => {
       const id = String(params.id || params.serverId || "").trim();
@@ -1801,6 +1973,36 @@ function createLocalApiMethods() {
     },
     "target.show": async (params = {}) => {
       return showCurrentTarget({ ...params, apiMode: true });
+    },
+    "target.update": async (params = {}) => {
+      const localPath = String(params.localPath || getWorkspaceRoot() || "").trim();
+      if (!localPath)
+        throw new Error("target.update 缺少本地工作区 localPath。");
+      const patch = params.patch && typeof params.patch === "object" && !Array.isArray(params.patch)
+        ? params.patch
+        : {};
+      const sftp = apiTransferSftp({ ...params, localPath });
+      const preview = {
+        ...sftp,
+        host: String(patch.host || sftp.host || "").trim(),
+        port: normalizeSshPort(patch.port ?? patch.sshPort ?? sftp.port, 22),
+        username: String(patch.username ?? patch.user ?? sftp.username ?? "").trim(),
+        remotePath: String(patch.remotePath || sftp.remotePath || "").trim().replace(/\/+$/, ""),
+      };
+      requireApiConfirmation(params, {
+        method: "target.update",
+        operation: "更新 SFTP 工作区目标",
+        sftp: preview,
+        localPath,
+        pathRequired: true,
+      });
+      const result = await updateWorkspaceTarget({ ...params, apiMode: true, localPath });
+      publishLocalApiEvent("target.update", {
+        localPath,
+        remotePath: result.remotePath,
+        updatedAt: new Date().toISOString(),
+      });
+      return result;
     },
     "project.create": async (params = {}) => {
       const remotePath = String(params.remotePath || "").trim();
@@ -2034,6 +2236,100 @@ function publicServerRecord(item) {
     sshConfigHost: item.sshConfigHost || item.sshConfigAlias || "",
     source: item.source || "",
     enabled: item.enabled !== false,
+  };
+}
+
+function simpleSftpConfigSchema() {
+  return PACKAGE_JSON.contributes?.configuration?.properties || {};
+}
+
+function simpleSftpConfigSuffix(key) {
+  return key.startsWith(API_CONFIG_PREFIX) ? key.slice(API_CONFIG_PREFIX.length) : key;
+}
+
+function simpleSftpConfigValue(config, key) {
+  const schema = simpleSftpConfigSchema()[key] || {};
+  return config.get(simpleSftpConfigSuffix(key), schema.default);
+}
+
+function validateSimpleSftpConfigValue(key, value) {
+  const schema = simpleSftpConfigSchema()[key] || {};
+  const type = schema.type;
+  if (type === "string" && typeof value !== "string")
+    throw new Error(`SimpleSFTP 配置 ${key} 需要 string：${typeof value}`);
+  if (type === "number" && (typeof value !== "number" || !Number.isFinite(value)))
+    throw new Error(`SimpleSFTP 配置 ${key} 需要 number：${typeof value}`);
+  if (type === "integer" && !Number.isInteger(value))
+    throw new Error(`SimpleSFTP 配置 ${key} 需要 integer：${typeof value}`);
+  if (type === "boolean" && typeof value !== "boolean")
+    throw new Error(`SimpleSFTP 配置 ${key} 需要 boolean：${typeof value}`);
+  if (type === "array" && !Array.isArray(value))
+    throw new Error(`SimpleSFTP 配置 ${key} 需要 array：${typeof value}`);
+  if (type === "object" && (!value || typeof value !== "object" || Array.isArray(value)))
+    throw new Error(`SimpleSFTP 配置 ${key} 需要 object：${typeof value}`);
+  if (Number.isFinite(schema.minimum) && typeof value === "number" && value < schema.minimum)
+    throw new Error(`SimpleSFTP 配置 ${key} 不能小于 ${schema.minimum}`);
+  if (Number.isFinite(schema.maximum) && typeof value === "number" && value > schema.maximum)
+    throw new Error(`SimpleSFTP 配置 ${key} 不能大于 ${schema.maximum}`);
+  return value;
+}
+
+function serverIdFromLabel(label) {
+  return String(label || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^\w.-]+/g, "-")
+    .replace(/^-+|-+$/g, "") || `server-${Date.now()}`;
+}
+
+function sanitizeServerProfile(input, existing = {}) {
+  if (!input || typeof input !== "object" || Array.isArray(input))
+    throw new Error("servers.save 的 server 参数必须是对象。");
+  const label = String(input.label || existing.label || "").trim();
+  const id = String(input.id || label || "").trim() || serverIdFromLabel(label);
+  if (!id)
+    throw new Error("servers.save 缺少服务器 id 或 label。");
+  const host = firstNonEmpty(
+    input.host,
+    input.sftpHost,
+    input.sshHost,
+    input.sshConfigHost,
+    input.sshConfigAlias,
+    existing.host,
+    existing.sftpHost,
+    existing.sshHost,
+    existing.sshConfigHost,
+    existing.sshConfigAlias
+  );
+  if (!host)
+    throw new Error("servers.save 至少需要一个 host、sftpHost、sshHost 或 sshConfigHost。");
+  const sshPort = normalizeSshPort(input.sshPort ?? input.port ?? existing.sshPort ?? existing.port, 22);
+  return {
+    ...existing,
+    ...input,
+    id,
+    label: String(input.label || existing.label || id).trim() || id,
+    enabled: input.enabled !== false,
+    source: String(input.source || existing.source || "api").trim() || "api",
+    sshPort,
+    port: sshPort,
+    remotePath: String(input.remotePath ?? input.remoteBase ?? existing.remotePath ?? existing.remoteBase ?? "")
+      .trim()
+      .replace(/\/+$/, ""),
+    localBase: String(input.localBase ?? existing.localBase ?? "").trim(),
+    sshConfigHost: String(input.sshConfigHost ?? input.sshConfigAlias ?? existing.sshConfigHost ?? existing.sshConfigAlias ?? "").trim(),
+    sshConfigAlias: String(input.sshConfigAlias ?? input.sshConfigHost ?? existing.sshConfigAlias ?? existing.sshConfigHost ?? "").trim(),
+    sftpHost: String(input.sftpHost ?? existing.sftpHost ?? "").trim(),
+    sshHost: String(input.sshHost ?? existing.sshHost ?? "").trim(),
+    host: String(input.host ?? existing.host ?? host).trim(),
+    user: String(input.user ?? input.username ?? existing.user ?? existing.username ?? "").trim(),
+    username: String(input.username ?? input.user ?? existing.username ?? existing.user ?? "").trim(),
+    maxConcurrentGpus: Number.isInteger(input.maxConcurrentGpus ?? existing.maxConcurrentGpus ?? 1)
+      ? Math.max(1, Number(input.maxConcurrentGpus ?? existing.maxConcurrentGpus ?? 1))
+      : 1,
+    allowedGpuIds: Array.isArray(input.allowedGpuIds ?? existing.allowedGpuIds)
+      ? [...(input.allowedGpuIds ?? existing.allowedGpuIds)].map(String)
+      : [],
   };
 }
 
@@ -2914,6 +3210,7 @@ module.exports = {
     createLocalApiMethods,
     isRememberedTransferPath,
     resolveCreateProjectTarget,
+    updateWorkspaceTargetCore,
     getSshArgs,
     getSshTarget,
     getManifestUploadRelativePaths,
@@ -2927,6 +3224,10 @@ module.exports = {
     resolveUploadSftp,
     sanitizeRelativeUploadPath,
     sharedServerCandidateKeys,
+    simpleSftpConfigSchema,
+    simpleSftpConfigSuffix,
+    validateSimpleSftpConfigValue,
+    sanitizeServerProfile,
     sortIgnorePatterns,
     toTarPath,
     writeWorkspace,
