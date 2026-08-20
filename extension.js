@@ -218,9 +218,12 @@ const HIDDEN_TOP_LEVEL = new Set([
 
 const promptedWorkspaces = new Set();
 const uploadQueues = new Map();
+const activeTransfers = new Map();
 const SAVE_UPLOAD_STATE = "simple-sftp-upload-state.json";
 const TARGET_IGNORE_STATE = "sftp-target-ignores.json";
 const PATH_CONFIRMATIONS_STATE = "simple-sftp-confirmed-transfer-paths.v1";
+let transferSequence = 0;
+let defaultConnectTimeoutSeconds = 15;
 let extensionContext;
 let localApiServer;
 let serverStatusButton;
@@ -229,6 +232,7 @@ const hostOperationLease = new HostOperationLeaseManager();
 
 function activate(context) {
   extensionContext = context;
+  refreshConnectTimeoutFromConfig();
   const command = vscode.commands.registerCommand(
     "simpleSftp.createOrOpen",
     (options) => createOrOpenProject(options)
@@ -275,6 +279,9 @@ function activate(context) {
       void handleSavedDocument(document);
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration("simpleSftp.connectTimeoutSeconds")) {
+        refreshConnectTimeoutFromConfig();
+      }
       if (event.affectsConfiguration("simpleSftp.uploadOnSave")) {
         applyUploadOnSaveSettingToOpenWorkspaces();
       }
@@ -968,9 +975,10 @@ async function uploadWorkspaceCore(options = {}) {
         localPath,
         sftp,
         manifest,
+        uploadOptions: options,
       });
     } else {
-      await uploadAllLocalToRemote({ localPath, sftp, writeState: options.stateFileMode !== "virtual", pathConfirmed: true });
+      await uploadAllLocalToRemote({ localPath, sftp, writeState: options.stateFileMode !== "virtual", pathConfirmed: true, options });
     }
     const missingManagedFiles = manifest && options.pruneManagedFiles !== false
       ? getMissingManagedFiles(previousManifest, manifest, sftp.ignore)
@@ -996,20 +1004,23 @@ async function uploadWorkspaceCore(options = {}) {
   }
 }
 
-async function uploadManifestLocalFilesToRemote({ localPath, sftp, manifest }) {
+async function uploadManifestLocalFilesToRemote({ localPath, sftp, manifest, uploadOptions = {} }) {
   const relativePaths = getManifestUploadRelativePaths({ localPath, sftp, manifest });
   if (relativePaths.length > 0) {
     await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
         title: `上传受管理代码文件 -> ${sftp.remotePath}`,
-        cancellable: false,
+        cancellable: uploadProgressCancellable(uploadOptions),
       },
-      () => runLocalTarUpload({
+      (_progress, token) => runLocalTarUpload({
         localPath,
         sftp,
         relativePaths,
         operation: "上传受管理代码文件",
+        timeoutMs: transferTimeoutMs(sftp, uploadOptions),
+        token,
+        transferId: uploadOptions.transferId,
       })
     );
   }
@@ -1053,13 +1064,16 @@ async function uploadFilesCore(options = {}) {
       {
         location: vscode.ProgressLocation.Notification,
         title: `上传指定文件 -> ${sftp.remotePath}`,
-        cancellable: false,
+        cancellable: uploadProgressCancellable(options),
       },
-      () => runLocalTarUpload({
+      (_progress, token) => runLocalTarUpload({
         localPath: tempDir,
         sftp,
         relativePaths,
         operation: "上传指定文件",
+        timeoutMs: transferTimeoutMs(sftp, options),
+        token,
+        transferId: options.transferId,
       })
     );
     return {
@@ -1121,6 +1135,7 @@ function resolveUploadSftp(localPath, options) {
     downloadOnOpen: false,
     useTempFile: false,
     openSsh: true,
+    connectTimeoutSeconds: resolvedConnectTimeoutSeconds(server.connectTimeoutSeconds),
     ignore,
   };
 }
@@ -1730,6 +1745,91 @@ function transferPathConfirmationKey(localPath, sftp) {
   return `${local}|${host}:${port}|${remote}`;
 }
 
+function refreshConnectTimeoutFromConfig() {
+  const value = Number(vscode.workspace.getConfiguration("simpleSftp").get("connectTimeoutSeconds", 15));
+  defaultConnectTimeoutSeconds = Number.isFinite(value) && value >= 0
+    ? Math.min(Math.max(0, Math.floor(value)), 3600)
+    : 15;
+}
+
+function resolvedConnectTimeoutSeconds(value) {
+  const own = Number(value);
+  if (!Number.isFinite(own) || own < 0) return defaultConnectTimeoutSeconds;
+  return Math.min(Math.max(0, Math.floor(own)), 3600);
+}
+
+function nextTransferId(operation) {
+  transferSequence += 1;
+  return `transfer-${Date.now()}-${transferSequence}-${String(operation || "").replace(/[^\w.-]+/g, "-")}`;
+}
+
+function createTransferController({ id, operation, localPath, remotePath, host }) {
+  const listeners = new Set();
+  let cancelled = false;
+  let cancelReason = "";
+  let disposed = false;
+  const controller = {
+    id,
+    operation,
+    localPath,
+    remotePath,
+    host,
+    startedAt: new Date().toISOString(),
+    status: "running",
+    onCancel(listener) {
+      if (disposed) return;
+      if (cancelled) {
+        queueMicrotask(() => listener(cancelReason));
+        return;
+      }
+      listeners.add(listener);
+    },
+    cancel(reason) {
+      if (disposed || cancelled) return false;
+      cancelled = true;
+      cancelReason = String(reason || "传输已取消");
+      controller.status = "cancelled";
+      for (const listener of [...listeners]) {
+        try { listener(cancelReason); } catch {}
+      }
+      return true;
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      listeners.clear();
+      activeTransfers.delete(controller.id);
+    },
+  };
+  activeTransfers.set(controller.id, controller);
+  return controller;
+}
+
+function listActiveTransfers() {
+  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status }) => ({
+    id,
+    operation,
+    localPath,
+    remotePath,
+    host,
+    startedAt,
+    status,
+  }));
+}
+
+function transferTimeoutMs(sftp, options = {}) {
+  const explicit = Number(options && options.timeoutMs);
+  if (Number.isFinite(explicit) && explicit >= 1000) return Math.round(explicit);
+  const seconds = Number(vscode.workspace.getConfiguration("simpleSftp").get("uploadTimeoutSeconds", 600));
+  if (!Number.isFinite(seconds) || seconds <= 0) return 0;
+  return Math.max(1000, Math.round(seconds * 1000));
+}
+
+function uploadProgressCancellable(options = {}) {
+  if (options && typeof options.cancellable === "boolean") return options.cancellable;
+  return vscode.workspace.getConfiguration("simpleSftp").get("uploadCancellable", true) !== false;
+}
+
 async function confirmTransferPath({ localPath, sftp, operation, detail, options = {} }) {
   const key = transferPathConfirmationKey(localPath, sftp);
   const remembered = extensionContext && extensionContext.globalState
@@ -2041,6 +2141,17 @@ function createLocalApiMethods() {
       });
       return result;
     },
+    "transfers.list": async () => {
+      return { ok: true, transfers: listActiveTransfers() };
+    },
+    "transfers.cancel": async (params = {}) => {
+      const id = String(params.transferId || params.id || "").trim();
+      if (!id) throw new Error("缺少传输 transferId。");
+      const transfer = activeTransfers.get(id);
+      if (!transfer) throw new Error("未找到活动传输：" + (id || "-"));
+      transfer.cancel(String(params.reason || "用户通过 API 取消"));
+      return { ok: true, transferId: id, cancelled: true };
+    },
     "upload.workspace": async (params = {}) => {
       const localPath = String(params.localPath || "").trim();
       const sftp = apiTransferSftp(params);
@@ -2221,6 +2332,7 @@ function apiTransferSftp(params = {}) {
     port,
     username,
     remotePath,
+    connectTimeoutSeconds: resolvedConnectTimeoutSeconds(merged.connectTimeoutSeconds),
   };
 }
 
@@ -2638,13 +2750,15 @@ async function uploadChangedLocalFilesCore({ localPath, sftp }) {
     {
       location: vscode.ProgressLocation.Window,
       title: `SimpleSFTP 正在上传 ${changedFiles.length} 个变更文件`,
-      cancellable: false,
+      cancellable: uploadProgressCancellable(),
     },
-    () => runLocalTarUpload({
+    (_progress, token) => runLocalTarUpload({
       localPath,
       sftp,
       relativePaths: changedFiles,
       operation: "上传变更文件",
+      timeoutMs: transferTimeoutMs(sftp),
+      token,
     })
   );
 
@@ -2664,11 +2778,11 @@ async function uploadChangedLocalFilesCore({ localPath, sftp }) {
   vscode.window.setStatusBarMessage(`SimpleSFTP：已上传 ${changedFiles.length} 个变更文件`, 3500);
 }
 
-async function uploadAllLocalToRemote({ localPath, sftp, writeState = true, pathConfirmed = false }) {
-  return withHostOperationLease("upload-all-files", "上传全部本地文件", localPath, () => uploadAllLocalToRemoteCore({ localPath, sftp, writeState, pathConfirmed }));
+async function uploadAllLocalToRemote({ localPath, sftp, writeState = true, pathConfirmed = false, options = {} }) {
+  return withHostOperationLease("upload-all-files", "上传全部本地文件", localPath, () => uploadAllLocalToRemoteCore({ localPath, sftp, writeState, pathConfirmed, options }));
 }
 
-async function uploadAllLocalToRemoteCore({ localPath, sftp, writeState = true, pathConfirmed = false }) {
+async function uploadAllLocalToRemoteCore({ localPath, sftp, writeState = true, pathConfirmed = false, options = {} }) {
   if (!sftp || !sftp.remotePath || !sftp.host) {
     throw new Error("未配置可用的 SFTP 远端路径。");
   }
@@ -2681,13 +2795,16 @@ async function uploadAllLocalToRemoteCore({ localPath, sftp, writeState = true, 
     {
       location: vscode.ProgressLocation.Notification,
       title: `上传全部本地文件 -> ${sftp.remotePath}`,
-      cancellable: false,
+      cancellable: uploadProgressCancellable(options),
     },
-    () => runLocalTarUpload({
+    (_progress, token) => runLocalTarUpload({
       localPath,
       sftp,
       relativePaths: null,
       operation: "上传全部文件",
+      timeoutMs: transferTimeoutMs(sftp, options),
+      token,
+      transferId: options.transferId,
     })
   );
   if (writeState) {
@@ -2848,10 +2965,17 @@ function getWorkspaceFolderForFile(filePath) {
     .map(({ folder }) => folder)[0] || null;
 }
 
-function runLocalTarUpload({ localPath, sftp, relativePaths, operation }) {
+function runLocalTarUpload({ localPath, sftp, relativePaths, operation, timeoutMs, token, transferId }) {
   const remoteCommand = createRemoteExtractCommand(sftp.remotePath);
   const tarArgs = createLocalTarArgs(sftp, relativePaths);
   return new Promise((resolve, reject) => {
+    const controller = createTransferController({
+      id: transferId || nextTransferId(operation),
+      operation,
+      localPath,
+      remotePath: String(sftp && sftp.remotePath || ""),
+      host: String(sftp && sftp.host || ""),
+    });
     const tarProc = spawn("tar", tarArgs, {
       cwd: localPath,
       windowsHide: true,
@@ -2867,10 +2991,22 @@ function runLocalTarUpload({ localPath, sftp, relativePaths, operation }) {
     let sshCode;
     let tarStderr = "";
     let sshStderr = "";
+    let cancelListener;
+    let tokenDisposable;
+    let timer;
+
+    const stopController = () => {
+      clearTimeout(timer);
+      if (tokenDisposable && typeof tokenDisposable.dispose === "function") {
+        tokenDisposable.dispose();
+      }
+      controller.dispose();
+    };
 
     const fail = (error) => {
       if (settled) return;
       settled = true;
+      stopController();
       tarProc.kill();
       sshProc.kill();
       reject(error);
@@ -2879,6 +3015,7 @@ function runLocalTarUpload({ localPath, sftp, relativePaths, operation }) {
     const finish = () => {
       if (settled || tarCode === undefined || sshCode === undefined) return;
       settled = true;
+      stopController();
       if (tarCode !== 0 || sshCode !== 0) {
         reject(new Error(formatProcessFailure({
           operation,
@@ -2891,6 +3028,20 @@ function runLocalTarUpload({ localPath, sftp, relativePaths, operation }) {
       }
       resolve();
     };
+
+    cancelListener = (reason) => fail(new Error(reason || "传输已取消"));
+    controller.onCancel(cancelListener);
+    if (token) {
+      if (token.isCancellationRequested) {
+        fail(new Error("传输已取消"));
+      } else if (typeof token.onCancellationRequested === "function") {
+        tokenDisposable = token.onCancellationRequested(() => fail(new Error("传输已取消")));
+      }
+    }
+    const timeout = Number(timeoutMs) || transferTimeoutMs(sftp);
+    if (timeout > 0) {
+      timer = setTimeout(() => fail(new Error(`SimpleSFTP 传输超过 ${Math.round(timeout / 1000)} 秒未完成，已停止。`)), timeout);
+    }
 
     tarProc.on("error", fail);
     sshProc.on("error", fail);
@@ -2941,15 +3092,27 @@ async function downloadRemoteToLocalCore({ localPath, sftp }) {
     {
       location: vscode.ProgressLocation.Notification,
       title,
-      cancellable: false,
+      cancellable: uploadProgressCancellable(),
     },
-    () => runRemoteTarExtract({ localPath, sftp })
+    (_progress, token) => runRemoteTarExtract({
+      localPath,
+      sftp,
+      timeoutMs: transferTimeoutMs(sftp),
+      token,
+    })
   );
 }
 
-function runRemoteTarExtract({ localPath, sftp }) {
+function runRemoteTarExtract({ localPath, sftp, timeoutMs, token, transferId }) {
   const remoteCommand = createRemoteTarCommand(sftp);
   return new Promise((resolve, reject) => {
+    const controller = createTransferController({
+      id: transferId || nextTransferId("远端到本地同步"),
+      operation: "远端到本地同步",
+      localPath,
+      remotePath: String(sftp && sftp.remotePath || ""),
+      host: String(sftp && sftp.host || ""),
+    });
     const sshProc = spawn("ssh", getSshArgs(sftp, remoteCommand), {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
@@ -2964,10 +3127,22 @@ function runRemoteTarExtract({ localPath, sftp }) {
     let tarCode;
     let sshStderr = "";
     let tarStderr = "";
+    let cancelListener;
+    let tokenDisposable;
+    let timer;
+
+    const stopController = () => {
+      clearTimeout(timer);
+      if (tokenDisposable && typeof tokenDisposable.dispose === "function") {
+        tokenDisposable.dispose();
+      }
+      controller.dispose();
+    };
 
     const fail = (error) => {
       if (settled) return;
       settled = true;
+      stopController();
       sshProc.kill();
       tarProc.kill();
       reject(error);
@@ -2976,6 +3151,7 @@ function runRemoteTarExtract({ localPath, sftp }) {
     const finish = () => {
       if (settled || sshCode === undefined || tarCode === undefined) return;
       settled = true;
+      stopController();
       if (sshCode !== 0 || tarCode !== 0) {
         reject(new Error(formatProcessFailure({
           operation: "远端到本地同步",
@@ -2988,6 +3164,20 @@ function runRemoteTarExtract({ localPath, sftp }) {
       }
       resolve();
     };
+
+    cancelListener = (reason) => fail(new Error(reason || "传输已取消"));
+    controller.onCancel(cancelListener);
+    if (token) {
+      if (token.isCancellationRequested) {
+        fail(new Error("传输已取消"));
+      } else if (typeof token.onCancellationRequested === "function") {
+        tokenDisposable = token.onCancellationRequested(() => fail(new Error("传输已取消")));
+      }
+    }
+    const timeout = Number(timeoutMs) || transferTimeoutMs(sftp);
+    if (timeout > 0) {
+      timer = setTimeout(() => fail(new Error(`SimpleSFTP 传输超过 ${Math.round(timeout / 1000)} 秒未完成，已停止。`)), timeout);
+    }
 
     sshProc.on("error", fail);
     tarProc.on("error", fail);
@@ -3082,6 +3272,13 @@ function getSshArgs(sftp, command) {
   const port = normalizeSshPort(sftp && sftp.port, 22);
   if (port !== 22) {
     args.push("-p", String(port));
+  }
+  const rawConnectTimeout = Number((sftp && sftp.connectTimeoutSeconds) || defaultConnectTimeoutSeconds);
+  const connectTimeout = Number.isFinite(rawConnectTimeout)
+    ? Math.min(Math.max(0, Math.floor(rawConnectTimeout)), 3600)
+    : defaultConnectTimeoutSeconds;
+  if (connectTimeout > 0) {
+    args.push("-o", `ConnectTimeout=${connectTimeout}`);
   }
   args.push(getSshTarget(sftp), command);
   return args;
@@ -3207,8 +3404,11 @@ module.exports = {
     createSshCommandTemplate,
     createWorkspaceTargetName,
     createTransferPreview,
+    createTransferController,
     createLocalApiMethods,
     isRememberedTransferPath,
+    listActiveTransfers,
+    refreshConnectTimeoutFromConfig,
     resolveCreateProjectTarget,
     updateWorkspaceTargetCore,
     getSshArgs,
@@ -3226,6 +3426,8 @@ module.exports = {
     sharedServerCandidateKeys,
     simpleSftpConfigSchema,
     simpleSftpConfigSuffix,
+    transferTimeoutMs,
+    uploadProgressCancellable,
     validateSimpleSftpConfigValue,
     sanitizeServerProfile,
     sortIgnorePatterns,

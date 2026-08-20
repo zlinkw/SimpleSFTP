@@ -282,6 +282,16 @@ test("SimpleSFTP source has an explicit API confirmation gate and no scp/rsync",
   assert.doesNotMatch(extensionSource, /\bscp\b|\brsync\b/);
 });
 
+test("SimpleSFTP uploads have connect timeout, transfer timeout, cancellation and API control", () => {
+  assert.match(extensionSource, /defaultConnectTimeoutSeconds = 15/);
+  assert.match(extensionSource, /"-o", `ConnectTimeout=\$\{connectTimeout\}`/);
+  assert.match(extensionSource, /uploadTimeoutSeconds/);
+  assert.match(extensionSource, /cancellable: uploadProgressCancellable/);
+  assert.match(extensionSource, /transfer\.cancel\(/);
+  assert.match(extensionSource, /"transfers\.list": async/);
+  assert.match(extensionSource, /"transfers\.cancel": async/);
+});
+
 test("SimpleSFTP exposes the planned public API methods", () => {
   const methods = [
     "status",
@@ -299,6 +309,8 @@ test("SimpleSFTP exposes the planned public API methods", () => {
     "target.update",
     "project.create",
     "sync.fromRemote",
+    "transfers.list",
+    "transfers.cancel",
     "upload.workspace",
     "upload.files",
     "handoff.markReady",

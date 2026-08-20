@@ -209,13 +209,22 @@ simple-sftp-api upload.workspace --json upload.json
 公开方法：
 
 - `status`
+- `config.list`
+- `config.get`
+- `config.set`
+- `config.reset`
 - `servers.list`
+- `servers.save`
+- `servers.delete`
 - `servers.setActive`
 - `servers.importSshConfig`
 - `remote.listDirs`
 - `target.show`
+- `target.update`
 - `project.create`
 - `sync.fromRemote`
+- `transfers.list`
+- `transfers.cancel`
 - `upload.workspace`
 - `upload.files`
 - `handoff.markReady`
@@ -223,6 +232,8 @@ simple-sftp-api upload.workspace --json upload.json
 - `confirmations.reset`
 
 `ignores.configure` 可通过 `ignore` 全量替换规则，也可通过 `patterns`、`add`、`remove` 增量修改。`handoff.markReady` 使用 `upload: true` 表示上传全部后写入交接标记，默认仅标记。
+
+上传和下载默认带 15 秒 SSH 建连超时、600 秒整体传输超时，并在进度通知中显示取消按钮。可在设置中调整 `simpleSftp.connectTimeoutSeconds`、`simpleSftp.uploadTimeoutSeconds` 和 `simpleSftp.uploadCancellable`；传输过程中也可通过 `transfers.list` 查看活动传输，用 `transfers.cancel` 传 `transferId` 手动停止。
 
 ## SSH 与端口
 
