@@ -666,16 +666,45 @@ function assertCreateProjectTarget({ host, remoteBase, localBase }) {
 }
 
 async function showCurrentTarget(options = {}) {
+  const hasExplicitTarget = Boolean(
+    options &&
+    (options.server ||
+      options.remotePath ||
+      options.host ||
+      options.sshHost ||
+      options.sshConfigHost ||
+      options.sshConfigAlias)
+  );
   const workspaceFolder = getPrimaryWorkspaceFolder();
   if (!workspaceFolder && !options.localPath) {
+    if (options.apiMode && hasExplicitTarget) {
+      const localPath = String(options.localPath || "").trim();
+      const sftp = apiTransferSftp({ ...options, localPath });
+      if (sftp && sftp.host && sftp.remotePath) {
+        const summary = formatSftpTargetSummary(localPath, sftp);
+        return {
+          ok: true,
+          localPath,
+          host: sftp.host,
+          username: sftp.username || "",
+          port: normalizeSshPort(sftp.port, 22),
+          remotePath: sftp.remotePath,
+          ignoreCount: 0,
+          summary,
+        };
+      }
+    }
     if (!options.apiMode) vscode.window.showInformationMessage("当前未打开工作区。");
     return { ok: false, error: "当前未打开工作区。请传入 localPath。" };
   }
   const localPath = String(options.localPath || getWorkspaceRoot()).trim();
-  const sftp = readSftpConfig(localPath);
+  const sftp = hasExplicitTarget ? apiTransferSftp({ ...options, localPath }) : readSftpConfig(localPath);
   if (!sftp || !sftp.remotePath || !sftp.host) {
-    if (!options.apiMode) vscode.window.showInformationMessage("当前工作区没有可用的 .vscode/sftp.json 目标。");
-    return { ok: false, error: "当前工作区没有可用的 .vscode/sftp.json 目标。" };
+    const message = hasExplicitTarget
+      ? "未提供可用的 SFTP 目标。"
+      : "当前工作区没有可用的 .vscode/sftp.json 目标。";
+    if (!options.apiMode) vscode.window.showInformationMessage(message);
+    return { ok: false, error: message };
   }
   const location = workspaceLocationForFolder(workspaceFolder);
   const summary = `${formatSftpTargetSummary(localPath, sftp)}${location && location.remote ? ` | 工作区 ${location.editorUri}` : ""}`;
@@ -3396,6 +3425,7 @@ module.exports = {
   deactivate,
   __test: {
     addTarExcludePattern,
+    apiTransferSftp,
     createLocalTarArgs,
     createListRemoteDirsSshArgs,
     createRemoteExtractCommand,

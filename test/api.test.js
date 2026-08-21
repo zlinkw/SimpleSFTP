@@ -325,6 +325,22 @@ test("SimpleSFTP exposes the planned public API methods", () => {
   }
 });
 
+test("SimpleSFTP target and upload helpers support explicit servers without sftp.json", () => {
+  assert.match(extensionSource, /function apiTransferSftp/);
+  assert.match(extensionSource, /server\.remotePath \|\| options\.remotePath \|\| existing\.remotePath/);
+  assert.match(extensionSource, /function resolveUploadSftp/);
+  assert.match(extensionSource, /"target\.show": async[\s\S]{0,120}showCurrentTarget/);
+  assert.match(extensionSource, /"upload\.workspace": async/);
+  assert.match(extensionSource, /"upload\.files": async/);
+  assert.match(extensionSource, /apiTransferSftp\(params\)/);
+});
+
+test("SimpleSFTP showCurrentTarget uses explicit server + remotePath", () => {
+  assert.match(extensionSource, /async function showCurrentTarget[\s\S]{0,700}apiTransferSftp/);
+  assert.match(extensionSource, /hasExplicitTarget = Boolean/);
+  assert.match(extensionSource, /module\.exports[\s\S]{0,200}apiTransferSftp/);
+});
+
 test("SimpleSFTP config and server API helpers are defined and validate types", () => {
   assert.match(extensionSource, /function simpleSftpConfigSchema\(\)/);
   assert.match(extensionSource, /function validateSimpleSftpConfigValue\(key, value\)/);
