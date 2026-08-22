@@ -125,3 +125,37 @@ test("managed state uses simple_cluster and reports legacy directories for manua
   const safeTest = source.match(/function isSafeRemoteManagedPath[\s\S]*?\n}/)?.[0] || "";
   assert.match(safeTest, /top === "simple_cluster"/);
 });
+
+test("legacy managed state is copied atomically and remains a read-only source", () => {
+  const localPath = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-migration-"));
+  try {
+    const legacyDir = path.join(localPath, "zlk_cluster");
+    const legacyFile = path.join(legacyDir, "code_sync_state.json");
+    const newFile = path.join(localPath, "simple_cluster", "code_sync_state.json");
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.writeFileSync(legacyFile, JSON.stringify({ fingerprint: "old", updatedAt: "2026-01-01T00:00:00.000Z" }), "utf8");
+
+    const sandbox = { fs, path, Date, process, console };
+    vm.createContext(sandbox);
+    vm.runInContext([
+      extractFunction("atomicWriteJsonIfMissing"),
+      extractFunction("migrateLegacyCodeSyncState"),
+      "this.migrate = migrateLegacyCodeSyncState;",
+    ].join("\n"), sandbox);
+    assert.equal(sandbox.migrate(localPath), true);
+    const migrated = JSON.parse(fs.readFileSync(newFile, "utf8"));
+    assert.equal(migrated.fingerprint, "old");
+    assert.equal(migrated.migration.source, "zlk_cluster/code_sync_state.json");
+    assert.equal(fs.existsSync(legacyFile), true);
+    const before = fs.readFileSync(newFile, "utf8");
+    assert.equal(sandbox.migrate(localPath), false);
+    assert.equal(fs.readFileSync(newFile, "utf8"), before);
+
+    fs.rmSync(path.join(localPath, "simple_cluster"), { recursive: true, force: true });
+    fs.writeFileSync(legacyFile, "{broken", "utf8");
+    assert.equal(sandbox.migrate(localPath), false);
+    assert.equal(fs.existsSync(newFile), false);
+  } finally {
+    fs.rmSync(localPath, { recursive: true, force: true });
+  }
+});

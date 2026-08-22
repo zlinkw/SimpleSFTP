@@ -997,6 +997,7 @@ async function uploadWorkspaceCore(options = {}) {
     }
     const remoteRoot = String(sftp.remotePath || "").replace(/\/+$/, "");
     await confirmTransferPath({ localPath, sftp, operation: "上传工作区", detail: options.manifest ? "manifest 指定代码文件" : "当前工作区内未被忽略的文件", options });
+    migrateLegacyCodeSyncState(localPath);
     const state = createCodeSyncState(sftp, options);
     const manifest = getManagedManifest(options.manifest);
     const previousState = manifest && options.pruneManagedFiles !== false
@@ -1254,6 +1255,37 @@ function writeLocalCodeSyncState(localPath, state) {
   fs.writeFileSync(path.join(dir, "code_sync_state.json"), `${JSON.stringify(state, null, 2)}\n`, "utf8");
 }
 
+function atomicWriteJsonIfMissing(targetPath, value) {
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  if (fs.existsSync(targetPath)) return false;
+  const temp = `${targetPath}.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`;
+  fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  fs.renameSync(temp, targetPath);
+  return true;
+}
+
+function migrateLegacyCodeSyncState(localPath) {
+  const newPath = path.join(localPath, "simple_cluster", "code_sync_state.json");
+  const legacyPath = path.join(localPath, "zlk_cluster", "code_sync_state.json");
+  if (fs.existsSync(newPath) || !fs.existsSync(legacyPath)) return false;
+  try {
+    const legacy = JSON.parse(fs.readFileSync(legacyPath, "utf8"));
+    if (!legacy || typeof legacy !== "object" || Array.isArray(legacy)) {
+      return false;
+    }
+    return atomicWriteJsonIfMissing(newPath, {
+      ...legacy,
+      migration: {
+        source: "zlk_cluster/code_sync_state.json",
+        migratedAt: new Date().toISOString(),
+        mode: "copy_read_only_source",
+      },
+    });
+  } catch {
+    return false;
+  }
+}
+
 async function pruneRemoteMissingManagedFiles(sftp, missing) {
   if (!missing.length) return { deleted: 0 };
   let deleted = 0;
@@ -1418,7 +1450,19 @@ function readTargetIgnoreState(localPath) {
     if (!fs.existsSync(file)) continue;
     try {
       const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-      if (parsed && typeof parsed === "object") return parsed;
+      if (parsed && typeof parsed === "object") {
+        if (file === legacyTargetIgnoreStatePath(localPath)) {
+          atomicWriteJsonIfMissing(targetIgnoreStatePath(localPath), {
+            ...parsed,
+            migration: {
+              source: `zlk_cluster/${TARGET_IGNORE_STATE}`,
+              migratedAt: new Date().toISOString(),
+              mode: "copy_read_only_source",
+            },
+          });
+        }
+        return parsed;
+      }
     } catch {
       // Fall through and try the next managed-state location.
     }
@@ -3622,6 +3666,8 @@ module.exports = {
     createTransferPreview,
     createTransferController,
     createLocalApiMethods,
+    atomicWriteJsonIfMissing,
+    migrateLegacyCodeSyncState,
     createManifestUploadPlan,
     createWorkspaceUploadPlan,
     hashUploadPlanChunks,
