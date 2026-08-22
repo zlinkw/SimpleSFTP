@@ -2828,7 +2828,13 @@ function runSsh(sftp, command, timeout) {
   return new Promise((resolve, reject) => {
     execFile("ssh", getSshArgs(sftp, command), { timeout, maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
       if (error) {
-        reject(new Error(stderr || error.message));
+        const failure = new Error(stderr || error.message);
+        failure.stderr = stderr;
+        reject(classifyTransportFailure(failure, {
+          command,
+          sshStderr: stderr,
+          sshCode: error.code,
+        }));
         return;
       }
       resolve(stdout);
@@ -3252,7 +3258,11 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
       stopController();
       tarProc.kill();
       sshProc.kill();
-      reject(error);
+      reject(classifyTransportFailure(error, {
+        command: remoteCommand,
+        sshStderr,
+        tarStderr,
+      }));
     };
 
     const finish = () => {
@@ -3260,13 +3270,21 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
       settled = true;
       stopController();
       if (tarCode !== 0 || sshCode !== 0) {
-        reject(new Error(formatProcessFailure({
+        const failure = new Error(formatProcessFailure({
           operation,
           tarCode,
           sshCode,
           tarStderr,
           sshStderr,
-        })));
+        }));
+        Object.assign(failure.details || {}, { sshExitCode: sshCode, tarExitCode: tarCode });
+        reject(classifyTransportFailure(failure, {
+          command: remoteCommand,
+          sshCode,
+          tarCode,
+          sshStderr,
+          tarStderr,
+        }));
         return;
       }
       resolve({
@@ -3404,7 +3422,11 @@ function runRemoteTarExtract({ localPath, sftp, timeoutMs, token, transferId }) 
       stopController();
       sshProc.kill();
       tarProc.kill();
-      reject(error);
+      reject(classifyTransportFailure(error, {
+        command: remoteCommand,
+        sshStderr,
+        tarStderr,
+      }));
     };
 
     const finish = () => {
@@ -3412,13 +3434,20 @@ function runRemoteTarExtract({ localPath, sftp, timeoutMs, token, transferId }) 
       settled = true;
       stopController();
       if (sshCode !== 0 || tarCode !== 0) {
-        reject(new Error(formatProcessFailure({
+        const failure = new Error(formatProcessFailure({
           operation: "远端到本地同步",
           sshCode,
           tarCode,
           sshStderr,
           tarStderr,
-        })));
+        }));
+        reject(classifyTransportFailure(failure, {
+          command: remoteCommand,
+          sshCode,
+          tarCode,
+          sshStderr,
+          tarStderr,
+        }));
         return;
       }
       resolve();
@@ -3516,6 +3545,77 @@ function formatProcessFailure({ operation, sshCode, tarCode, sshStderr, tarStder
     tarStderr.trim() ? `tar: ${tarStderr.trim()}` : "",
   ].filter(Boolean);
   return `${operation || "SFTP 传输"}失败。${details.join(" | ")}`;
+}
+
+function classifyTransportFailure(error, context = {}) {
+  const source = error instanceof Error ? error : new Error(String(error || "传输失败"));
+  const combined = [
+    source.message,
+    source.stderr || "",
+    String(context.sshStderr || ""),
+    String(context.tarStderr || ""),
+    String(context.command || ""),
+  ].join("\n").toLowerCase();
+  const classified = new Error(source.message || "SimpleSFTP 传输失败。");
+  classified.cause = source;
+  classified.details = {
+    sshExitCode: context.sshCode,
+    tarExitCode: context.tarCode,
+    sshStderr: String(context.sshStderr || "").slice(-4000),
+    tarStderr: String(context.tarStderr || "").slice(-4000),
+  };
+  if (source.name === "Cancel" || /传输已取消|用户通过 api 取消/.test(combined)) {
+    classified.category = "user_cancelled";
+    classified.retryable = false;
+    classified.diagnosis = "用户或调用方取消了传输。";
+    return classified;
+  }
+  if (/传输超过|simple-sftp timeout|timeout|timed out/.test(combined)) {
+    classified.category = "transfer_timeout";
+    classified.retryable = true;
+    classified.diagnosis = "传输超过配置的超时时间；检查网络、目标负载或增大超时。";
+    return classified;
+  }
+  if (/permission denied \(publickey|authentication failed|host key verification failed|invalid format\)/.test(combined)) {
+    classified.category = "ssh_auth_failed";
+    classified.retryable = false;
+    classified.diagnosis = "SSH 认证、密钥或 host key 验证失败；先用同一 alias 手动连接验证。";
+    return classified;
+  }
+  if (/econnrefused|connection refused|local forward|forwarding failed|channel .* not opened/.test(combined)) {
+    classified.category = "local_forward_unavailable";
+    classified.retryable = true;
+    classified.diagnosis = "本机转发端口未建立或目标 Agent/SSH 服务不可达。";
+    return classified;
+  }
+  if (/enotfound|no such host|name or service not known|temporary failure in name resolution|network is unreachable|connection timed out|no route to host/.test(combined)) {
+    classified.category = "dns_tcp_unreachable";
+    classified.retryable = true;
+    classified.diagnosis = "DNS 或 TCP 链路不可达；核对网络、防火墙和服务器地址。";
+    return classified;
+  }
+  if (/subsystem request failed|unknown subsystem/.test(combined)) {
+    classified.category = "sftp_subsystem_unavailable";
+    classified.retryable = false;
+    classified.diagnosis = "远端 SSH 子系统不可用；确认服务器允许当前账号使用所需子系统。";
+    return classified;
+  }
+  if (/mkdir |permission denied|read-only file system|disk quota exceeded|no space left on device/.test(combined)) {
+    classified.category = "remote_permission_denied";
+    classified.retryable = false;
+    classified.diagnosis = "远端目录权限、只读文件系统或磁盘配额导致写入失败。";
+    return classified;
+  }
+  if (/remote root|outside .*root|路径越界|不安全的受管理代码路径/.test(combined)) {
+    classified.category = "remote_root_validation_failed";
+    classified.retryable = false;
+    classified.diagnosis = "目标路径未通过远端根目录或托管路径安全校验。";
+    return classified;
+  }
+  classified.category = "transport_failed";
+  classified.retryable = true;
+  classified.diagnosis = "传输失败；请查看 SSH/tar 的退出码和错误输出。";
+  return classified;
 }
 
 function getSshTarget(sftp) {
@@ -3671,6 +3771,7 @@ module.exports = {
     createManifestUploadPlan,
     createWorkspaceUploadPlan,
     hashUploadPlanChunks,
+    classifyTransportFailure,
     isRememberedTransferPath,
     listActiveTransfers,
     refreshConnectTimeoutFromConfig,
