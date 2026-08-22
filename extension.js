@@ -2,6 +2,7 @@ const vscode = require("vscode");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const crypto = require("crypto");
 const { execFile, spawn } = require("child_process");
 const { resolveWorkspaceLocation } = require("./workspace-path.js");
 const { LocalApiServer, confirmationRequired } = require("./api-server.js");
@@ -40,6 +41,7 @@ const DEFAULT_IGNORES = [
   "build",
   "dist",
   "node_modules",
+  "comparison_methods/_repos",
   "data",
   "dataset",
   "datasets",
@@ -993,21 +995,25 @@ async function uploadWorkspaceCore(options = {}) {
     if (!sftp || !sftp.remotePath || !sftp.host) {
       throw new Error("未提供可用的 SFTP 目标。");
     }
+    const remoteRoot = String(sftp.remotePath || "").replace(/\/+$/, "");
     await confirmTransferPath({ localPath, sftp, operation: "上传工作区", detail: options.manifest ? "manifest 指定代码文件" : "当前工作区内未被忽略的文件", options });
     const state = createCodeSyncState(sftp, options);
     const manifest = getManagedManifest(options.manifest);
-    const previousManifest = manifest && options.pruneManagedFiles !== false
+    const previousState = manifest && options.pruneManagedFiles !== false
       ? await readRemoteCodeManifest(sftp).catch(() => null)
       : null;
+    const previousManifest = previousState && typeof previousState === "object" ? previousState.manifest : null;
+    const legacyManagedDir = previousState && typeof previousState === "object" ? previousState.legacyManagedDir : "";
+    let uploadStats;
     if (manifest) {
-      await uploadManifestLocalFilesToRemote({
+      uploadStats = await uploadManifestLocalFilesToRemote({
         localPath,
         sftp,
         manifest,
         uploadOptions: options,
       });
     } else {
-      await uploadAllLocalToRemote({ localPath, sftp, writeState: options.stateFileMode !== "virtual", pathConfirmed: true, options });
+      uploadStats = await uploadAllLocalToRemote({ localPath, sftp, writeState: options.stateFileMode !== "virtual", pathConfirmed: true, options });
     }
     const missingManagedFiles = manifest && options.pruneManagedFiles !== false
       ? getMissingManagedFiles(previousManifest, manifest, sftp.ignore)
@@ -1017,6 +1023,14 @@ async function uploadWorkspaceCore(options = {}) {
     if (options.stateFileMode !== "virtual") {
       writeLocalCodeSyncState(localPath, state);
     }
+    const legacyLocalManagedDir = path.join(localPath, "zlk_cluster");
+    const hasLegacyLocalManagedDir = fs.existsSync(legacyLocalManagedDir);
+    if (hasLegacyLocalManagedDir) {
+      void vscode.window.showWarningMessage(`检测到本地旧版托管目录 ${legacyLocalManagedDir}。新状态已写入 simple_cluster；请人工核对后手动删除。`);
+    }
+    if (legacyManagedDir && !options.apiMode) {
+      void vscode.window.showWarningMessage(`检测到旧版托管目录 ${remoteRoot}/${legacyManagedDir}。新上传已改用 ${remoteRoot}/simple_cluster；请人工核对其中的自有文件后手动删除该目录。`);
+    }
     return {
       ok: true,
       targetId: options.targetId || options.id || sftp.name || sftp.host,
@@ -1024,6 +1038,9 @@ async function uploadWorkspaceCore(options = {}) {
       fingerprint: state.fingerprint,
       uploadedAt: state.updatedAt,
       deletedRemoteFiles: prune.deleted,
+      stats: uploadStats,
+      legacyManagedPath: legacyManagedDir ? `${remoteRoot}/${legacyManagedDir}` : "",
+      cleanupRequired: Boolean(legacyManagedDir || hasLegacyLocalManagedDir),
     };
   } catch (error) {
     if (options.apiMode) throw error;
@@ -1034,9 +1051,9 @@ async function uploadWorkspaceCore(options = {}) {
 }
 
 async function uploadManifestLocalFilesToRemote({ localPath, sftp, manifest, uploadOptions = {} }) {
-  const relativePaths = getManifestUploadRelativePaths({ localPath, sftp, manifest });
-  if (relativePaths.length > 0) {
-    await vscode.window.withProgress(
+  const uploadPlan = createManifestUploadPlan({ localPath, sftp, manifest });
+  if (uploadPlan.fileCount > 0) {
+    return await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
         title: `上传受管理代码文件 -> ${sftp.remotePath}`,
@@ -1045,7 +1062,7 @@ async function uploadManifestLocalFilesToRemote({ localPath, sftp, manifest, upl
       (_progress, token) => runLocalTarUpload({
         localPath,
         sftp,
-        relativePaths,
+        uploadPlan,
         operation: "上传受管理代码文件",
         timeoutMs: transferTimeoutMs(sftp, uploadOptions),
         token,
@@ -1053,6 +1070,15 @@ async function uploadManifestLocalFilesToRemote({ localPath, sftp, manifest, upl
       })
     );
   }
+  return {
+    fileCount: 0,
+    byteCount: 0,
+    excludedRuleHits: 0,
+    excludedNestedGitRepos: 0,
+    nestedGitRoots: [],
+    durationMs: 0,
+    verification: { method: "manifest-empty" },
+  };
 }
 
 async function uploadFiles(options = {}) {
@@ -1072,6 +1098,7 @@ async function uploadFilesCore(options = {}) {
     await confirmTransferPath({ localPath: localBase, sftp, operation: "上传指定文件", detail: filesSummary(options.files), options });
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-files-"));
     const relativePaths = [];
+    const uploadPlanFiles = [];
     for (const item of files) {
       const rawLocalPath = typeof item === "string" ? item : String(item && (item.localPath || item.path) || "");
       const localPath = resolveUploadFilePath(rawLocalPath);
@@ -1083,13 +1110,15 @@ async function uploadFilesCore(options = {}) {
       fs.mkdirSync(path.dirname(targetPath), { recursive: true });
       fs.copyFileSync(localPath, targetPath);
       relativePaths.push(toPosixPath(remoteName));
+      uploadPlanFiles.push({ relativePath: toPosixPath(remoteName), fullPath: targetPath, size: fs.statSync(targetPath).size });
     }
     if (options.manifest) {
       const manifestPath = path.join(tempDir, "runtime_manifest.json");
       fs.writeFileSync(manifestPath, `${JSON.stringify(options.manifest, null, 2)}\n`, "utf8");
       relativePaths.push("runtime_manifest.json");
+      uploadPlanFiles.push({ relativePath: "runtime_manifest.json", fullPath: manifestPath, size: fs.statSync(manifestPath).size });
     }
-    await vscode.window.withProgress(
+    const stats = await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
         title: `上传指定文件 -> ${sftp.remotePath}`,
@@ -1098,7 +1127,7 @@ async function uploadFilesCore(options = {}) {
       (_progress, token) => runLocalTarUpload({
         localPath: tempDir,
         sftp,
-        relativePaths,
+        uploadPlan: { files: uploadPlanFiles, fileCount: uploadPlanFiles.length, byteCount: uploadPlanFiles.reduce((total, file) => total + file.size, 0), excludedRuleHits: 0, excludedNestedGitRepos: 0, nestedGitRoots: [] },
         operation: "上传指定文件",
         timeoutMs: transferTimeoutMs(sftp, options),
         token,
@@ -1110,6 +1139,7 @@ async function uploadFilesCore(options = {}) {
       targetId: options.targetId || options.id || sftp.name || sftp.host,
       remotePath: sftp.remotePath,
       files: relativePaths,
+      stats: stats,
       uploadedAt: new Date().toISOString(),
     };
   } catch (error) {
@@ -1219,7 +1249,7 @@ function createCodeSyncState(sftp, options) {
 }
 
 function writeLocalCodeSyncState(localPath, state) {
-  const dir = path.join(localPath, "zlk_cluster");
+  const dir = path.join(localPath, "simple_cluster");
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, "code_sync_state.json"), `${JSON.stringify(state, null, 2)}\n`, "utf8");
 }
@@ -1236,7 +1266,7 @@ async function pruneRemoteMissingManagedFiles(sftp, missing) {
       "deleted=0",
       "for rel in paths:",
       "    rel=rel.replace('\\\\','/').lstrip('/')",
-      "    if not rel or rel.startswith('../') or '/../' in rel or rel.startswith('zlk_cluster/'):",
+      "    if not rel or rel.startswith('../') or '/../' in rel or rel.startswith('simple_cluster/') or rel.startswith('zlk_cluster/'):",
       "        continue",
       "    target=os.path.abspath(os.path.join(root, rel))",
       "    base=os.path.abspath(root)",
@@ -1265,8 +1295,16 @@ function getManifestUploadRelativePaths({ localPath, manifest }) {
   const managedManifest = getManagedManifest(manifest);
   if (!managedManifest) return [];
   const paths = [];
+  let legacyManagedPathWarned = false;
   for (const key of Object.keys(managedManifest).sort((a, b) => a.localeCompare(b))) {
     const relativePath = sanitizeRelativeUploadPath(key);
+    if (relativePath.replace(/\\/g, "/").toLowerCase().startsWith("zlk_cluster/")) {
+      if (!legacyManagedPathWarned) {
+        void vscode.window.showWarningMessage(`检测到旧版托管路径 ${relativePath}；新版本不会上传它。请人工核对后删除本地/远端旧版 zlk_cluster 目录。`);
+        legacyManagedPathWarned = true;
+      }
+      continue;
+    }
     if (!isSafeRemoteManagedPath(relativePath)) {
       throw new Error(`不安全的受管理代码路径：${relativePath}`);
     }
@@ -1294,17 +1332,30 @@ function getMissingManagedFiles(previous, manifest, ignorePatterns) {
 }
 
 async function readRemoteCodeManifest(sftp) {
-  const manifestPath = `${String(sftp.remotePath).replace(/\/+$/, "")}/zlk_cluster/code_sync_manifest.json`;
-  const stdout = await runSsh(sftp, `if [ -f ${shellQuote(manifestPath)} ]; then cat ${shellQuote(manifestPath)}; fi`, 20000);
-  const text = String(stdout || "").trim();
-  return text ? JSON.parse(text) : null;
+  const remoteRoot = `${String(sftp.remotePath).replace(/\/+$/, "")}`;
+  const managedDirs = [
+    { dir: "simple_cluster", legacy: false },
+    { dir: "zlk_cluster", legacy: true },
+  ];
+  for (const managedDir of managedDirs) {
+    const manifestPath = `${remoteRoot}/${managedDir.dir}/code_sync_manifest.json`;
+    const stdout = await runSsh(sftp, `if [ -f ${shellQuote(manifestPath)} ]; then cat ${shellQuote(manifestPath)}; fi`, 20000);
+    const text = String(stdout || "").trim();
+    if (text) {
+      return {
+        manifest: JSON.parse(text),
+        legacyManagedDir: managedDir.legacy ? managedDir.dir : "",
+      };
+    }
+  }
+  return null;
 }
 
 async function writeRemoteCodeSyncState(sftp, state, manifest) {
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) return;
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zlk-code-sync-state-"));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-code-sync-state-"));
   try {
-    const stateDir = path.join(tempDir, "zlk_cluster");
+    const stateDir = path.join(tempDir, "simple_cluster");
     fs.mkdirSync(stateDir, { recursive: true });
     fs.writeFileSync(path.join(stateDir, "code_sync_state.json"), `${JSON.stringify(state, null, 2)}\n`, "utf8");
     fs.writeFileSync(path.join(stateDir, "code_sync_manifest.json"), `${JSON.stringify({
@@ -1315,7 +1366,16 @@ async function writeRemoteCodeSyncState(sftp, state, manifest) {
     await runLocalTarUpload({
       localPath: tempDir,
       sftp,
-      relativePaths: ["zlk_cluster/code_sync_state.json", "zlk_cluster/code_sync_manifest.json"],
+      uploadPlan: {
+        files: [
+          { relativePath: "simple_cluster/code_sync_state.json", fullPath: path.join(stateDir, "code_sync_state.json"), size: fs.statSync(path.join(stateDir, "code_sync_state.json")).size },
+          { relativePath: "simple_cluster/code_sync_manifest.json", fullPath: path.join(stateDir, "code_sync_manifest.json"), size: fs.statSync(path.join(stateDir, "code_sync_manifest.json")).size },
+        ],
+        fileCount: 2,
+        excludedRuleHits: 0,
+        excludedNestedGitRepos: 0,
+        nestedGitRoots: [],
+      },
       operation: "上传代码同步 manifest",
     });
   } finally {
@@ -1328,6 +1388,7 @@ function isSafeRemoteManagedPath(relativePath) {
   if (!normalized || normalized.includes("..") || path.posix.isAbsolute(normalized)) return false;
   const top = normalized.split("/")[0].toLowerCase();
   if ([".git", ".vscode", "zlk_cluster", "data", "dataset", "datasets", "checkpoints", "checkpoint", "weights", "runs", "work_dirs", "outputs", "output", "results", "logs"].includes(top)) return false;
+  if (top === "simple_cluster") return true;
   return !/[\\]|\0/.test(normalized);
 }
 
@@ -1340,7 +1401,7 @@ function sanitizeRelativeUploadPath(value) {
 }
 
 function targetIgnoreStatePath(localPath) {
-  return path.join(localPath, "zlk_cluster", TARGET_IGNORE_STATE);
+  return path.join(localPath, "simple_cluster", TARGET_IGNORE_STATE);
 }
 
 function targetIgnoreKey(options, sftp) {
@@ -1348,15 +1409,21 @@ function targetIgnoreKey(options, sftp) {
   return String(options.targetId || options.id || server.id || server.label || sftp.name || `${sftp.host}:${sftp.remotePath}`).trim();
 }
 
+function legacyTargetIgnoreStatePath(localPath) {
+  return path.join(localPath, "zlk_cluster", TARGET_IGNORE_STATE);
+}
+
 function readTargetIgnoreState(localPath) {
-  const file = targetIgnoreStatePath(localPath);
-  if (!fs.existsSync(file)) return {};
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
+  for (const file of [targetIgnoreStatePath(localPath), legacyTargetIgnoreStatePath(localPath)]) {
+    if (!fs.existsSync(file)) continue;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch {
+      // Fall through and try the next managed-state location.
+    }
   }
+  return {};
 }
 
 function readTargetIgnorePatterns(localPath, options, sftp) {
@@ -1496,8 +1563,12 @@ async function configureIgnoresCore(options = {}) {
         await openWorkspaceRelativeFile(".vscode/sftp.json");
       }
       if (action === "打开目标忽略状态") {
-        await openWorkspaceRelativeFile(`zlk_cluster/${TARGET_IGNORE_STATE}`);
+        await openWorkspaceRelativeFile(`simple_cluster/${TARGET_IGNORE_STATE}`);
       }
+    }
+    const legacyManagedDir = path.join(localPath, "zlk_cluster");
+    if (fs.existsSync(legacyManagedDir) && !options.apiMode) {
+      void vscode.window.showWarningMessage(`检测到旧版托管目录 ${legacyManagedDir}；新状态已写入 simple_cluster。请人工核对后手动删除。`);
     }
     return { ok: true, targetId: targetIgnoreKey(options, sftp), remotePath: sftp.remotePath, ignore: sftp.ignore };
   } catch (error) {
@@ -2774,6 +2845,18 @@ async function uploadChangedLocalFilesCore({ localPath, sftp }) {
     vscode.window.setStatusBarMessage("SimpleSFTP：没有需要上传的变更文件", 2500);
     return;
   }
+  const uploadPlan = {
+    mode: "changed",
+    files: changedFiles.map((relativePath) => {
+      const fullPath = path.join(localPath, relativePath);
+      return { relativePath, fullPath, size: fs.statSync(fullPath).size };
+    }),
+    excludedRuleHits: 0,
+    excludedNestedGitRepos: 0,
+    nestedGitRoots: [],
+  };
+  uploadPlan.fileCount = uploadPlan.files.length;
+  uploadPlan.byteCount = uploadPlan.files.reduce((total, file) => total + file.size, 0);
 
   await vscode.window.withProgress(
     {
@@ -2784,7 +2867,7 @@ async function uploadChangedLocalFilesCore({ localPath, sftp }) {
     (_progress, token) => runLocalTarUpload({
       localPath,
       sftp,
-      relativePaths: changedFiles,
+      uploadPlan,
       operation: "上传变更文件",
       timeoutMs: transferTimeoutMs(sftp),
       token,
@@ -2820,7 +2903,11 @@ async function uploadAllLocalToRemoteCore({ localPath, sftp, writeState = true, 
   }
 
   const uploadStartedAt = new Date();
-  await vscode.window.withProgress(
+  const uploadPlan = createWorkspaceUploadPlan(localPath, sftp);
+  if (!uploadPlan.fileCount) {
+    throw new Error("没有要上传的文件；所有文件都被忽略规则排除。");
+  }
+  const stats = await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
       title: `上传全部本地文件 -> ${sftp.remotePath}`,
@@ -2829,7 +2916,7 @@ async function uploadAllLocalToRemoteCore({ localPath, sftp, writeState = true, 
     (_progress, token) => runLocalTarUpload({
       localPath,
       sftp,
-      relativePaths: null,
+      uploadPlan,
       operation: "上传全部文件",
       timeoutMs: transferTimeoutMs(sftp, options),
       token,
@@ -2843,6 +2930,7 @@ async function uploadAllLocalToRemoteCore({ localPath, sftp, writeState = true, 
       remotePath: sftp.remotePath,
     });
   }
+  return stats;
 }
 
 function findChangedLocalFiles({ localPath, sftp }) {
@@ -2857,8 +2945,15 @@ function findChangedLocalFiles({ localPath, sftp }) {
   return changed.sort((a, b) => a.localeCompare(b));
 }
 
-function walkLocalFiles(rootPath, relativeDir, ignorePatterns, visitFile) {
+function walkLocalFiles(rootPath, relativeDir, ignorePatterns, visitFile, planStats = null, nestedGitRoots = null) {
   const currentDir = relativeDir ? path.join(rootPath, relativeDir) : rootPath;
+  if (relativeDir && fs.existsSync(path.join(currentDir, ".git"))) {
+    if (planStats) {
+      planStats.excludedNestedGitRepos += 1;
+      (nestedGitRoots || []).push(relativeDir);
+    }
+    return;
+  }
   let entries = [];
   try {
     entries = fs.readdirSync(currentDir, { withFileTypes: true });
@@ -2868,18 +2963,75 @@ function walkLocalFiles(rootPath, relativeDir, ignorePatterns, visitFile) {
 
   for (const entry of entries) {
     const relativePath = toPosixPath(relativeDir ? path.join(relativeDir, entry.name) : entry.name);
-    if (isIgnoredLocalPath(relativePath, ignorePatterns)) continue;
+    const ignored = isIgnoredLocalPath(relativePath, ignorePatterns);
+    if (ignored && planStats) planStats.excludedRuleHits += 1;
+    if (ignored) continue;
 
     const fullPath = path.join(rootPath, relativePath);
     if (entry.isSymbolicLink()) continue;
     if (entry.isDirectory()) {
-      walkLocalFiles(rootPath, relativePath, ignorePatterns, visitFile);
+      walkLocalFiles(rootPath, relativePath, ignorePatterns, visitFile, planStats, nestedGitRoots);
       continue;
     }
     if (entry.isFile()) {
       visitFile(relativePath, fullPath);
     }
   }
+}
+
+function createWorkspaceUploadPlan(localPath, sftp) {
+  const files = [];
+  const nestedGitRoots = [];
+  const stats = { excludedRuleHits: 0, excludedNestedGitRepos: 0 };
+  walkLocalFiles(localPath, "", sftp.ignore, (relativePath, fullPath) => {
+    const size = fs.statSync(fullPath).size;
+    files.push({ relativePath, fullPath, size });
+    stats.byteCount = (stats.byteCount || 0) + Number(size) || 0;
+  }, stats, nestedGitRoots);
+  files.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+  return {
+    mode: "workspace",
+    files,
+    fileCount: files.length,
+    byteCount: files.reduce((total, file) => total + file.size, 0),
+    excludedRuleHits: stats.excludedRuleHits,
+    excludedNestedGitRepos: stats.excludedNestedGitRepos,
+    nestedGitRoots: nestedGitRoots.sort(),
+  };
+}
+
+function createManifestUploadPlan({ localPath, sftp, manifest }) {
+  const relativePaths = getManifestUploadRelativePaths({ localPath, sftp, manifest });
+  const files = relativePaths.map((relativePath) => {
+    const fullPath = path.join(localPath, relativePath);
+    const size = fs.statSync(fullPath).size;
+    return { relativePath, fullPath, size };
+  });
+  return {
+    mode: "manifest",
+    files,
+    fileCount: files.length,
+    byteCount: files.reduce((total, file) => total + file.size, 0),
+    excludedRuleHits: 0,
+    excludedNestedGitRepos: 0,
+    nestedGitRoots: [],
+  };
+}
+
+function hashUploadPlanChunks(files, chunkSize = 500) {
+  const hash = crypto.createHash("sha256");
+  const chunks = [];
+  for (let start = 0; start < files.length; start += chunkSize) {
+    const entries = files.slice(start, start + chunkSize).map((file) => [
+      toTarPath(file.relativePath),
+      Number(file.size) || 0,
+    ]);
+    const payload = `${start}:${entries.length}:${JSON.stringify(entries)}`;
+    const checksum = crypto.createHash("sha256").update(payload, "utf8").digest("hex");
+    hash.update(checksum);
+    chunks.push({ start, count: entries.length, checksum });
+  }
+  return { algorithm: "sha256", chunkSize, chunks, combinedChecksum: hash.digest("hex") };
 }
 
 function getUploadBaselineMs(localPath) {
@@ -2994,10 +3146,27 @@ function getWorkspaceFolderForFile(filePath) {
     .map(({ folder }) => folder)[0] || null;
 }
 
-function runLocalTarUpload({ localPath, sftp, relativePaths, operation, timeoutMs, token, transferId }) {
+function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, token, transferId }) {
   const remoteCommand = createRemoteExtractCommand(sftp.remotePath);
-  const tarArgs = createLocalTarArgs(sftp, relativePaths);
-  return new Promise((resolve, reject) => {
+  const plan = uploadPlan || createWorkspaceUploadPlan(localPath, sftp);
+  const fileTempDir = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-filelist-"));
+  const fileList = path.join(fileTempDir, "files.txt");
+  let fileListContent;
+  try {
+    fileListContent = `${plan.files.map((file) => toTarPath(file.relativePath)).join("\0")}\0`;
+    fs.writeFileSync(fileList, fileListContent, "utf8");
+    const readback = fs.readFileSync(fileList, "utf8");
+    if (readback !== fileListContent) {
+      throw new Error("上传清单校验失败：写入的临时文件列表不一致。");
+    }
+  } catch (error) {
+    fs.rmSync(fileTempDir, { recursive: true, force: true });
+    throw error;
+  }
+  const chunkedChecksum = hashUploadPlanChunks(plan.files);
+  const tarArgs = createLocalTarArgs(sftp, plan, fileList);
+  const startedAt = Date.now();
+  const upload = new Promise((resolve, reject) => {
     const controller = createTransferController({
       id: transferId || nextTransferId(operation),
       operation,
@@ -3026,6 +3195,7 @@ function runLocalTarUpload({ localPath, sftp, relativePaths, operation, timeoutM
 
     const stopController = () => {
       clearTimeout(timer);
+      fs.rmSync(fileList, { force: true });
       if (tokenDisposable && typeof tokenDisposable.dispose === "function") {
         tokenDisposable.dispose();
       }
@@ -3055,7 +3225,19 @@ function runLocalTarUpload({ localPath, sftp, relativePaths, operation, timeoutM
         })));
         return;
       }
-      resolve();
+      resolve({
+        fileCount: plan.fileCount,
+        byteCount: plan.byteCount,
+        excludedRuleHits: plan.excludedRuleHits,
+        excludedNestedGitRepos: plan.excludedNestedGitRepos,
+        nestedGitRoots: plan.nestedGitRoots,
+        durationMs: Date.now() - startedAt,
+        verification: {
+          method: "chunked-sha256",
+          ...chunkedChecksum,
+          fileListSha256: crypto.createHash("sha256").update(fileListContent, "utf8").digest("hex"),
+        },
+      });
     };
 
     cancelListener = (reason) => fail(new Error(reason || "传输已取消"));
@@ -3090,15 +3272,19 @@ function runLocalTarUpload({ localPath, sftp, relativePaths, operation, timeoutM
     sshProc.on("close", (code, signal) => {
       sshCode = code === null ? `signal ${signal || "unknown"}` : code;
       finish();
+      });
     });
+
+  return upload.finally(() => {
+    fs.rmSync(fileTempDir, { recursive: true, force: true });
   });
 }
 
-function createLocalTarArgs(sftp, relativePaths) {
-  if (Array.isArray(relativePaths) && relativePaths.length > 0) {
-    return ["-cf", "-", "--", ...relativePaths.map(toTarPath)];
+function createLocalTarArgs(_sftp, uploadPlan, fileListPath) {
+  if (uploadPlan?.fileCount && fileListPath) {
+    return ["-cf", "-", "--null", "-T", fileListPath];
   }
-  return ["-cf", "-", ...getTarExcludeArgs(sftp.ignore), "."];
+  return ["-cf", "-"];
 }
 
 function createRemoteExtractCommand(remotePath) {
@@ -3436,6 +3622,9 @@ module.exports = {
     createTransferPreview,
     createTransferController,
     createLocalApiMethods,
+    createManifestUploadPlan,
+    createWorkspaceUploadPlan,
+    hashUploadPlanChunks,
     isRememberedTransferPath,
     listActiveTransfers,
     refreshConnectTimeoutFromConfig,
@@ -3447,6 +3636,7 @@ module.exports = {
     getMissingManagedFiles,
     formatSftpTargetSummary,
     getTarExcludeArgs,
+    legacyTargetIgnoreStatePath,
     isIgnoredLocalPath,
     isSafeRemoteManagedPath,
     mergeIgnorePatterns,
