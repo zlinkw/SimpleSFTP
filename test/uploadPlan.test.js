@@ -101,17 +101,56 @@ test("upload file list is checksummed in bounded chunks", () => {
   assert.match(verification.combinedChecksum, /^[a-f0-9]{64}$/);
 });
 
-test("tar upload uses a temporary NUL-delimited file list instead of path arguments", () => {
-  assert.doesNotMatch(source, /createLocalTarArgs\(sftp,\s*relativePaths/);
+test("managed uploads write UTF-8 tar directly instead of invoking Windows tar", () => {
+  const start = source.indexOf("function runLocalTarUpload");
+  const end = source.indexOf("function createRemoteExtractCommand", start);
+  assert.ok(start >= 0 && end > start, "missing managed upload implementation");
+  const upload = source.slice(start, end);
+  assert.doesNotMatch(upload, /createLocalTarArgs/);
   assert.doesNotMatch(source, /"--",\s*\.\.\.relativePaths\.map\(toTarPath\)/);
-  assert.match(source, /function createLocalTarArgs\(_sftp, uploadPlan, fileListPath\)/);
-  assert.match(source, /return \["-cf", "-", "--null", "-T", fileListPath\];/);
-  assert.match(source, /const fileTempDir = fs\.mkdtempSync\(/);
-  assert.match(source, /fileListContent = `\$\{plan\.files\.map\(\(file\) => toTarPath\(file\.relativePath\)\)\.join\(/);
-  assert.match(source, /fs\.writeFileSync\(fileList, fileListContent, "utf8"\)/);
-  assert.match(source, /"--null",\s*"-T",\s*fileList/);
+  assert.doesNotMatch(upload, /spawn\("tar"/);
+  assert.match(upload, /writeTarEntriesToStream\(\{ localPath, files: plan\.files, stream: sshProc\.stdin \}\)/);
+  assert.match(source, /manifestSha256:/);
   assert.match(source, /hashUploadPlanChunks\(plan\.files\)/);
-  assert.match(source, /return upload\.finally\(\(\) => \{\s*fs\.rmSync\(fileTempDir,\s*\{ recursive: true, force: true \}\);/);
+});
+
+test("tar writer preserves UTF-8 and long POSIX paths", async () => {
+  const { execFile } = require("node:child_process");
+  const { promisify } = require("node:util");
+  const execFileAsync = promisify(execFile);
+  const writer = require("../tar-writer.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-tar-"));
+  const extract = path.join(root, "extract");
+  const unicodeRelative = "数据/实验配置.yaml";
+  const longRelative = `${Array.from({ length: 12 }, (_, index) => `directory-${index}`).join("/")}/final-result.txt`;
+  fs.mkdirSync(path.dirname(path.join(root, unicodeRelative)), { recursive: true });
+  fs.mkdirSync(path.dirname(path.join(root, longRelative)), { recursive: true });
+  fs.writeFileSync(path.join(root, unicodeRelative), "中文内容\n");
+  fs.writeFileSync(path.join(root, longRelative), "ok\n");
+
+  try {
+    const archive = fs.createWriteStream(path.join(root, "workspace.tar"));
+    const written = writer.writeTarEntriesToStream({
+      localPath: root,
+      files: [
+        { relativePath: unicodeRelative, fullPath: path.join(root, unicodeRelative) },
+        { relativePath: longRelative, fullPath: path.join(root, longRelative) },
+      ],
+      stream: archive,
+    });
+    await written;
+    await new Promise((resolve, reject) => {
+      archive.on("error", reject);
+      archive.on("finish", resolve);
+      archive.end();
+    });
+    fs.mkdirSync(extract);
+    await execFileAsync("tar", ["-xf", path.join(root, "workspace.tar"), "-C", extract]);
+    assert.equal(fs.readFileSync(path.join(extract, unicodeRelative), "utf8"), "中文内容\n");
+    assert.equal(fs.readFileSync(path.join(extract, longRelative), "utf8"), "ok\n");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("managed state uses simple_cluster and reports legacy directories for manual cleanup", () => {

@@ -5,6 +5,7 @@ const path = require("path");
 const crypto = require("crypto");
 const { execFile, spawn } = require("child_process");
 const { resolveWorkspaceLocation } = require("./workspace-path.js");
+const { toTarPath: tarEntryPath, writeTarEntriesToStream } = require("./tar-writer.js");
 const { LocalApiServer, confirmationRequired } = require("./api-server.js");
 const {
   HostOperationLeaseConflictError,
@@ -3199,22 +3200,8 @@ function getWorkspaceFolderForFile(filePath) {
 function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, token, transferId }) {
   const remoteCommand = createRemoteExtractCommand(sftp.remotePath);
   const plan = uploadPlan || createWorkspaceUploadPlan(localPath, sftp);
-  const fileTempDir = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-filelist-"));
-  const fileList = path.join(fileTempDir, "files.txt");
-  let fileListContent;
-  try {
-    fileListContent = `${plan.files.map((file) => toTarPath(file.relativePath)).join("\0")}\0`;
-    fs.writeFileSync(fileList, fileListContent, "utf8");
-    const readback = fs.readFileSync(fileList, "utf8");
-    if (readback !== fileListContent) {
-      throw new Error("上传清单校验失败：写入的临时文件列表不一致。");
-    }
-  } catch (error) {
-    fs.rmSync(fileTempDir, { recursive: true, force: true });
-    throw error;
-  }
+  const manifestContent = `${plan.files.map((file) => tarEntryPath(file.relativePath)).join("\n")}\n`;
   const chunkedChecksum = hashUploadPlanChunks(plan.files);
-  const tarArgs = createLocalTarArgs(sftp, plan, fileList);
   const startedAt = Date.now();
   const upload = new Promise((resolve, reject) => {
     const controller = createTransferController({
@@ -3224,20 +3211,13 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
       remotePath: String(sftp && sftp.remotePath || ""),
       host: String(sftp && sftp.host || ""),
     });
-    const tarProc = spawn("tar", tarArgs, {
-      cwd: localPath,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
     const sshProc = spawn("ssh", getSshArgs(sftp, remoteCommand), {
       windowsHide: true,
       stdio: ["pipe", "ignore", "pipe"],
     });
 
     let settled = false;
-    let tarCode;
     let sshCode;
-    let tarStderr = "";
     let sshStderr = "";
     let cancelListener;
     let tokenDisposable;
@@ -3245,7 +3225,6 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
 
     const stopController = () => {
       clearTimeout(timer);
-      fs.rmSync(fileList, { force: true });
       if (tokenDisposable && typeof tokenDisposable.dispose === "function") {
         tokenDisposable.dispose();
       }
@@ -3256,7 +3235,6 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
       if (settled) return;
       settled = true;
       stopController();
-      tarProc.kill();
       sshProc.kill();
       reject(classifyTransportFailure(error, {
         command: remoteCommand,
@@ -3266,24 +3244,19 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
     };
 
     const finish = () => {
-      if (settled || tarCode === undefined || sshCode === undefined) return;
+      if (settled || sshCode === undefined) return;
       settled = true;
       stopController();
-      if (tarCode !== 0 || sshCode !== 0) {
+      if (sshCode !== 0) {
         const failure = new Error(formatProcessFailure({
           operation,
-          tarCode,
           sshCode,
-          tarStderr,
           sshStderr,
         }));
-        Object.assign(failure.details || {}, { sshExitCode: sshCode, tarExitCode: tarCode });
         reject(classifyTransportFailure(failure, {
           command: remoteCommand,
           sshCode,
-          tarCode,
           sshStderr,
-          tarStderr,
         }));
         return;
       }
@@ -3297,7 +3270,7 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
         verification: {
           method: "chunked-sha256",
           ...chunkedChecksum,
-          fileListSha256: crypto.createHash("sha256").update(fileListContent, "utf8").digest("hex"),
+          manifestSha256: crypto.createHash("sha256").update(manifestContent, "utf8").digest("hex"),
         },
       });
     };
@@ -3316,21 +3289,15 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
       timer = setTimeout(() => fail(new Error(`SimpleSFTP 传输超过 ${Math.round(timeout / 1000)} 秒未完成，已停止。`)), timeout);
     }
 
-    tarProc.on("error", fail);
     sshProc.on("error", fail);
-    tarProc.stderr.on("data", (chunk) => {
-      tarStderr = appendProcessOutput(tarStderr, chunk);
-    });
     sshProc.stderr.on("data", (chunk) => {
       sshStderr = appendProcessOutput(sshStderr, chunk);
     });
     sshProc.stdin.on("error", () => {});
 
-    tarProc.stdout.pipe(sshProc.stdin);
-    tarProc.on("close", (code, signal) => {
-      tarCode = code === null ? `signal ${signal || "unknown"}` : code;
-      finish();
-    });
+    writeTarEntriesToStream({ localPath, files: plan.files, stream: sshProc.stdin })
+      .then(() => sshProc.stdin.end())
+      .catch(fail);
     sshProc.on("close", (code, signal) => {
       sshCode = code === null ? `signal ${signal || "unknown"}` : code;
       finish();
@@ -3338,15 +3305,7 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
     });
 
   return upload.finally(() => {
-    fs.rmSync(fileTempDir, { recursive: true, force: true });
   });
-}
-
-function createLocalTarArgs(_sftp, uploadPlan, fileListPath) {
-  if (uploadPlan?.fileCount && fileListPath) {
-    return ["-cf", "-", "--null", "-T", fileListPath];
-  }
-  return ["-cf", "-"];
 }
 
 function createRemoteExtractCommand(remotePath) {
@@ -3756,7 +3715,6 @@ module.exports = {
   __test: {
     addTarExcludePattern,
     apiTransferSftp,
-    createLocalTarArgs,
     createListRemoteDirsSshArgs,
     createRemoteExtractCommand,
     createRemoteTarCommand,
