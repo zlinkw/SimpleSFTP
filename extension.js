@@ -1449,10 +1449,19 @@ async function writeRemoteCodeSyncState(sftp, state, manifest) {
 function isSafeRemoteManagedPath(relativePath) {
   const normalized = toPosixPath(relativePath).replace(/^\/+/, "");
   if (!normalized || normalized.includes("..") || path.posix.isAbsolute(normalized)) return false;
-  const top = normalized.split("/")[0].toLowerCase();
-  if ([".git", ".vscode", "zlk_cluster", "data", "dataset", "datasets", "checkpoints", "checkpoint", "weights", "runs", "work_dirs", "outputs", "output", "results", "logs"].includes(top)) return false;
+  if (/[\\]|\0/.test(normalized)) return false;
+  const segments = normalized.toLowerCase().split("/");
+  const top = segments[0];
+  if (top === "data") {
+    if (segments.length < 2 || segments.slice(1, -1).some((segment) => ["raw", "processed", "patients", "patient", "subjects", "images", "image", "features", "feature_cache", "cache", ".cache", "checkpoints", "checkpoint", "weights", "weight", "pretrained", "runs", "work_dirs", "__pycache__", "artifacts", "outputs", "results"].includes(segment))) return false;
+    const basename = segments.at(-1);
+    if (/\.(py|pyi)$/.test(basename)) return true;
+    return /(?:^|[._-])(config|settings|schema|manifest|protocol|metadata)(?:[._-]|$)/.test(basename)
+      && /\.(yaml|yml|toml|ini|cfg|json)$/.test(basename);
+  }
+  if ([".git", ".vscode", "zlk_cluster", "dataset", "datasets", "checkpoints", "checkpoint", "weights", "runs", "work_dirs", "outputs", "output", "results", "logs"].includes(top)) return false;
   if (top === "simple_cluster") return true;
-  return !/[\\]|\0/.test(normalized);
+  return true;
 }
 
 function sanitizeRelativeUploadPath(value) {

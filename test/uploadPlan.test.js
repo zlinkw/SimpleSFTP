@@ -165,6 +165,45 @@ test("managed state uses simple_cluster and reports legacy directories for manua
   assert.match(safeTest, /top === "simple_cluster"/);
 });
 
+test("managed manifest accepts data source and named config but rejects data assets", () => {
+  const localPath = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-data-manifest-"));
+  const sandbox = { fs, path, vscode: { window: { showWarningMessage() {} } }, toPosixPath: (value) => String(value).replace(/\\/g, "/") };
+  vm.createContext(sandbox);
+  vm.runInContext([
+    source.slice(source.indexOf("function getManagedManifest("), source.indexOf("function getMissingManagedFiles(")),
+    source.slice(source.indexOf("function isSafeRemoteManagedPath("), source.indexOf("function targetIgnoreStatePath(")),
+    "this.getPaths = getManifestUploadRelativePaths;",
+  ].join("\n"), sandbox);
+  try {
+    const allowed = [
+      "data/__init__.py",
+      "data/auxiliary_views.py",
+      "data/multimodal_dataset.py",
+      "data/datasets/fixed_protocol_manifest.py",
+      "data/protocol_config.yaml",
+    ];
+    for (const relativePath of allowed) {
+      const file = path.join(localPath, relativePath);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, "content\n");
+    }
+    const paths = sandbox.getPaths({ localPath, manifest: Object.fromEntries(allowed.map((name) => [name, {}])) });
+    assert.deepEqual([...paths].sort(), allowed.sort());
+    for (const blocked of [
+      "data/patient_info.json",
+      "data/sample.npy",
+      "data/images/scan.png",
+      "data/weights/model.pt",
+      "data/patients/subject.py",
+      "data/datasets/patient_records.json",
+    ]) {
+      assert.throws(() => sandbox.getPaths({ localPath, manifest: { [blocked]: {} } }), /不安全的受管理代码路径/);
+    }
+  } finally {
+    fs.rmSync(localPath, { recursive: true, force: true });
+  }
+});
+
 test("legacy managed state is copied atomically and remains a read-only source", () => {
   const localPath = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-migration-"));
   try {
