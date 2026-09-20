@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.8
+
+- Upload preview and execution now resolve the same server and remote directory. An explicit remote path overrides a saved server root; conflicting explicit paths or a changed target stop the upload before transfer.
+- Server names in API requests resolve to saved profiles; unknown names fail instead of falling back to the active server.
+
 ## 0.2.7
 
 - Replaced the Windows tar subprocess for managed uploads with a Node UTF-8/PAX tar writer; Chinese and long workspace paths no longer fail with `Can't convert a path to a wchar_t string`.

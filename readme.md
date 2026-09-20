@@ -156,6 +156,8 @@ simple-sftp-api upload.workspace --json upload.json
 
 公开方法以 `/api/v1/capabilities` 的实时返回为准。
 
+指定文件上传时，`remotePath` 是实际目标目录。若同时传入 `server.remotePath`，两者必须一致；不一致时插件会拒绝上传。`target.show`、API 确认预览和实际传输使用同一目标解析逻辑。用服务器名称指定目标时，该名称必须匹配已保存的服务器配置；未知名称不会回退到当前活动服务器。上传前请核对预览中的主机、端口与远端目录。
+
 ## 故障排查
 
 | 问题 | 处理 |

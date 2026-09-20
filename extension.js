@@ -682,7 +682,7 @@ async function showCurrentTarget(options = {}) {
   if (!workspaceFolder && !options.localPath) {
     if (options.apiMode && hasExplicitTarget) {
       const localPath = String(options.localPath || "").trim();
-      const sftp = apiTransferSftp({ ...options, localPath });
+      const sftp = localPath ? resolveUploadSftp(localPath, options) : apiTransferSftp({ ...options, localPath });
       if (sftp && sftp.host && sftp.remotePath) {
         const summary = formatSftpTargetSummary(localPath, sftp);
         return {
@@ -701,7 +701,7 @@ async function showCurrentTarget(options = {}) {
     return { ok: false, error: "当前未打开工作区。请传入 localPath。" };
   }
   const localPath = String(options.localPath || getWorkspaceRoot()).trim();
-  const sftp = hasExplicitTarget ? apiTransferSftp({ ...options, localPath }) : readSftpConfig(localPath);
+  const sftp = hasExplicitTarget ? resolveUploadSftp(localPath, options) : readSftpConfig(localPath);
   if (!sftp || !sftp.remotePath || !sftp.host) {
     const message = hasExplicitTarget
       ? "未提供可用的 SFTP 目标。"
@@ -993,6 +993,7 @@ async function uploadWorkspaceCore(options = {}) {
     const localPath = resolveLocalWorkspacePath(options.localPath, "上传工作区");
     if (!localPath) throw new Error("请先打开工作区，或传入 localPath。");
     const sftp = resolveUploadSftp(localPath, options);
+    if (options.expectedTransferTarget) assertTransferTargetUnchanged(options.expectedTransferTarget, sftp);
     if (!sftp || !sftp.remotePath || !sftp.host) {
       throw new Error("未提供可用的 SFTP 目标。");
     }
@@ -1094,6 +1095,7 @@ async function uploadFilesCore(options = {}) {
     const localBase = resolveLocalWorkspacePath(options.localBase || options.localPath, "上传指定文件");
     if (!localBase) throw new Error("请先打开工作区，或传入 localBase。");
     const sftp = resolveUploadSftp(localBase, options);
+    if (options.expectedTransferTarget) assertTransferTargetUnchanged(options.expectedTransferTarget, sftp);
     if (!sftp || !sftp.remotePath || !sftp.host) throw new Error("没有可用的 SFTP 上传目标。");
     const files = Array.isArray(options.files) ? options.files : [];
     if (!files.length && !options.manifest) throw new Error("没有要上传的文件。");
@@ -1162,25 +1164,25 @@ function resolveUploadSftp(localPath, options) {
   const host = firstNonEmpty(
     incomingServer.transferHost,
     incomingServer.resolvedHost,
+    incomingServer.sftpHost,
+    incomingServer.sshHost,
+    incomingServer.host,
+    incomingServer.sshConfigHost,
+    incomingServer.sshConfigAlias,
+    options.sftpHost,
+    options.sshHost,
+    options.host,
+    options.sshConfigHost,
+    options.sshConfigAlias,
     sharedServer.transferHost,
     sharedServer.resolvedHost,
     sharedServer.sftpHost,
     sharedServer.sshHost,
     sharedServer.host,
-    incomingServer.sftpHost,
-    incomingServer.sshHost,
-    options.sftpHost,
-    options.sshHost,
-    incomingServer.host,
-    options.host,
-    incomingServer.sshConfigHost,
-    incomingServer.sshConfigAlias,
-    options.sshConfigHost,
-    options.sshConfigAlias,
     existing.host
   );
   const user = String(server.user || server.username || options.user || options.username || existing.username || "").trim();
-  const remotePath = String(server.remotePath || options.remotePath || existing.remotePath || "").replace(/\/+$/, "");
+  const remotePath = requestedRemotePath(options) || String(sharedServer.remotePath || sharedServer.remoteBase || existing.remotePath || "").replace(/\/+$/, "");
   const port = normalizeSshPort(server.sshPort || server.port || options.sshPort || options.port || existing.port, 22);
   const targetIgnores = readTargetIgnorePatterns(localPath, options, { host, remotePath });
   const ignore = mergeIgnorePatterns(existing.ignore, targetIgnores, options.ignore, server.ignore, DEFAULT_IGNORES);
@@ -1201,6 +1203,23 @@ function resolveUploadSftp(localPath, options) {
   };
 }
 
+function requestedRemotePath(options = {}) {
+  const server = options.server && typeof options.server === "object" ? options.server : {};
+  const top = String(options.remotePath || options.remoteBase || "").trim().replace(/\/+$/, "");
+  const nested = String(server.remotePath || server.remoteBase || "").trim().replace(/\/+$/, "");
+  if (top && nested && top !== nested) {
+    throw new Error(`远端目标冲突：请求 ${top}，服务器对象 ${nested}。已阻止传输。`);
+  }
+  return top || nested;
+}
+
+function assertTransferTargetUnchanged(expected, actual) {
+  const fields = ["host", "port", "username", "remotePath"];
+  if (fields.some((field) => String(expected?.[field] || "") !== String(actual?.[field] || ""))) {
+    throw new Error("上传目标在确认后发生变化，已阻止传输。");
+  }
+}
+
 function firstNonEmpty(...values) {
   for (const value of values) {
     const text = String(value || "").trim();
@@ -1213,17 +1232,22 @@ function sharedServerForOptions(options, server) {
   const candidates = sharedServerCandidateKeys(options, server);
   if (!candidates.length) return {};
   const data = readSharedServers();
-  return data.servers.find((item) => {
+  const found = data.servers.find((item) => {
     if (!item) return false;
     const keys = sharedServerCandidateKeys(item, item);
-    return keys.some((key) => candidates.includes(key));
-  }) || {};
+    return keys.some((key) => candidates.some((candidate) => candidate.toLowerCase() === key.toLowerCase()));
+  });
+  if (!found && typeof options?.server === "string" && options.server.trim()) {
+    throw new Error(`未找到指定的 SFTP 服务器：${options.server.trim()}`);
+  }
+  return found || {};
 }
 
 function sharedServerCandidateKeys(options, server) {
   const raw = [
     options && options.targetId,
     options && options.id,
+    options && typeof options.server === "string" ? options.server : "",
     server && server.targetId,
     server && server.id,
     server && server.label,
@@ -2299,7 +2323,7 @@ function createLocalApiMethods() {
     },
     "upload.workspace": async (params = {}) => {
       const localPath = String(params.localPath || "").trim();
-      const sftp = apiTransferSftp(params);
+      const sftp = resolveUploadSftp(localPath, params);
       requireApiConfirmation(params, {
         method: "upload.workspace",
         operation: "上传工作区",
@@ -2307,7 +2331,7 @@ function createLocalApiMethods() {
         localPath,
         pathRequired: true,
       });
-      const result = await uploadWorkspace({ ...params, apiMode: true });
+      const result = await uploadWorkspace({ ...params, apiMode: true, expectedTransferTarget: sftp });
       publishLocalApiEvent("upload.workspace", {
         targetId: result && result.targetId,
         remotePath: result && result.remotePath,
@@ -2320,7 +2344,7 @@ function createLocalApiMethods() {
         throw new Error("缺少上传文件列表 files 或 manifest。");
       }
       const localBase = String(params.localBase || params.localPath || "").trim();
-      const sftp = apiTransferSftp(params);
+      const sftp = resolveUploadSftp(localBase, params);
       requireApiConfirmation(params, {
         method: "upload.files",
         operation: "上传指定文件",
@@ -2328,7 +2352,7 @@ function createLocalApiMethods() {
         localPath: localBase,
         pathRequired: true,
       });
-      const result = await uploadFiles({ ...params, apiMode: true });
+      const result = await uploadFiles({ ...params, apiMode: true, expectedTransferTarget: sftp });
       publishLocalApiEvent("upload.files", {
         remotePath: result && result.remotePath,
         files: result && result.files,
@@ -2438,6 +2462,16 @@ function apiTransferSftp(params = {}) {
   const host = firstNonEmpty(
     incoming.transferHost,
     incoming.resolvedHost,
+    incoming.sftpHost,
+    incoming.sshHost,
+    incoming.host,
+    incoming.sshConfigHost,
+    incoming.sshConfigAlias,
+    params.sftpHost,
+    params.sshHost,
+    params.host,
+    params.sshConfigHost,
+    params.sshConfigAlias,
     shared.transferHost,
     shared.resolvedHost,
     merged.sftpHost,
@@ -2462,8 +2496,7 @@ function apiTransferSftp(params = {}) {
     22
   );
   const remotePath = String(
-    incoming.remotePath ||
-    incoming.remoteBase ||
+    requestedRemotePath(params) ||
     shared.remotePath ||
     shared.remoteBase ||
     merged.remotePath ||
