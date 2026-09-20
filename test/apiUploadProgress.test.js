@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
@@ -46,4 +47,46 @@ test("interactive upload retains the cancellable progress notification", async (
   });
   assert.equal(result.ok, true);
   assert.equal(runner.progressCalls, 1);
+});
+
+test("SSH spawn errors settle uploads even if killing the child throws", async () => {
+  const uploadStart = source.indexOf("function runLocalTarUpload(");
+  const uploadEnd = source.indexOf("function createRemoteExtractCommand(", uploadStart);
+  assert.ok(uploadStart >= 0 && uploadEnd > uploadStart);
+  let disposed = false;
+  const sandbox = {
+    Date,
+    Promise,
+    clearTimeout,
+    setTimeout,
+    crypto: require("node:crypto"),
+    createRemoteExtractCommand: () => "tar -xf -",
+    hashUploadPlanChunks: () => ({ algorithm: "sha256", chunks: [] }),
+    tarEntryPath: (value) => value,
+    createTransferController: () => ({ onCancel() {}, dispose() { disposed = true; } }),
+    nextTransferId: () => "test-upload",
+    getSshArgs: () => [],
+    transferTimeoutMs: () => 200,
+    classifyTransportFailure: (error) => error,
+    appendProcessOutput: () => "",
+    writeTarEntriesToStream: () => new Promise(() => {}),
+    spawn: () => {
+      const child = new EventEmitter();
+      child.stdin = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => { throw new Error("kill failed"); };
+      queueMicrotask(() => child.emit("error", new Error("ssh unavailable")));
+      return child;
+    },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`${source.slice(uploadStart, uploadEnd)}\nthis.upload = runLocalTarUpload;`, sandbox);
+  await assert.rejects(sandbox.upload({
+    localPath: "C:/project",
+    sftp: { remotePath: "/project" },
+    uploadPlan: { files: [], fileCount: 0, byteCount: 0 },
+    operation: "test",
+    timeoutMs: 200,
+  }), /ssh unavailable/);
+  assert.equal(disposed, true);
 });

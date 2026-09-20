@@ -3278,12 +3278,17 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
       if (settled) return;
       settled = true;
       stopController();
-      sshProc.kill();
-      reject(classifyTransportFailure(error, {
-        command: remoteCommand,
-        sshStderr,
-        tarStderr,
-      }));
+      // A failed spawn can make kill() throw. Always settle the upload Promise
+      // so the API request and shared host lease can finish with the cause.
+      try { sshProc.kill(); } catch {}
+      try {
+        reject(classifyTransportFailure(error, {
+          command: remoteCommand,
+          sshStderr,
+        }));
+      } catch {
+        reject(error);
+      }
     };
 
     const finish = () => {
