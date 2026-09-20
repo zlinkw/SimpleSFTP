@@ -222,6 +222,7 @@ const HIDDEN_TOP_LEVEL = new Set([
 const promptedWorkspaces = new Set();
 const uploadQueues = new Map();
 const activeTransfers = new Map();
+const activeUploadOperations = new Map();
 const SAVE_UPLOAD_STATE = "simple-sftp-upload-state.json";
 const TARGET_IGNORE_STATE = "sftp-target-ignores.json";
 const PATH_CONFIRMATIONS_STATE = "simple-sftp-confirmed-transfer-paths.v1";
@@ -1079,7 +1080,21 @@ async function uploadManifestLocalFilesToRemote({ localPath, sftp, manifest, upl
 
 async function uploadFiles(options = {}) {
   const localPath = resolveLocalWorkspacePath(options.localBase || options.localPath, "上传指定文件");
-  return withHostOperationLease("upload-files", "上传指定文件", localPath, () => uploadFilesCore(options));
+  const operationId = String(options.transferId || nextTransferId("upload-files"));
+  activeUploadOperations.set(operationId, { id: operationId, stage: "acquiring-lease", startedAt: new Date().toISOString() });
+  try {
+    return await withHostOperationLease("upload-files", "上传指定文件", localPath, () => {
+      setUploadOperationStage(operationId, "preparing-files");
+      return uploadFilesCore({ ...options, transferId: operationId });
+    });
+  } finally {
+    activeUploadOperations.delete(operationId);
+  }
+}
+
+function setUploadOperationStage(operationId, stage) {
+  const operation = activeUploadOperations.get(operationId);
+  if (operation) operation.stage = stage;
 }
 
 async function uploadFilesCore(options = {}) {
@@ -1092,7 +1107,9 @@ async function uploadFilesCore(options = {}) {
     if (!sftp || !sftp.remotePath || !sftp.host) throw new Error("没有可用的 SFTP 上传目标。");
     const files = Array.isArray(options.files) ? options.files : [];
     if (!files.length && !options.manifest) throw new Error("没有要上传的文件。");
+    setUploadOperationStage(options.transferId, "confirming-path");
     await confirmTransferPath({ localPath: localBase, sftp, operation: "上传指定文件", detail: filesSummary(options.files), options });
+    setUploadOperationStage(options.transferId, "staging-files");
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-files-"));
     const relativePaths = [];
     const uploadPlanFiles = [];
@@ -1115,6 +1132,7 @@ async function uploadFilesCore(options = {}) {
       relativePaths.push("runtime_manifest.json");
       uploadPlanFiles.push({ relativePath: "runtime_manifest.json", fullPath: manifestPath, size: fs.statSync(manifestPath).size });
     }
+    setUploadOperationStage(options.transferId, "transferring");
     const stats = await runUploadWithProgress(options, `上传指定文件 -> ${sftp.remotePath}`, (token) => runLocalTarUpload({
         localPath: tempDir,
         sftp,
@@ -1124,6 +1142,7 @@ async function uploadFilesCore(options = {}) {
         token,
         transferId: options.transferId,
       }));
+    setUploadOperationStage(options.transferId, "transfer-complete");
     return {
       ok: true,
       targetId: options.targetId || options.id || sftp.name || sftp.host,
@@ -1138,6 +1157,7 @@ async function uploadFilesCore(options = {}) {
     vscode.window.showErrorMessage(message);
     return { ok: false, error: message };
   } finally {
+    setUploadOperationStage(options.transferId, "cleaning-staging-files");
     if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
   }
 }
@@ -2308,7 +2328,7 @@ function createLocalApiMethods() {
       return result;
     },
     "transfers.list": async () => {
-      return { ok: true, transfers: listActiveTransfers() };
+      return { ok: true, transfers: listActiveTransfers(), operations: [...activeUploadOperations.values()] };
     },
     "transfers.cancel": async (params = {}) => {
       const id = String(params.transferId || params.id || "").trim();
