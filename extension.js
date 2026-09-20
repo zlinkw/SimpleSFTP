@@ -2881,7 +2881,7 @@ function runSsh(sftp, command, timeout) {
       if (error) {
         const failure = new Error(stderr || error.message);
         failure.stderr = stderr;
-        reject(classifyTransportFailure(failure, {
+        reject(classifySftpFailure(failure, sftp, {
           command,
           sshStderr: stderr,
           sshCode: error.code,
@@ -3282,7 +3282,7 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
       // so the API request and shared host lease can finish with the cause.
       try { sshProc.kill(); } catch {}
       try {
-        reject(classifyTransportFailure(error, {
+        reject(classifySftpFailure(error, sftp, {
           command: remoteCommand,
           sshStderr,
         }));
@@ -3301,7 +3301,7 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
           sshCode,
           sshStderr,
         }));
-        reject(classifyTransportFailure(failure, {
+        reject(classifySftpFailure(failure, sftp, {
           command: remoteCommand,
           sshCode,
           sshStderr,
@@ -3427,9 +3427,9 @@ function runRemoteTarExtract({ localPath, sftp, timeoutMs, token, transferId }) 
       if (settled) return;
       settled = true;
       stopController();
-      sshProc.kill();
-      tarProc.kill();
-      reject(classifyTransportFailure(error, {
+      try { sshProc.kill(); } catch {}
+      try { tarProc.kill(); } catch {}
+      reject(classifySftpFailure(error, sftp, {
         command: remoteCommand,
         sshStderr,
         tarStderr,
@@ -3448,7 +3448,7 @@ function runRemoteTarExtract({ localPath, sftp, timeoutMs, token, transferId }) 
           sshStderr,
           tarStderr,
         }));
-        reject(classifyTransportFailure(failure, {
+        reject(classifySftpFailure(failure, sftp, {
           command: remoteCommand,
           sshCode,
           tarCode,
@@ -3545,13 +3545,34 @@ function toTarPath(value) {
 }
 
 function formatProcessFailure({ operation, sshCode, tarCode, sshStderr, tarStderr }) {
+  const sshText = String(sshStderr || "").trim();
+  const tarText = String(tarStderr || "").trim();
   const details = [
     `ssh 退出码：${sshCode}`,
-    `tar 退出码：${tarCode}`,
-    sshStderr.trim() ? `ssh: ${sshStderr.trim()}` : "",
-    tarStderr.trim() ? `tar: ${tarStderr.trim()}` : "",
+    tarCode === undefined ? "" : `tar 退出码：${tarCode}`,
+    sshText ? `ssh: ${sshText}` : "",
+    tarText ? `tar: ${tarText}` : "",
   ].filter(Boolean);
   return `${operation || "SFTP 传输"}失败。${details.join(" | ")}`;
+}
+
+function classifySftpFailure(error, sftp, context = {}) {
+  const classified = classifyTransportFailure(error, context);
+  const host = String(sftp && sftp.host || "").trim();
+  const port = normalizeSshPort(sftp && sftp.port, 22);
+  if (classified.category !== "user_cancelled") {
+    classified.message = `SimpleSFTP 到 ${host || "未知主机"}:${port} 的传输失败：${classified.message} ${classified.diagnosis}`;
+  }
+  classified.apiData = {
+    category: classified.category,
+    retryable: classified.retryable,
+    diagnosis: classified.diagnosis,
+    host,
+    port,
+    remotePath: String(sftp && sftp.remotePath || ""),
+    sshStderr: classified.details.sshStderr,
+  };
+  return classified;
 }
 
 function classifyTransportFailure(error, context = {}) {
@@ -3577,10 +3598,16 @@ function classifyTransportFailure(error, context = {}) {
     classified.diagnosis = "用户或调用方取消了传输。";
     return classified;
   }
+  if (/connection timed out|no route to host|network is unreachable/.test(combined)) {
+    classified.category = "dns_tcp_unreachable";
+    classified.retryable = true;
+    classified.diagnosis = "SSH 地址或端口不可达；核对服务器配置、网络和防火墙。";
+    return classified;
+  }
   if (/传输超过|simple-sftp timeout|timeout|timed out/.test(combined)) {
     classified.category = "transfer_timeout";
     classified.retryable = true;
-    classified.diagnosis = "传输超过配置的超时时间；检查网络、目标负载或增大超时。";
+    classified.diagnosis = "传输超时；先核对 SSH IP、端口和网络，再检查目标负载或增大超时。";
     return classified;
   }
   if (/permission denied \(publickey|authentication failed|host key verification failed|invalid format\)/.test(combined)) {
@@ -3589,13 +3616,13 @@ function classifyTransportFailure(error, context = {}) {
     classified.diagnosis = "SSH 认证、密钥或 host key 验证失败；先用同一 alias 手动连接验证。";
     return classified;
   }
-  if (/econnrefused|connection refused|local forward|forwarding failed|channel .* not opened/.test(combined)) {
+  if (/local forward|forwarding failed|channel .* not opened/.test(combined)) {
     classified.category = "local_forward_unavailable";
     classified.retryable = true;
     classified.diagnosis = "本机转发端口未建立或目标 Agent/SSH 服务不可达。";
     return classified;
   }
-  if (/enotfound|no such host|name or service not known|temporary failure in name resolution|network is unreachable|connection timed out|no route to host/.test(combined)) {
+  if (/enotfound|no such host|name or service not known|temporary failure in name resolution|econnrefused|connection refused/.test(combined)) {
     classified.category = "dns_tcp_unreachable";
     classified.retryable = true;
     classified.diagnosis = "DNS 或 TCP 链路不可达；核对网络、防火墙和服务器地址。";
