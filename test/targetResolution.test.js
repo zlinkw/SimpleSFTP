@@ -32,11 +32,12 @@ function sandbox() {
   };
   const context = {
     DEFAULT_IGNORES: [],
+    FIXED_IGNORES: [".git", ".vscode"],
     readSharedServers: () => ({ servers: [profile] }),
     getActiveSharedServer: () => profile,
     readSftpConfig: () => ({ host: "NWPU3", username: "qgking", port: 22, remotePath: profile.remotePath }),
-    readTargetIgnorePatterns: () => [],
-    mergeIgnorePatterns: () => [],
+    readTargetIgnorePatterns: () => null,
+    mergeIgnorePatterns: (...groups) => [...new Set(groups.flatMap((group) => Array.isArray(group) ? group : []))],
     normalizeSshPort: (value, fallback) => Number(value) || fallback,
     resolvedConnectTimeoutSeconds: () => 15,
   };
@@ -90,4 +91,33 @@ test("API previews and upload cores use identical resolved targets", () => {
   assert.match(source, /"upload\.workspace": async[\s\S]*?const sftp = resolveUploadSftp\(localPath, params\)/);
   assert.match(source, /"upload\.files": async[\s\S]*?const sftp = resolveUploadSftp\(localBase, params\)/);
   assert.match(source, /if \(options\.expectedTransferTarget\) assertTransferTargetUnchanged\(options\.expectedTransferTarget, sftp\)/);
+});
+
+test("saved target ignore selection stays authoritative after reopening", () => {
+  const code = sandbox();
+  code.DEFAULT_IGNORES = ["data", "*.npy"];
+  code.readTargetIgnorePatterns = () => [];
+  const emptySelection = code.resolveUploadSftp("C:\\runtime", { server: "NWPU3" });
+  assert.deepEqual(Array.from(emptySelection.ignore).sort(), [".git", ".vscode"]);
+  code.readTargetIgnorePatterns = () => ["*.npy"];
+  const chosen = code.resolveUploadSftp("C:\\runtime", { server: "NWPU3" });
+  assert.ok(chosen.ignore.includes("*.npy"));
+  assert.ok(!chosen.ignore.includes("data"));
+});
+
+test("remote candidates start selected only when saved as ignored", () => {
+  const code = {
+    FIXED_IGNORES: [".git", ".vscode"],
+    IGNORE_PRESETS: [{ label: "数据", description: "数据目录", patterns: ["data", "dataset"] }],
+    vscode: { QuickPickItemKind: { Separator: -1 } },
+    formatBytes: () => "1 MB",
+  };
+  vm.createContext(code);
+  vm.runInContext(extractFunction("buildIgnoreQuickPickItems"), code);
+  const rows = code.buildIgnoreQuickPickItems(new Set(["data"]), [
+    { pattern: "data/raw", relativePath: "data/raw", reason: "数据", type: "d" },
+  ]);
+  assert.equal(rows.find((row) => row.label === "data").picked, true);
+  assert.equal(rows.find((row) => row.label === "dataset").picked, false);
+  assert.equal(rows.find((row) => row.label === "data/raw").picked, false);
 });

@@ -105,6 +105,9 @@ const DEFAULT_IGNORES = [
   "*.npz",
 ];
 
+// These editor and Git internals never belong in a project transfer.
+const FIXED_IGNORES = [".git", ".vscode"];
+
 const IGNORE_PRESETS = [
   {
     label: "缓存和临时文件",
@@ -1191,7 +1194,11 @@ function resolveUploadSftp(localPath, options) {
   const remotePath = requestedRemotePath(options) || String(sharedServer.remotePath || sharedServer.remoteBase || existing.remotePath || "").replace(/\/+$/, "");
   const port = normalizeSshPort(server.sshPort || server.port || options.sshPort || options.port || existing.port, 22);
   const targetIgnores = readTargetIgnorePatterns(localPath, options, { host, remotePath });
-  const ignore = mergeIgnorePatterns(existing.ignore, targetIgnores, options.ignore, server.ignore, DEFAULT_IGNORES);
+  // A saved target selection is authoritative. Reapplying defaults here made
+  // unchecked rules reappear every time the picker was opened.
+  const ignore = targetIgnores === null
+    ? mergeIgnorePatterns(existing.ignore, options.ignore, server.ignore, DEFAULT_IGNORES)
+    : mergeIgnorePatterns(targetIgnores, options.ignore, server.ignore, FIXED_IGNORES);
   return {
     ...existing,
     name: String(options.targetId || server.id || server.label || existing.name || host || "simple-sftp-target"),
@@ -1514,7 +1521,7 @@ function readTargetIgnorePatterns(localPath, options, sftp) {
   const state = readTargetIgnoreState(localPath);
   const key = targetIgnoreKey(options || {}, sftp || {});
   const item = state[key];
-  return item && Array.isArray(item.ignore) ? item.ignore : [];
+  return item && Array.isArray(item.ignore) ? item.ignore : null;
 }
 
 function writeTargetIgnorePatterns(localPath, options, sftp, ignore) {
@@ -1591,7 +1598,7 @@ async function configureIgnoresCore(options = {}) {
         }
       }
     } else {
-      const currentIgnores = new Set(nextIgnores);
+      const currentIgnores = new Set([...nextIgnores].filter((pattern) => !FIXED_IGNORES.includes(pattern)));
       const detectedRemoteItems = await getRemoteIgnoreCandidates(sftp).catch((error) => {
         vscode.window.showWarningMessage(
           `无法扫描远端忽略候选项：${formatError(error)}`
@@ -1631,7 +1638,7 @@ async function configureIgnoresCore(options = {}) {
       }
     }
 
-    sftp.ignore = sortIgnorePatterns(nextIgnores);
+    sftp.ignore = sortIgnorePatterns(new Set([...nextIgnores, ...FIXED_IGNORES]));
     if (hasTargetOptions) {
       writeTargetIgnorePatterns(localPath, options, sftp, sftp.ignore);
     } else {
@@ -2765,24 +2772,20 @@ function wildcardToRegExp(pattern) {
 
 function buildIgnoreQuickPickItems(currentIgnores, detectedRemoteItems) {
   const knownPatterns = new Set();
-  const items = [
-    {
-      label: "推荐规则组",
-      kind: vscode.QuickPickItemKind.Separator,
-    },
-  ];
+  const items = [{ label: "常用跳过规则（逐项选择）", kind: vscode.QuickPickItemKind.Separator }];
 
   for (const preset of IGNORE_PRESETS) {
-    for (const pattern of preset.patterns) knownPatterns.add(pattern);
-    items.push({
-      label: preset.label,
-      description: preset.description,
-      detail: preset.patterns.join(", "),
-      picked:
-        currentIgnores.size === 0 ||
-        preset.patterns.some((pattern) => currentIgnores.has(pattern)),
-      patterns: preset.patterns,
-    });
+    for (const pattern of preset.patterns) {
+      if (FIXED_IGNORES.includes(pattern) || knownPatterns.has(pattern)) continue;
+      knownPatterns.add(pattern);
+      items.push({
+        label: pattern,
+        description: preset.label,
+        detail: preset.description,
+        picked: currentIgnores.has(pattern),
+        patterns: [pattern],
+      });
+    }
   }
 
   if (detectedRemoteItems.length > 0) {
@@ -2791,12 +2794,13 @@ function buildIgnoreQuickPickItems(currentIgnores, detectedRemoteItems) {
       kind: vscode.QuickPickItemKind.Separator,
     });
     for (const candidate of detectedRemoteItems) {
+      if (FIXED_IGNORES.includes(candidate.pattern) || knownPatterns.has(candidate.pattern)) continue;
       knownPatterns.add(candidate.pattern);
       items.push({
         label: candidate.relativePath,
         description: candidate.reason,
         detail: candidate.type === "f" ? `远端文件，${formatBytes(candidate.sizeBytes)}` : "远端文件夹",
-        picked: true,
+        picked: currentIgnores.has(candidate.pattern),
         patterns: [candidate.pattern],
       });
     }

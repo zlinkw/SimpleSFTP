@@ -99,7 +99,7 @@ code --install-extension .\simple-sftp-<version>.vsix --force
 
 默认排除 `.git`、IDE 目录、Python 缓存、虚拟环境、构建产物、`node_modules`、数据集、checkpoint、模型权重、日志、输出目录、压缩包和常见二进制数组文件。
 
-用户可以在 `.vscode/sftp.json` 或目标级 ignore 中追加规则。SimpleExperiment 会把 `comparison_methods/_repos` 作为稳定默认排除项，避免嵌套第三方仓库导致参数过长或上传缓慢。
+用户可以在 `.vscode/sftp.json` 或目标级 ignore 中设置规则。目标级选择保存后，下次打开仅勾选实际保存的条目；初次使用才采用默认建议。`.git` 和 `.vscode` 始终跳过。SimpleExperiment 会把 `comparison_methods/_repos` 作为初始默认排除项，避免嵌套第三方仓库导致参数过长或上传缓慢。
 
 全量上传不会镜像删除远端文件。manifest 同步只会清理上一版 manifest 存在、当前 manifest 缺失且通过安全检查的受管文件。
 
