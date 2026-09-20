@@ -1056,13 +1056,7 @@ async function uploadWorkspaceCore(options = {}) {
 async function uploadManifestLocalFilesToRemote({ localPath, sftp, manifest, uploadOptions = {} }) {
   const uploadPlan = createManifestUploadPlan({ localPath, sftp, manifest });
   if (uploadPlan.fileCount > 0) {
-    return await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Notification,
-        title: `上传受管理代码文件 -> ${sftp.remotePath}`,
-        cancellable: uploadProgressCancellable(uploadOptions),
-      },
-      (_progress, token) => runLocalTarUpload({
+    return await runUploadWithProgress(uploadOptions, `上传受管理代码文件 -> ${sftp.remotePath}`, (token) => runLocalTarUpload({
         localPath,
         sftp,
         uploadPlan,
@@ -1070,8 +1064,7 @@ async function uploadManifestLocalFilesToRemote({ localPath, sftp, manifest, upl
         timeoutMs: transferTimeoutMs(sftp, uploadOptions),
         token,
         transferId: uploadOptions.transferId,
-      })
-    );
+      }));
   }
   return {
     fileCount: 0,
@@ -1122,13 +1115,7 @@ async function uploadFilesCore(options = {}) {
       relativePaths.push("runtime_manifest.json");
       uploadPlanFiles.push({ relativePath: "runtime_manifest.json", fullPath: manifestPath, size: fs.statSync(manifestPath).size });
     }
-    const stats = await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Notification,
-        title: `上传指定文件 -> ${sftp.remotePath}`,
-        cancellable: uploadProgressCancellable(options),
-      },
-      (_progress, token) => runLocalTarUpload({
+    const stats = await runUploadWithProgress(options, `上传指定文件 -> ${sftp.remotePath}`, (token) => runLocalTarUpload({
         localPath: tempDir,
         sftp,
         uploadPlan: { files: uploadPlanFiles, fileCount: uploadPlanFiles.length, byteCount: uploadPlanFiles.reduce((total, file) => total + file.size, 0), excludedRuleHits: 0, excludedNestedGitRepos: 0, nestedGitRoots: [] },
@@ -1136,8 +1123,7 @@ async function uploadFilesCore(options = {}) {
         timeoutMs: transferTimeoutMs(sftp, options),
         token,
         transferId: options.transferId,
-      })
-    );
+      }));
     return {
       ok: true,
       targetId: options.targetId || options.id || sftp.name || sftp.host,
@@ -1997,6 +1983,17 @@ function transferTimeoutMs(sftp, options = {}) {
 function uploadProgressCancellable(options = {}) {
   if (options && typeof options.cancellable === "boolean") return options.cancellable;
   return vscode.workspace.getConfiguration("simpleSftp").get("uploadCancellable", true) !== false;
+}
+
+function runUploadWithProgress(options, title, operation) {
+  // JSON-RPC callers can track and cancel transfers through transfers.list/cancel.
+  // Do not couple their response to the VS Code notification lifecycle.
+  if (options && options.apiMode === true) return operation(undefined);
+  return vscode.window.withProgress({
+    location: vscode.ProgressLocation.Notification,
+    title,
+    cancellable: uploadProgressCancellable(options),
+  }, (_progress, token) => operation(token));
 }
 
 async function confirmTransferPath({ localPath, sftp, operation, detail, options = {} }) {
@@ -2991,13 +2988,7 @@ async function uploadAllLocalToRemoteCore({ localPath, sftp, writeState = true, 
   if (!uploadPlan.fileCount) {
     throw new Error("没有要上传的文件；所有文件都被忽略规则排除。");
   }
-  const stats = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: `上传全部本地文件 -> ${sftp.remotePath}`,
-      cancellable: uploadProgressCancellable(options),
-    },
-    (_progress, token) => runLocalTarUpload({
+  const stats = await runUploadWithProgress(options, `上传全部本地文件 -> ${sftp.remotePath}`, (token) => runLocalTarUpload({
       localPath,
       sftp,
       uploadPlan,
@@ -3005,8 +2996,7 @@ async function uploadAllLocalToRemoteCore({ localPath, sftp, writeState = true, 
       timeoutMs: transferTimeoutMs(sftp, options),
       token,
       transferId: options.transferId,
-    })
-  );
+    }));
   if (writeState) {
     writeUploadState(localPath, {
       lastUploadedAt: uploadStartedAt.toISOString(),
