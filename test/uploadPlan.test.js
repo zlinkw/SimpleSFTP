@@ -181,6 +181,7 @@ test("managed manifest accepts data source and named config but rejects data ass
       "data/multimodal_dataset.py",
       "data/datasets/fixed_protocol_manifest.py",
       "data/protocol_config.yaml",
+      "datasets/loader.py",
     ];
     for (const relativePath of allowed) {
       const file = path.join(localPath, relativePath);
@@ -196,6 +197,7 @@ test("managed manifest accepts data source and named config but rejects data ass
       "data/weights/model.pt",
       "data/patients/subject.py",
       "data/datasets/patient_records.json",
+      "datasets/images/scan.png",
     ]) {
       assert.throws(() => sandbox.getPaths({ localPath, manifest: { [blocked]: {} } }), /不安全的受管理代码路径/);
     }
