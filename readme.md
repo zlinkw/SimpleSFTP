@@ -7,11 +7,11 @@ SimpleSFTP 与 [SimpleExperiment](https://github.com/zlinkw/SimpleExperiment) �
 ## 主要能力
 
 - 创建或打开远端项目对应的本地工作区。
-- 远端到本地同步，自动排除数据集、缓存、权重、日志和大产物。
+- 远端到本地同步；可按服务器选择远端文件或文件夹，并限制文件类型和大小。
 - 全量上传、指定文件上传、manifest 受控同步。
 - 可选的保存后增量上传。
 - 共享服务器配置，可从 `~/.ssh/config` 导入。
-- 目标级 ignore 规则。
+- 独立的远端下载范围；旧目标级 ignore 配置继续兼容。
 - 上传前强制确认本机路径、服务器账号和远端目标路径。
 - 本机 JSON-RPC API 和 `simple-sftp-api` CLI，供自动化工具调用。
 
@@ -63,11 +63,11 @@ code --install-extension .\simple-sftp-<version>.vsix --force
 | 命令 | 功能 |
 | --- | --- |
 | 创建或打开远端项目 | 选择远端目录并创建本地同步工作区。 |
-| 远端同步到本地 | 从远端拉取未被 ignore 的项目文件。 |
+| 远端同步到本地 | 已设置范围时仅下载所选远端文件；否则沿用旧同步规则。 |
 | 上传工作区到目标 | 上传全量文件或 manifest 指定的受管文件。 |
 | 上传指定文件到目标 | 供 API/编排器上传明确文件。 |
 | 上传并标记交接 | 上传后写入交接标记。 |
-| 配置忽略规则 | 配置工作区或目标级 exclude 规则。 |
+| 设置下载文件范围 | 浏览远端项目，选择允许下载的文件或文件夹，并设置文件类型与大小上限。 |
 | 选择服务器 | 切换共享服务器配置。 |
 | 导入 VS Code SSH 配置 | 从 `~/.ssh/config` 导入 host/user/port。 |
 | 查看当前目标 | 显示当前本地路径、远端路径、host、user 和 port。 |
@@ -99,7 +99,7 @@ code --install-extension .\simple-sftp-<version>.vsix --force
 
 默认排除 `.git`、IDE 目录、Python 缓存、虚拟环境、构建产物、`node_modules`、数据集、checkpoint、模型权重、日志、输出目录、压缩包和常见二进制数组文件。
 
-用户可以在 `.vscode/sftp.json` 或目标级 ignore 中设置规则。目标级选择保存后，下次打开仅勾选实际保存的条目；初次使用才采用默认建议。`.git` 和 `.vscode` 始终跳过。SimpleExperiment 会把 `comparison_methods/_repos` 作为初始默认排除项，避免嵌套第三方仓库导致参数过长或上传缓慢。
+未设置下载范围时，既有 `.vscode/sftp.json` 和目标级 ignore 规则继续生效。设置下载范围后，远端到本地同步只读取所选远端路径中符合扩展名和大小上限的文件；范围按服务器保存到本机项目的 `simple_cluster/sftp-download-scopes.json`。`.git`、`.vscode`、`.codex` 和插件状态目录始终不会进入下载范围。
 
 全量上传不会镜像删除远端文件。manifest 同步采用调用方已确认的文件类型与大小规则，不再根据 `data/` 子目录或文件名重复过滤；仍会阻止路径越界以及 `.git`、`.vscode`、`.codex`、旧插件状态目录。manifest 同步只会清理上一版 manifest 存在、当前 manifest 缺失且通过路径安全检查的受管文件。
 
@@ -107,7 +107,7 @@ code --install-extension .\simple-sftp-<version>.vsix --force
 
 ## 文件位置确认
 
-上传、下载、交接和忽略配置前会显示：
+上传、下载、交接和下载范围配置前会显示：
 
 - 本机宿主路径；
 - 服务器 label/host/user/port；

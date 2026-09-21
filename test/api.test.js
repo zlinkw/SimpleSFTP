@@ -315,6 +315,7 @@ test("SimpleSFTP exposes the planned public API methods", () => {
     "upload.files",
     "handoff.markReady",
     "ignores.configure",
+    "downloadScope.configure",
     "confirmations.reset",
   ];
   for (const method of methods) {

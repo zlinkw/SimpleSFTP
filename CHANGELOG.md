@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.17
+
+- Replaced the visible ignore-rule entry with separate upload and download ranges in SimpleExperiment. Download ranges browse the remote project and persist selected paths, file types, and size limits per target.
+- Remote-to-local sync now downloads only the configured range when one exists; legacy ignore handling remains available internally for existing configurations.
+
 ## 0.2.16
 
 - Managed uploads now honor the caller's explicit file-type and size policy. Nested configuration files such as `data/datasets/*/recipe.yaml` are no longer rejected by a second hard-coded allowlist; project-boundary and plugin-state protections remain.

@@ -228,6 +228,9 @@ const activeTransfers = new Map();
 const activeUploadOperations = new Map();
 const SAVE_UPLOAD_STATE = "simple-sftp-upload-state.json";
 const TARGET_IGNORE_STATE = "sftp-target-ignores.json";
+const TARGET_DOWNLOAD_SCOPE_STATE = "sftp-download-scopes.json";
+const DEFAULT_DOWNLOAD_EXTENSIONS = ["*"];
+const DEFAULT_DOWNLOAD_MAX_FILE_SIZE_MB = 1024;
 const PATH_CONFIRMATIONS_STATE = "simple-sftp-confirmed-transfer-paths.v1";
 let transferSequence = 0;
 let defaultConnectTimeoutSeconds = 15;
@@ -280,7 +283,11 @@ function activate(context) {
     "simpleSftp.configureIgnores",
     (options) => configureIgnores(options)
   );
-  context.subscriptions.push(command, syncCommand, uploadWorkspaceCommand, uploadFilesCommand, handoffCommand, configureIgnoresCommand, selectServerCommand, importSshConfigCommand, openSharedServerConfigCommand, showCurrentTargetCommand);
+  const configureDownloadScopeCommand = vscode.commands.registerCommand(
+    "simpleSftp.configureDownloadScope",
+    (options) => configureDownloadScope(options)
+  );
+  context.subscriptions.push(command, syncCommand, uploadWorkspaceCommand, uploadFilesCommand, handoffCommand, configureIgnoresCommand, configureDownloadScopeCommand, selectServerCommand, importSshConfigCommand, openSharedServerConfigCommand, showCurrentTargetCommand);
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument((document) => {
       void handleSavedDocument(document);
@@ -321,9 +328,9 @@ function activate(context) {
       100
     ),
     createStatusButton(
-      "$(exclude) 忽略",
-      "选择不需要同步的文件、文件夹和规则组。",
-      "simpleSftp.configureIgnores",
+      "$(cloud-download) 下载范围",
+      "选择允许从远端下载到本机的文件和文件夹。",
+      "simpleSftp.configureDownloadScope",
       99
     )
   );
@@ -540,10 +547,10 @@ class ActionTreeProvider {
         command: "simpleSftp.markHandoffReady",
       }),
       new ActionTreeItem({
-        label: "配置忽略规则",
-        description: "选择不参与同步的文件和文件夹",
-        icon: "exclude",
-        command: "simpleSftp.configureIgnores",
+        label: "设置下载文件范围",
+        description: "选择允许下载的远端文件和文件夹",
+        icon: "cloud-download",
+        command: "simpleSftp.configureDownloadScope",
       }),
       new ActionTreeItem({
         label: "查看当前目标",
@@ -881,7 +888,8 @@ async function syncFromRemoteCore(options = {}) {
     }
 
     const syncStartedAt = new Date();
-    await downloadRemoteToLocal({ localPath, sftp });
+    const downloadScope = readTargetDownloadScope(localPath, options, sftp);
+    await downloadRemoteToLocal({ localPath, sftp, downloadScope });
     writeLocalSessionRecord(localPath, {
       action: "remoteToLocal",
       device: getDeviceName(),
@@ -1538,6 +1546,189 @@ function writeTargetIgnorePatterns(localPath, options, sftp, ignore) {
   return state[key];
 }
 
+function targetDownloadScopeStatePath(localPath) {
+  return path.join(localPath, "simple_cluster", TARGET_DOWNLOAD_SCOPE_STATE);
+}
+
+function normalizeDownloadExtensions(values) {
+  const extensions = [...new Set((Array.isArray(values) ? values : DEFAULT_DOWNLOAD_EXTENSIONS)
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter(Boolean)
+    .map((value) => value === "*" ? value : value.startsWith(".") ? value : `.${value}`))];
+  if (!extensions.length) throw new Error("至少保留一种下载文件类型，或填写 *。");
+  if (extensions.some((value) => value !== "*" && !/^\.[a-z0-9][a-z0-9._+-]*$/.test(value))) {
+    throw new Error("文件类型格式无效；请使用 .py、.yaml 这类扩展名，或填写 *。");
+  }
+  return extensions.sort((a, b) => a.localeCompare(b));
+}
+
+function normalizeDownloadMaxFileSizeMB(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size) || size < 0.1 || size > 1024) {
+    throw new Error("单文件大小上限必须在 0.1–1024 MB 之间。");
+  }
+  return Math.round(size * 100) / 100;
+}
+
+function normalizeDownloadScopePath(value) {
+  const normalized = toPosixPath(String(value || "").trim()).replace(/^\.\//, "").replace(/^\/+|\/+$/g, "");
+  if (!normalized || normalized === ".") return ".";
+  if (path.posix.isAbsolute(normalized) || normalized.split("/").some((part) => !part || part === "." || part === "..")) {
+    throw new Error(`下载范围必须是远端项目内相对路径：${value}`);
+  }
+  if (normalized.toLowerCase().split("/").some((part) => [".git", ".vscode", ".codex", "simple_cluster", "zlk_cluster"].includes(part))) {
+    throw new Error(`下载范围包含插件或版本控制状态目录：${value}`);
+  }
+  return normalized;
+}
+
+function normalizeDownloadScope(value = {}) {
+  return {
+    paths: [...new Set((Array.isArray(value.paths) ? value.paths : []).map(normalizeDownloadScopePath))].sort((a, b) => a.localeCompare(b)),
+    extensions: normalizeDownloadExtensions(value.extensions),
+    maxFileSizeMB: normalizeDownloadMaxFileSizeMB(value.maxFileSizeMB ?? DEFAULT_DOWNLOAD_MAX_FILE_SIZE_MB),
+  };
+}
+
+function readTargetDownloadScope(localPath, options, sftp) {
+  const file = targetDownloadScopeStatePath(localPath);
+  if (!fs.existsSync(file)) return null;
+  try {
+    const state = JSON.parse(fs.readFileSync(file, "utf8"));
+    const item = state && typeof state === "object" ? state[targetIgnoreKey(options || {}, sftp || {})] : null;
+    if (!item || !Array.isArray(item.paths) || !item.paths.length) return null;
+    return normalizeDownloadScope(item);
+  } catch {
+    return null;
+  }
+}
+
+function writeTargetDownloadScope(localPath, options, sftp, scope) {
+  const file = targetDownloadScopeStatePath(localPath);
+  let state = {};
+  try {
+    state = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!state || typeof state !== "object" || Array.isArray(state)) state = {};
+  } catch {
+    state = {};
+  }
+  const normalized = normalizeDownloadScope(scope);
+  const key = targetIgnoreKey(options || {}, sftp || {});
+  state[key] = {
+    targetId: key,
+    host: sftp.host,
+    username: sftp.username,
+    port: sftp.port,
+    remotePath: sftp.remotePath,
+    ...normalized,
+    updatedAt: new Date().toISOString(),
+  };
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  return state[key];
+}
+
+function relativeRemoteScopePath(remoteRoot, selectedPath) {
+  const base = path.posix.normalize(String(remoteRoot || "").replace(/\/+$/, ""));
+  const selected = path.posix.normalize(String(selectedPath || "").replace(/\/+$/, ""));
+  if (!base || !selected || (selected !== base && !selected.startsWith(`${base}/`))) {
+    throw new Error(`所选远端路径超出项目根目录：${selectedPath}`);
+  }
+  return normalizeDownloadScopePath(selected === base ? "." : selected.slice(base.length + 1));
+}
+
+async function configureDownloadScope(options = {}) {
+  const localPath = resolveLocalWorkspacePath(options.localPath, "设置下载文件范围");
+  return withHostOperationLease("configure-download-scope", "设置下载文件范围", localPath, () => configureDownloadScopeCore({ ...options, localPath }));
+}
+
+async function configureDownloadScopeCore(options = {}) {
+  try {
+    const localPath = resolveLocalWorkspacePath(options.localPath, "设置下载文件范围");
+    const hasTargetOptions = Boolean(options && (options.server || options.remotePath || options.host));
+    const sftp = hasTargetOptions ? resolveUploadSftp(localPath, options) : readSftpConfig(localPath);
+    if (!sftp || !sftp.remotePath || !sftp.host) throw new Error("未提供可用的 SFTP 目标。");
+    await confirmTransferPath({ localPath, sftp, operation: "设置下载文件范围", detail: "浏览远端项目目录并保存允许下载的范围", options });
+
+    const current = readTargetDownloadScope(localPath, options, sftp) || normalizeDownloadScope({ paths: [] });
+    if (options.apiMode) {
+      const saved = writeTargetDownloadScope(localPath, options, sftp, {
+        paths: Array.isArray(options.paths) ? options.paths : current.paths,
+        extensions: Array.isArray(options.extensions) ? options.extensions : current.extensions,
+        maxFileSizeMB: options.maxFileSizeMB ?? current.maxFileSizeMB,
+      });
+      return { ok: true, targetId: targetIgnoreKey(options, sftp), remotePath: sftp.remotePath, scope: saved };
+    }
+
+    const action = await vscode.window.showQuickPick([
+      { label: "$(folder-opened) 添加远端文件夹", description: "浏览远端项目；选中后立即保存", id: "folder" },
+      { label: "$(file-add) 添加远端文件", description: "先进入所在目录，再多选文件", id: "file" },
+      { label: "$(symbol-file) 设置允许的文件类型", description: current.extensions.join("、"), id: "extensions" },
+      { label: "$(file-binary) 设置单文件大小上限", description: `${current.maxFileSizeMB} MB`, id: "max-size" },
+      { label: "$(list-selection) 查看已选远端路径", description: `${current.paths.length} 条`, id: "preview" },
+      { label: "$(trash) 移除已选远端路径", description: current.paths.join("、") || "暂无", id: "remove" },
+    ], { title: "设置下载文件范围", placeHolder: "只下载明确选择的远端文件或文件夹", ignoreFocusOut: true });
+    if (!action) return { ok: false, cancelled: true };
+
+    let next = { ...current, paths: [...current.paths] };
+    if (action.id === "extensions") {
+      const value = await vscode.window.showInputBox({
+        title: "允许下载的文件类型",
+        prompt: "用英文逗号分隔，例如 .py,.yaml,.json；填写 * 表示任意类型。",
+        value: current.extensions.join(","),
+        ignoreFocusOut: true,
+        validateInput: (input) => { try { normalizeDownloadExtensions(input.split(",")); return undefined; } catch (error) { return formatError(error); } },
+      });
+      if (value === undefined) return { ok: false, cancelled: true };
+      next.extensions = normalizeDownloadExtensions(value.split(","));
+    } else if (action.id === "max-size") {
+      const value = await vscode.window.showInputBox({
+        title: "下载单文件大小上限",
+        prompt: "单位 MB，允许 0.1–1024。",
+        value: String(current.maxFileSizeMB),
+        ignoreFocusOut: true,
+        validateInput: (input) => { try { normalizeDownloadMaxFileSizeMB(Number(input)); return undefined; } catch (error) { return formatError(error); } },
+      });
+      if (value === undefined) return { ok: false, cancelled: true };
+      next.maxFileSizeMB = normalizeDownloadMaxFileSizeMB(Number(value));
+    } else if (action.id === "preview") {
+      if (!current.paths.length) {
+        void vscode.window.showInformationMessage("尚未设置下载文件范围；远端到本地同步会沿用原有整项目规则。");
+        return { ok: true, scope: current };
+      }
+      await vscode.window.showQuickPick(current.paths.map((relative) => ({ label: relative, description: `${sftp.remotePath.replace(/\/+$/, "")}/${relative === "." ? "" : relative}` })), { title: "已选远端下载路径", placeHolder: "只读预览", ignoreFocusOut: true });
+      return { ok: true, scope: current };
+    } else if (action.id === "remove") {
+      if (!current.paths.length) return { ok: true, scope: current };
+      const picked = await vscode.window.showQuickPick(current.paths.map((relative) => ({ label: relative, picked: true })), { title: "移除远端下载路径", canPickMany: true, ignoreFocusOut: true });
+      if (!picked?.length) return { ok: false, cancelled: true };
+      const removed = new Set(picked.map((item) => item.label));
+      next.paths = current.paths.filter((relative) => !removed.has(relative));
+    } else if (action.id === "folder") {
+      const selected = await pickRemoteDirectory({ remoteBase: sftp.remotePath, sftp, title: "选择允许下载的远端文件夹" });
+      if (!selected) return { ok: false, cancelled: true };
+      next.paths = [...new Set([...current.paths, relativeRemoteScopePath(sftp.remotePath, selected)])].sort((a, b) => a.localeCompare(b));
+    } else if (action.id === "file") {
+      const selectedDir = await pickRemoteDirectory({ remoteBase: sftp.remotePath, sftp, title: "进入远端文件所在目录" });
+      if (!selectedDir) return { ok: false, cancelled: true };
+      const files = await listRemoteFiles(sftp, selectedDir);
+      const picked = await vscode.window.showQuickPick(files.map((file) => ({ label: file.name, description: formatBytes(file.sizeBytes), file })), { title: `选择远端文件：${selectedDir}`, canPickMany: true, ignoreFocusOut: true });
+      if (!picked?.length) return { ok: false, cancelled: true };
+      const selectedPaths = picked.map((item) => relativeRemoteScopePath(sftp.remotePath, `${selectedDir}/${item.file.name}`));
+      next.paths = [...new Set([...current.paths, ...selectedPaths])].sort((a, b) => a.localeCompare(b));
+    }
+
+    const saved = writeTargetDownloadScope(localPath, options, sftp, next);
+    void vscode.window.showInformationMessage(`下载范围已保存：${saved.paths.length} 条路径，${saved.extensions.join("、")}，单文件不超过 ${saved.maxFileSizeMB} MB。`);
+    return { ok: true, targetId: targetIgnoreKey(options, sftp), remotePath: sftp.remotePath, scope: saved };
+  } catch (error) {
+    if (options.apiMode) throw error;
+    const message = `设置下载文件范围失败：${formatError(error)}`;
+    vscode.window.showErrorMessage(message);
+    return { ok: false, error: message };
+  }
+}
+
 function mergeIgnorePatterns(...groups) {
   const out = new Set();
   for (const group of groups) {
@@ -1666,7 +1857,7 @@ async function configureIgnoresCore(options = {}) {
   }
 }
 
-async function pickRemoteDirectory({ remoteBase, sftp }) {
+async function pickRemoteDirectory({ remoteBase, sftp, title = "选择远端项目根目录" }) {
   let current = remoteBase.replace(/\/+$/, "");
   for (;;) {
     const dirs = await listRemoteDirs(sftp, current);
@@ -1704,7 +1895,7 @@ async function pickRemoteDirectory({ remoteBase, sftp }) {
     }
 
     const picked = await vscode.window.showQuickPick(items, {
-      title: "选择远端项目根目录",
+      title,
       placeHolder: current,
       matchOnDescription: true,
     });
@@ -1726,6 +1917,22 @@ async function pickRemoteDirectory({ remoteBase, sftp }) {
       current = `${current}/${picked.name}`;
     }
   }
+}
+
+function listRemoteFiles(sftp, remotePath) {
+  const command = `find ${shellQuote(remotePath)} -mindepth 1 -maxdepth 1 -type f -printf '%f\\t%s\\n' 2>/dev/null | sort`;
+  return new Promise((resolve, reject) => {
+    execFile("ssh", getSshArgs(sftp, command), { timeout: 15000 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(`列出远端文件失败：${stderr || error.message}`));
+        return;
+      }
+      resolve(stdout.split(/\r?\n/).map((line) => {
+        const [name, sizeText] = line.split("\t");
+        return { name: String(name || "").trim(), sizeBytes: Number(sizeText) || 0 };
+      }).filter((item) => item.name));
+    });
+  });
 }
 
 function listRemoteDirs(sftp, remotePath) {
@@ -2423,6 +2630,24 @@ function createLocalApiMethods() {
         targetId: result && result.targetId,
         remotePath: result && result.remotePath,
         ignore: result && result.ignore,
+      });
+      return result;
+    },
+    "downloadScope.configure": async (params = {}) => {
+      const localPath = String(params.localPath || "").trim();
+      const sftp = apiTransferSftp(params);
+      requireApiConfirmation(params, {
+        method: "downloadScope.configure",
+        operation: "设置下载文件范围",
+        sftp,
+        localPath,
+        pathRequired: true,
+      });
+      const result = await configureDownloadScope({ ...params, apiMode: true });
+      publishLocalApiEvent("downloadScope.configure", {
+        targetId: result && result.targetId,
+        remotePath: result && result.remotePath,
+        scope: result && result.scope,
       });
       return result;
     },
@@ -3370,11 +3595,11 @@ function createRemoteExtractCommand(remotePath) {
   return `mkdir -p ${shellQuote(safeRemotePath)} && tar -xf - -C ${shellQuote(safeRemotePath)}`;
 }
 
-async function downloadRemoteToLocal({ localPath, sftp }) {
-  return withHostOperationLease("download-workspace", "下载远端工作区", localPath, () => downloadRemoteToLocalCore({ localPath, sftp }));
+async function downloadRemoteToLocal({ localPath, sftp, downloadScope }) {
+  return withHostOperationLease("download-workspace", "下载远端工作区", localPath, () => downloadRemoteToLocalCore({ localPath, sftp, downloadScope }));
 }
 
-async function downloadRemoteToLocalCore({ localPath, sftp }) {
+async function downloadRemoteToLocalCore({ localPath, sftp, downloadScope }) {
   if (!sftp || !sftp.remotePath || !sftp.host) {
     throw new Error("未配置可用的 SFTP 远端路径。");
   }
@@ -3390,14 +3615,15 @@ async function downloadRemoteToLocalCore({ localPath, sftp }) {
     (_progress, token) => runRemoteTarExtract({
       localPath,
       sftp,
+      downloadScope,
       timeoutMs: transferTimeoutMs(sftp),
       token,
     })
   );
 }
 
-function runRemoteTarExtract({ localPath, sftp, timeoutMs, token, transferId }) {
-  const remoteCommand = createRemoteTarCommand(sftp);
+function runRemoteTarExtract({ localPath, sftp, downloadScope, timeoutMs, token, transferId }) {
+  const remoteCommand = createRemoteTarCommand(sftp, downloadScope);
   return new Promise((resolve, reject) => {
     const controller = createTransferController({
       id: transferId || nextTransferId("远端到本地同步"),
@@ -3505,8 +3731,14 @@ function runRemoteTarExtract({ localPath, sftp, timeoutMs, token, transferId }) 
   });
 }
 
-function createRemoteTarCommand(sftp) {
+function createRemoteTarCommand(sftp, downloadScope) {
   const remotePath = String(sftp.remotePath).replace(/\/+$/, "");
+  const scope = downloadScope && Array.isArray(downloadScope.paths) && downloadScope.paths.length
+    ? normalizeDownloadScope(downloadScope)
+    : null;
+  if (scope) {
+    return `python3 -c ${shellQuote(createRemoteDownloadScript(remotePath, scope))}`;
+  }
   const args = [
     "tar",
     "-cf",
@@ -3515,6 +3747,49 @@ function createRemoteTarCommand(sftp) {
     ".",
   ];
   return `cd ${shellQuote(remotePath)} && ${args.map(shellQuote).join(" ")}`;
+}
+
+function createRemoteDownloadScript(remotePath, downloadScope) {
+    const scope = normalizeDownloadScope(downloadScope);
+    const payload = Buffer.from(JSON.stringify(scope), "utf8").toString("base64");
+    return [
+      "import base64,json,os,sys,tarfile",
+      `root=os.path.realpath(${JSON.stringify(remotePath)})`,
+      `scope=json.loads(base64.b64decode(${JSON.stringify(payload)}).decode('utf-8'))`,
+      "paths=scope.get('paths') or []",
+      "extensions=[str(v).lower() for v in (scope.get('extensions') or ['*'])]",
+      "allow_any='*' in extensions",
+      "max_bytes=int(float(scope.get('maxFileSizeMB') or 1024)*1024*1024)",
+      "blocked={'.git','.vscode','.codex','simple_cluster','zlk_cluster'}",
+      "selected=[]",
+      "seen=set()",
+      "def inside(value):",
+      "    try: return os.path.commonpath([root, value]) == root",
+      "    except ValueError: return False",
+      "def allowed(rel, full):",
+      "    if not rel or rel in seen or os.path.islink(full) or not os.path.isfile(full): return False",
+      "    if any(part.lower() in blocked for part in rel.replace('\\\\','/').split('/')): return False",
+      "    if os.path.getsize(full) > max_bytes: return False",
+      "    lower=rel.lower()",
+      "    return allow_any or any(lower.endswith(ext) for ext in extensions)",
+      "for rel_root in paths:",
+      "    rel_root=str(rel_root or '.').replace('\\\\','/').strip('/') or '.'",
+      "    target=os.path.realpath(os.path.join(root, rel_root))",
+      "    if not inside(target) or os.path.islink(target): continue",
+      "    if os.path.isfile(target):",
+      "        rel=os.path.relpath(target,root).replace(os.sep,'/')",
+      "        if allowed(rel,target): seen.add(rel); selected.append((rel,target))",
+      "        continue",
+      "    if not os.path.isdir(target): continue",
+      "    for current,dirs,files in os.walk(target,followlinks=False):",
+      "        dirs[:]=[d for d in dirs if not os.path.islink(os.path.join(current,d)) and not any(part.lower() in blocked for part in os.path.relpath(os.path.join(current,d),root).replace(os.sep,'/').split('/'))]",
+      "        for name in files:",
+      "            full=os.path.join(current,name)",
+      "            rel=os.path.relpath(full,root).replace(os.sep,'/')",
+      "            if allowed(rel,full): seen.add(rel); selected.append((rel,full))",
+      "with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:",
+      "    for rel,full in sorted(selected): archive.add(full,arcname=rel,recursive=False)",
+    ].join("\n");
 }
 
 function getTarExcludeArgs(ignorePatterns) {
@@ -3802,6 +4077,12 @@ module.exports = {
     createListRemoteDirsSshArgs,
     createRemoteExtractCommand,
     createRemoteTarCommand,
+    createRemoteDownloadScript,
+    normalizeDownloadScope,
+    normalizeDownloadScopePath,
+    relativeRemoteScopePath,
+    readTargetDownloadScope,
+    writeTargetDownloadScope,
     createAgentsManagedBlock,
     createSshCommandTemplate,
     createWorkspaceTargetName,
