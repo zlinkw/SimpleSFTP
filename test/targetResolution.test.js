@@ -36,7 +36,6 @@ function sandbox() {
     readSharedServers: () => ({ servers: [profile] }),
     getActiveSharedServer: () => profile,
     readSftpConfig: () => ({ host: "NWPU3", username: "qgking", port: 22, remotePath: profile.remotePath }),
-    readTargetIgnorePatterns: () => null,
     mergeIgnorePatterns: (...groups) => [...new Set(groups.flatMap((group) => Array.isArray(group) ? group : []))],
     normalizeSshPort: (value, fallback) => Number(value) || fallback,
     resolvedConnectTimeoutSeconds: () => 15,
@@ -93,31 +92,17 @@ test("API previews and upload cores use identical resolved targets", () => {
   assert.match(source, /if \(options\.expectedTransferTarget\) assertTransferTargetUnchanged\(options\.expectedTransferTarget, sftp\)/);
 });
 
-test("saved target ignore selection stays authoritative after reopening", () => {
+test("upload target uses only built-in exclusions", () => {
   const code = sandbox();
   code.DEFAULT_IGNORES = ["data", "*.npy"];
-  code.readTargetIgnorePatterns = () => [];
-  const emptySelection = code.resolveUploadSftp("C:\\runtime", { server: "NWPU3" });
-  assert.deepEqual(Array.from(emptySelection.ignore).sort(), [".git", ".vscode"]);
-  code.readTargetIgnorePatterns = () => ["*.npy"];
-  const chosen = code.resolveUploadSftp("C:\\runtime", { server: "NWPU3" });
-  assert.ok(chosen.ignore.includes("*.npy"));
-  assert.ok(!chosen.ignore.includes("data"));
+  const target = code.resolveUploadSftp("C:\\runtime", {
+    server: { id: "nwpu3", ignore: ["user-server-ignore"] },
+    ignore: ["user-request-ignore"],
+  });
+  assert.deepEqual(Array.from(target.ignore).sort(), ["*.npy", ".git", ".vscode", "data"]);
 });
 
-test("remote candidates start selected only when saved as ignored", () => {
-  const code = {
-    FIXED_IGNORES: [".git", ".vscode"],
-    IGNORE_PRESETS: [{ label: "数据", description: "数据目录", patterns: ["data", "dataset"] }],
-    vscode: { QuickPickItemKind: { Separator: -1 } },
-    formatBytes: () => "1 MB",
-  };
-  vm.createContext(code);
-  vm.runInContext(extractFunction("buildIgnoreQuickPickItems"), code);
-  const rows = code.buildIgnoreQuickPickItems(new Set(["data"]), [
-    { pattern: "data/raw", relativePath: "data/raw", reason: "数据", type: "d" },
-  ]);
-  assert.equal(rows.find((row) => row.label === "data").picked, true);
-  assert.equal(rows.find((row) => row.label === "dataset").picked, false);
-  assert.equal(rows.find((row) => row.label === "data/raw").picked, false);
+test("legacy ignore configuration surface is removed", () => {
+  assert.doesNotMatch(source, /configureIgnores|ignores\.configure|TARGET_IGNORE_STATE|IGNORE_PRESETS/);
+  assert.doesNotMatch(source, /readTargetIgnorePatterns|writeTargetIgnorePatterns|getRemoteIgnoreCandidates/);
 });

@@ -154,13 +154,10 @@ test("tar writer preserves UTF-8 and long POSIX paths", async () => {
 });
 
 test("managed state uses simple_cluster and reports legacy directories for manual cleanup", () => {
-  assert.match(source, /path\.join\(localPath, "simple_cluster", TARGET_IGNORE_STATE\)/);
   assert.match(source, /function writeLocalCodeSyncState\(localPath, state\) \{\s*const dir = path\.join\(localPath, "simple_cluster"\);/);
-  assert.match(source, /function legacyTargetIgnoreStatePath\(localPath\) \{\s*return path\.join\(localPath, "zlk_cluster", TARGET_IGNORE_STATE\);/);
   assert.match(source, /检测到旧版托管路径 \$\{relativePath\}/);
   assert.match(source, /请人工核对后删除本地\/远端旧版 zlk_cluster 目录/);
-  assert.match(source, /检测到旧版托管目录 \$\{legacyManagedDir\}/);
-  assert.match(source, /请人工核对后手动删除/);
+  assert.doesNotMatch(source, /TARGET_IGNORE_STATE|sftp-target-ignores\.json/);
   const safeTest = source.match(/function isSafeRemoteManagedPath[\s\S]*?\n}/)?.[0] || "";
   assert.match(safeTest, /top === "simple_cluster"/);
 });
@@ -171,7 +168,7 @@ test("managed manifest trusts caller-selected data files while retaining path sa
   vm.createContext(sandbox);
   vm.runInContext([
     source.slice(source.indexOf("function getManagedManifest("), source.indexOf("function getMissingManagedFiles(")),
-    source.slice(source.indexOf("function isSafeRemoteManagedPath("), source.indexOf("function targetIgnoreStatePath(")),
+    source.slice(source.indexOf("function isSafeRemoteManagedPath("), source.indexOf("function targetScopeKey(")),
     "this.getPaths = getManifestUploadRelativePaths;",
   ].join("\n"), sandbox);
   try {

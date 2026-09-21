@@ -314,7 +314,6 @@ test("SimpleSFTP exposes the planned public API methods", () => {
     "upload.workspace",
     "upload.files",
     "handoff.markReady",
-    "ignores.configure",
     "downloadScope.configure",
     "confirmations.reset",
   ];
@@ -324,6 +323,7 @@ test("SimpleSFTP exposes the planned public API methods", () => {
       : new RegExp(`"${method.replace(/\./g, "\\.")}": async`);
     assert.match(extensionSource, pattern, `missing API method ${method}`);
   }
+  assert.doesNotMatch(extensionSource, /"ignores\.configure": async/);
 });
 
 test("SimpleSFTP target and upload helpers support explicit servers without sftp.json", () => {

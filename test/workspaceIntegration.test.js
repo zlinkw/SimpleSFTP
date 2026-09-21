@@ -75,7 +75,6 @@ test("all transfer entry points confirm expected host and remote paths before si
     ["markHandoffReadyCore", "confirmTransferPath", "writeRemoteHandoffMarker"],
     ["uploadWorkspaceCore", "confirmTransferPath", "readRemoteCodeManifest"],
     ["uploadFilesCore", "confirmTransferPath", "fs.mkdtempSync"],
-    ["configureIgnoresCore", "confirmTransferPath", "getRemoteIgnoreCandidates"],
     ["uploadChangedLocalFilesCore", "confirmTransferPath", "findChangedLocalFiles"],
   ];
   for (const [name, gate, effect] of ordered) {
@@ -95,7 +94,6 @@ test("all host file side effects acquire the shared operation lease", () => {
     "markHandoffReady",
     "uploadWorkspace",
     "uploadFiles",
-    "configureIgnores",
     "uploadChangedLocalFiles",
     "uploadAllLocalToRemote",
     "downloadRemoteToLocal",
@@ -103,6 +101,7 @@ test("all host file side effects acquire the shared operation lease", () => {
   for (const name of leased) {
     assert.match(extractFunction(name), /withHostOperationLease\(/, `${name} missing host operation lease`);
   }
+  assert.doesNotMatch(source, /configureIgnores|配置忽略规则/);
   assert.match(source, /pluginId: "simple-local\.simple-sftp"/);
   assert.match(source, /showErrorMessage\(error\.message, \{ modal: true \}, "知道了"\)/);
 });

@@ -108,112 +108,6 @@ const DEFAULT_IGNORES = [
 // These editor and Git internals never belong in a project transfer.
 const FIXED_IGNORES = [".git", ".vscode"];
 
-const IGNORE_PRESETS = [
-  {
-    label: "缓存和临时文件",
-    description: "cache、tmp、temp、__pycache__",
-    patterns: [
-      ".ipynb_checkpoints",
-      "__pycache__",
-      ".pytest_cache",
-      ".mypy_cache",
-      ".ruff_cache",
-      ".cache",
-      ".tox",
-      "tmp",
-      "temp",
-      "*cache*",
-      "*tmp*",
-    ],
-    fields: ["cache", "tmp", "temp", "__pycache__"],
-  },
-  {
-    label: "环境和构建产物",
-    description: "venv、build、dist、node_modules",
-    patterns: [".venv", "venv", "env", "build", "dist", "node_modules"],
-    fields: ["venv", "env", "build", "dist", "node_modules"],
-  },
-  {
-    label: "数据集目录",
-    description: "data、dataset、VOCdevkit",
-    patterns: ["data", "dataset", "datasets", "Datasets", "VOCdevkit"],
-    fields: ["data", "dataset", "datasets", "vocdevkit"],
-  },
-  {
-    label: "权重和检查点",
-    description: "weights、checkpoints、pretrained",
-    patterns: [
-      "checkpoints",
-      "checkpoint",
-      "weights",
-      "weight",
-      "pretrained",
-      "pretrained_ckpt",
-      "*.pth",
-      "*.pt",
-      "*.ckpt",
-      "*.onnx",
-      "*.engine",
-    ],
-    fields: ["checkpoint", "checkpoints", "weight", "weights", "pretrained", "ckpt"],
-  },
-  {
-    label: "日志和实验输出",
-    description: "runs、logs、outputs、wandb",
-    patterns: [
-      "runs",
-      "work_dirs",
-      "wandb",
-      "tensorboard",
-      "logs",
-      "log",
-      "output",
-      "outputs",
-      "results",
-      "result",
-      "*.log",
-      "*.out",
-      "*.err",
-      "*.csv",
-      "*.tsv",
-      "*.xlsx",
-      "*.xls",
-    ],
-    fields: ["run", "runs", "log", "logs", "output", "outputs", "result", "results", "wandb", "tensorboard"],
-  },
-  {
-    label: "压缩包",
-    description: "zip、tar、rar、7z",
-    patterns: ["*.zip", "*.tar", "*.tar.gz", "*.tgz", "*.rar", "*.7z"],
-    fields: ["zip", "tar", "tgz", "rar", "7z"],
-  },
-  {
-    label: "医学图像、普通图像和数组文件",
-    description: "nii、dcm、image、numpy",
-    patterns: [
-      "*.h5",
-      "*.hdf5",
-      "*.pkl",
-      "*.pickle",
-      "*.joblib",
-      "*.nii",
-      "*.nii.gz",
-      "*.mha",
-      "*.mhd",
-      "*.dcm",
-      "*.png",
-      "*.jpg",
-      "*.jpeg",
-      "*.bmp",
-      "*.tif",
-      "*.tiff",
-      "*.npy",
-      "*.npz",
-    ],
-    fields: ["nii", "dcm", "image", "img", "mask", "npy", "npz"],
-  },
-];
-
 const HIDDEN_TOP_LEVEL = new Set([
   ".codex",
   ".vscode-server",
@@ -227,7 +121,6 @@ const uploadQueues = new Map();
 const activeTransfers = new Map();
 const activeUploadOperations = new Map();
 const SAVE_UPLOAD_STATE = "simple-sftp-upload-state.json";
-const TARGET_IGNORE_STATE = "sftp-target-ignores.json";
 const TARGET_DOWNLOAD_SCOPE_STATE = "sftp-download-scopes.json";
 const DEFAULT_DOWNLOAD_EXTENSIONS = ["*"];
 const DEFAULT_DOWNLOAD_MAX_FILE_SIZE_MB = 1024;
@@ -279,15 +172,11 @@ function activate(context) {
     "simpleSftp.markHandoffReady",
     () => markHandoffReady()
   );
-  const configureIgnoresCommand = vscode.commands.registerCommand(
-    "simpleSftp.configureIgnores",
-    (options) => configureIgnores(options)
-  );
   const configureDownloadScopeCommand = vscode.commands.registerCommand(
     "simpleSftp.configureDownloadScope",
     (options) => configureDownloadScope(options)
   );
-  context.subscriptions.push(command, syncCommand, uploadWorkspaceCommand, uploadFilesCommand, handoffCommand, configureIgnoresCommand, configureDownloadScopeCommand, selectServerCommand, importSshConfigCommand, openSharedServerConfigCommand, showCurrentTargetCommand);
+  context.subscriptions.push(command, syncCommand, uploadWorkspaceCommand, uploadFilesCommand, handoffCommand, configureDownloadScopeCommand, selectServerCommand, importSshConfigCommand, openSharedServerConfigCommand, showCurrentTargetCommand);
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument((document) => {
       void handleSavedDocument(document);
@@ -770,7 +659,7 @@ async function updateWorkspaceTargetCore(options = {}) {
     throw new Error("target.update 缺少远端路径 remotePath。");
   const port = normalizeSshPort(patch.port ?? patch.sshPort ?? existing.port, 22);
   const username = String(patch.username ?? patch.user ?? existing.username ?? existing.user ?? "").trim();
-  const ignore = Array.isArray(patch.ignore) ? patch.ignore : Array.isArray(existing.ignore) ? existing.ignore : DEFAULT_IGNORES;
+  const ignore = mergeIgnorePatterns(DEFAULT_IGNORES, FIXED_IGNORES);
   const sftp = {
     ...existing,
     ...patch,
@@ -1201,12 +1090,7 @@ function resolveUploadSftp(localPath, options) {
   const user = String(server.user || server.username || options.user || options.username || existing.username || "").trim();
   const remotePath = requestedRemotePath(options) || String(sharedServer.remotePath || sharedServer.remoteBase || existing.remotePath || "").replace(/\/+$/, "");
   const port = normalizeSshPort(server.sshPort || server.port || options.sshPort || options.port || existing.port, 22);
-  const targetIgnores = readTargetIgnorePatterns(localPath, options, { host, remotePath });
-  // A saved target selection is authoritative. Reapplying defaults here made
-  // unchecked rules reappear every time the picker was opened.
-  const ignore = targetIgnores === null
-    ? mergeIgnorePatterns(existing.ignore, options.ignore, server.ignore, DEFAULT_IGNORES)
-    : mergeIgnorePatterns(targetIgnores, options.ignore, server.ignore, FIXED_IGNORES);
+  const ignore = mergeIgnorePatterns(DEFAULT_IGNORES, FIXED_IGNORES);
   return {
     ...existing,
     name: String(options.targetId || server.id || server.label || existing.name || host || "simple-sftp-target"),
@@ -1483,67 +1367,9 @@ function sanitizeRelativeUploadPath(value) {
   return normalized;
 }
 
-function targetIgnoreStatePath(localPath) {
-  return path.join(localPath, "simple_cluster", TARGET_IGNORE_STATE);
-}
-
-function targetIgnoreKey(options, sftp) {
+function targetScopeKey(options, sftp) {
   const server = options && typeof options.server === "object" ? options.server : {};
   return String(options.targetId || options.id || server.id || server.label || sftp.name || `${sftp.host}:${sftp.remotePath}`).trim();
-}
-
-function legacyTargetIgnoreStatePath(localPath) {
-  return path.join(localPath, "zlk_cluster", TARGET_IGNORE_STATE);
-}
-
-function readTargetIgnoreState(localPath) {
-  for (const file of [targetIgnoreStatePath(localPath), legacyTargetIgnoreStatePath(localPath)]) {
-    if (!fs.existsSync(file)) continue;
-    try {
-      const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-      if (parsed && typeof parsed === "object") {
-        if (file === legacyTargetIgnoreStatePath(localPath)) {
-          atomicWriteJsonIfMissing(targetIgnoreStatePath(localPath), {
-            ...parsed,
-            migration: {
-              source: `zlk_cluster/${TARGET_IGNORE_STATE}`,
-              migratedAt: new Date().toISOString(),
-              mode: "copy_read_only_source",
-            },
-          });
-        }
-        return parsed;
-      }
-    } catch {
-      // Fall through and try the next managed-state location.
-    }
-  }
-  return {};
-}
-
-function readTargetIgnorePatterns(localPath, options, sftp) {
-  const state = readTargetIgnoreState(localPath);
-  const key = targetIgnoreKey(options || {}, sftp || {});
-  const item = state[key];
-  return item && Array.isArray(item.ignore) ? item.ignore : null;
-}
-
-function writeTargetIgnorePatterns(localPath, options, sftp, ignore) {
-  const file = targetIgnoreStatePath(localPath);
-  const state = readTargetIgnoreState(localPath);
-  const key = targetIgnoreKey(options || {}, sftp || {});
-  state[key] = {
-    targetId: key,
-    host: sftp.host,
-    username: sftp.username,
-    port: sftp.port,
-    remotePath: sftp.remotePath,
-    ignore: sortIgnorePatterns(ignore),
-    updatedAt: new Date().toISOString(),
-  };
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-  return state[key];
 }
 
 function targetDownloadScopeStatePath(localPath) {
@@ -1595,7 +1421,7 @@ function readTargetDownloadScope(localPath, options, sftp) {
   if (!fs.existsSync(file)) return null;
   try {
     const state = JSON.parse(fs.readFileSync(file, "utf8"));
-    const item = state && typeof state === "object" ? state[targetIgnoreKey(options || {}, sftp || {})] : null;
+    const item = state && typeof state === "object" ? state[targetScopeKey(options || {}, sftp || {})] : null;
     if (!item || !Array.isArray(item.paths) || !item.paths.length) return null;
     return normalizeDownloadScope(item);
   } catch {
@@ -1613,7 +1439,7 @@ function writeTargetDownloadScope(localPath, options, sftp, scope) {
     state = {};
   }
   const normalized = normalizeDownloadScope(scope);
-  const key = targetIgnoreKey(options || {}, sftp || {});
+  const key = targetScopeKey(options || {}, sftp || {});
   state[key] = {
     targetId: key,
     host: sftp.host,
@@ -1657,7 +1483,7 @@ async function configureDownloadScopeCore(options = {}) {
         extensions: Array.isArray(options.extensions) ? options.extensions : current.extensions,
         maxFileSizeMB: options.maxFileSizeMB ?? current.maxFileSizeMB,
       });
-      return { ok: true, targetId: targetIgnoreKey(options, sftp), remotePath: sftp.remotePath, scope: saved };
+      return { ok: true, targetId: targetScopeKey(options, sftp), remotePath: sftp.remotePath, scope: saved };
     }
 
     const action = await vscode.window.showQuickPick([
@@ -1720,7 +1546,7 @@ async function configureDownloadScopeCore(options = {}) {
 
     const saved = writeTargetDownloadScope(localPath, options, sftp, next);
     void vscode.window.showInformationMessage(`下载范围已保存：${saved.paths.length} 条路径，${saved.extensions.join("、")}，单文件不超过 ${saved.maxFileSizeMB} MB。`);
-    return { ok: true, targetId: targetIgnoreKey(options, sftp), remotePath: sftp.remotePath, scope: saved };
+    return { ok: true, targetId: targetScopeKey(options, sftp), remotePath: sftp.remotePath, scope: saved };
   } catch (error) {
     if (options.apiMode) throw error;
     const message = `设置下载文件范围失败：${formatError(error)}`;
@@ -1738,123 +1564,6 @@ function mergeIgnorePatterns(...groups) {
     }
   }
   return [...out].sort((a, b) => a.localeCompare(b));
-}
-
-async function configureIgnores(options = {}) {
-  const localPath = resolveLocalWorkspacePath(options.localPath, "配置忽略规则");
-  return withHostOperationLease("configure-ignores", "扫描或更新忽略规则", localPath, () => configureIgnoresCore(options));
-}
-
-async function configureIgnoresCore(options = {}) {
-  try {
-    const workspaceFolder = getPrimaryWorkspaceFolder();
-    const hasTargetOptions = Boolean(options && (options.server || options.remotePath || options.host));
-    if (!workspaceFolder) {
-      if (!options.localPath) throw new Error("请先打开工作区，或由调用方传入 localPath。");
-    }
-
-    const localPath = resolveLocalWorkspacePath(options.localPath, "配置忽略规则");
-    const sftpPath = path.join(localPath, ".vscode", "sftp.json");
-    const sftp = hasTargetOptions ? resolveUploadSftp(localPath, options) : readSftpConfig(localPath);
-    if (!sftp || !sftp.remotePath || !sftp.host) {
-      const message = hasTargetOptions ? "未提供可用的 SFTP 目标。" : "当前工作区未找到可用的 .vscode/sftp.json。";
-      vscode.window.showErrorMessage(message);
-      return { ok: false, error: message };
-    }
-
-    await confirmTransferPath({ localPath, sftp, operation: "扫描或更新忽略规则", detail: "远端候选扫描及目标级忽略状态", options });
-
-    const nextIgnores = new Set(Array.isArray(sftp.ignore) ? sftp.ignore : []);
-    if (options.apiMode) {
-      if (Array.isArray(options.ignore)) {
-        nextIgnores.clear();
-        for (const pattern of options.ignore) {
-          const value = String(pattern || "").trim();
-          if (value) nextIgnores.add(value.replace(/\\/g, "/"));
-        }
-      } else {
-        for (const group of [options.patterns, options.add]) {
-          for (const pattern of Array.isArray(group) ? group : []) {
-            const value = String(pattern || "").trim();
-            if (value) nextIgnores.add(value.replace(/\\/g, "/"));
-          }
-        }
-        for (const pattern of Array.isArray(options.remove) ? options.remove : []) {
-          const value = String(pattern || "").trim();
-          if (value) nextIgnores.delete(value.replace(/\\/g, "/"));
-        }
-      }
-    } else {
-      const currentIgnores = new Set([...nextIgnores].filter((pattern) => !FIXED_IGNORES.includes(pattern)));
-      const detectedRemoteItems = await getRemoteIgnoreCandidates(sftp).catch((error) => {
-        vscode.window.showWarningMessage(
-          `无法扫描远端忽略候选项：${formatError(error)}`
-        );
-        return [];
-      });
-
-      const items = buildIgnoreQuickPickItems(currentIgnores, detectedRemoteItems);
-      const selected = await vscode.window.showQuickPick(items, {
-        canPickMany: true,
-        ignoreFocusOut: true,
-        matchOnDescription: true,
-        matchOnDetail: true,
-        placeHolder: "选择不需要同步的远端文件、文件夹或规则组",
-        title: `配置忽略规则：${sftp.remotePath}`,
-      });
-      if (!selected) return { ok: false, cancelled: true };
-      nextIgnores.clear();
-      for (const item of selected) {
-        if (!item.patterns) continue;
-        for (const pattern of item.patterns) {
-          nextIgnores.add(pattern);
-        }
-      }
-
-      const custom = await vscode.window.showInputBox({
-        title: "可选：自定义忽略规则",
-        prompt: "多个规则用英文逗号分隔；留空则不追加。",
-        placeHolder: "示例：*.tmp, debug_outputs, experiments/cache",
-        ignoreFocusOut: true,
-      });
-      if (custom) {
-        for (const pattern of custom.split(",")) {
-          const value = pattern.trim();
-          if (value) nextIgnores.add(value.replace(/\\/g, "/"));
-        }
-      }
-    }
-
-    sftp.ignore = sortIgnorePatterns(new Set([...nextIgnores, ...FIXED_IGNORES]));
-    if (hasTargetOptions) {
-      writeTargetIgnorePatterns(localPath, options, sftp, sftp.ignore);
-    } else {
-      fs.writeFileSync(sftpPath, `${JSON.stringify(sftp, null, 2)}\n`, "utf8");
-    }
-
-    if (!options.apiMode) {
-      const action = await vscode.window.showInformationMessage(
-        `已更新 SFTP 忽略规则：${sftp.ignore.length} 条。`,
-        hasTargetOptions ? "打开目标忽略状态" : "打开 sftp.json"
-      );
-      if (action === "打开 sftp.json") {
-        await openWorkspaceRelativeFile(".vscode/sftp.json");
-      }
-      if (action === "打开目标忽略状态") {
-        await openWorkspaceRelativeFile(`simple_cluster/${TARGET_IGNORE_STATE}`);
-      }
-    }
-    const legacyManagedDir = path.join(localPath, "zlk_cluster");
-    if (fs.existsSync(legacyManagedDir) && !options.apiMode) {
-      void vscode.window.showWarningMessage(`检测到旧版托管目录 ${legacyManagedDir}；新状态已写入 simple_cluster。请人工核对后手动删除。`);
-    }
-    return { ok: true, targetId: targetIgnoreKey(options, sftp), remotePath: sftp.remotePath, ignore: sftp.ignore };
-  } catch (error) {
-    if (options.apiMode) throw error;
-    const message = `配置忽略规则失败：${formatError(error)}`;
-    vscode.window.showErrorMessage(message);
-    return { ok: false, error: message };
-  }
 }
 
 async function pickRemoteDirectory({ remoteBase, sftp, title = "选择远端项目根目录" }) {
@@ -2615,24 +2324,6 @@ function createLocalApiMethods() {
       });
       return result;
     },
-    "ignores.configure": async (params = {}) => {
-      const localPath = String(params.localPath || "").trim();
-      const sftp = apiTransferSftp(params);
-      requireApiConfirmation(params, {
-        method: "ignores.configure",
-        operation: "配置 SFTP 忽略规则",
-        sftp,
-        localPath,
-        pathRequired: true,
-      });
-      const result = await configureIgnores({ ...params, apiMode: true });
-      publishLocalApiEvent("ignores.configure", {
-        targetId: result && result.targetId,
-        remotePath: result && result.remotePath,
-        ignore: result && result.ignore,
-      });
-      return result;
-    },
     "downloadScope.configure": async (params = {}) => {
       const localPath = String(params.localPath || "").trim();
       const sftp = apiTransferSftp(params);
@@ -2905,77 +2596,6 @@ function readSftpConfig(localPath) {
   return JSON.parse(fs.readFileSync(configPath, "utf8"));
 }
 
-async function getRemoteIgnoreCandidates(sftp) {
-  const cfg = vscode.workspace.getConfiguration("simpleSftp");
-  const thresholdMB = Number(cfg.get("largeFileThresholdMB") || 50);
-  const thresholdBytes = Math.max(1, thresholdMB) * 1024 * 1024;
-  const remotePath = String(sftp.remotePath).replace(/\/+$/, "");
-  const command = [
-    "find",
-    shellQuote(remotePath),
-    "-mindepth 1 -maxdepth 2",
-    "\\( -name .git -o -name .vscode \\) -prune -o",
-    "\\( -type d -o -type f \\)",
-    "-printf '%P\\t%y\\t%s\\n'",
-    "2>/dev/null | head -n 1200",
-  ].join(" ");
-  const stdout = await runSsh(sftp, command, 30000);
-  const seen = new Map();
-
-  for (const line of stdout.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    const [relativePath, type, sizeText] = line.split("\t");
-    if (!relativePath || !type) continue;
-
-    const normalizedPath = relativePath.replace(/\\/g, "/").replace(/\/+$/, "");
-    const sizeBytes = Number(sizeText) || 0;
-    const reason = getRemoteIgnoreReason(normalizedPath, type, sizeBytes, thresholdBytes);
-    if (!reason) continue;
-
-    seen.set(normalizedPath, {
-      pattern: normalizedPath,
-      relativePath: normalizedPath,
-      reason,
-      sizeBytes,
-      type,
-    });
-  }
-
-  return Array.from(seen.values()).sort((a, b) => {
-    const reasonCompare = a.reason.localeCompare(b.reason);
-    if (reasonCompare !== 0) return reasonCompare;
-    return a.relativePath.localeCompare(b.relativePath);
-  });
-}
-
-function getRemoteIgnoreReason(relativePath, type, sizeBytes, thresholdBytes) {
-  if (type === "f" && sizeBytes >= thresholdBytes) {
-    return `大文件 ${formatBytes(sizeBytes)}`;
-  }
-
-  const lowerPath = relativePath.toLowerCase();
-  for (const preset of IGNORE_PRESETS) {
-    if (preset.fields.some((field) => fieldMatchesPath(lowerPath, field))) {
-      return preset.label;
-    }
-    if (preset.patterns.some((pattern) => patternMatchesPath(lowerPath, pattern))) {
-      return preset.label;
-    }
-  }
-
-  return null;
-}
-
-function fieldMatchesPath(lowerPath, field) {
-  const normalizedField = String(field).toLowerCase();
-  const tokens = lowerPath.split(/[\/._\-\s]+/).filter(Boolean);
-  const exactOnly = new Set(["data", "dataset", "datasets", "env", "log", "logs", "run", "runs"]);
-  if (exactOnly.has(normalizedField)) {
-    return tokens.includes(normalizedField);
-  }
-  return tokens.some((token) => token.includes(normalizedField));
-}
-
 function patternMatchesPath(lowerPath, pattern) {
   const lowerPattern = String(pattern).toLowerCase();
   if (lowerPattern.startsWith("*.")) {
@@ -2989,82 +2609,6 @@ function patternMatchesPath(lowerPath, pattern) {
 
 function wildcardToRegExp(pattern) {
   return new RegExp(`^${escapeRegExp(pattern).replace(/\\\*/g, ".*")}$`, "i");
-}
-
-function buildIgnoreQuickPickItems(currentIgnores, detectedRemoteItems) {
-  const knownPatterns = new Set();
-  const items = [{ label: "常用跳过规则（逐项选择）", kind: vscode.QuickPickItemKind.Separator }];
-
-  for (const preset of IGNORE_PRESETS) {
-    for (const pattern of preset.patterns) {
-      if (FIXED_IGNORES.includes(pattern) || knownPatterns.has(pattern)) continue;
-      knownPatterns.add(pattern);
-      items.push({
-        label: pattern,
-        description: preset.label,
-        detail: preset.description,
-        picked: currentIgnores.has(pattern),
-        patterns: [pattern],
-      });
-    }
-  }
-
-  if (detectedRemoteItems.length > 0) {
-    items.push({
-      label: "已识别的远端候选项",
-      kind: vscode.QuickPickItemKind.Separator,
-    });
-    for (const candidate of detectedRemoteItems) {
-      if (FIXED_IGNORES.includes(candidate.pattern) || knownPatterns.has(candidate.pattern)) continue;
-      knownPatterns.add(candidate.pattern);
-      items.push({
-        label: candidate.relativePath,
-        description: candidate.reason,
-        detail: candidate.type === "f" ? `远端文件，${formatBytes(candidate.sizeBytes)}` : "远端文件夹",
-        picked: currentIgnores.has(candidate.pattern),
-        patterns: [candidate.pattern],
-      });
-    }
-  }
-
-  const customPatterns = Array.from(currentIgnores)
-    .filter((pattern) => !knownPatterns.has(pattern))
-    .sort((a, b) => a.localeCompare(b));
-  if (customPatterns.length > 0) {
-    items.push({
-      label: "已有自定义规则",
-      kind: vscode.QuickPickItemKind.Separator,
-    });
-    for (const pattern of customPatterns) {
-      items.push({
-        label: pattern,
-        description: "已有忽略规则",
-        picked: true,
-        patterns: [pattern],
-      });
-    }
-  }
-
-  return items;
-}
-
-function sortIgnorePatterns(patterns) {
-  const ordered = new Map();
-  for (const pattern of DEFAULT_IGNORES) {
-    if (!ordered.has(pattern)) ordered.set(pattern, ordered.size);
-  }
-  for (const preset of IGNORE_PRESETS) {
-    for (const pattern of preset.patterns) {
-      if (!ordered.has(pattern)) ordered.set(pattern, ordered.size);
-    }
-  }
-
-  return Array.from(patterns).sort((a, b) => {
-    const aOrder = ordered.has(a) ? ordered.get(a) : Number.MAX_SAFE_INTEGER;
-    const bOrder = ordered.has(b) ? ordered.get(b) : Number.MAX_SAFE_INTEGER;
-    if (aOrder !== bOrder) return aOrder - bOrder;
-    return a.localeCompare(b);
-  });
 }
 
 function formatBytes(bytes) {
@@ -4106,7 +3650,6 @@ module.exports = {
     getMissingManagedFiles,
     formatSftpTargetSummary,
     getTarExcludeArgs,
-    legacyTargetIgnoreStatePath,
     isIgnoredLocalPath,
     isSafeRemoteManagedPath,
     mergeIgnorePatterns,
@@ -4120,7 +3663,6 @@ module.exports = {
     uploadProgressCancellable,
     validateSimpleSftpConfigValue,
     sanitizeServerProfile,
-    sortIgnorePatterns,
     toTarPath,
     writeWorkspace,
   },

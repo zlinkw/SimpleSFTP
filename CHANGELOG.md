@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.18
+
+- Removed the legacy configurable ignore command, API, state migration, and settings.
+- Upload and download selection now use only their dedicated range controls; fixed safety exclusions remain internal.
+
 ## 0.2.17
 
 - Replaced the visible ignore-rule entry with separate upload and download ranges in SimpleExperiment. Download ranges browse the remote project and persist selected paths, file types, and size limits per target.

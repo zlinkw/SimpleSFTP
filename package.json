@@ -2,7 +2,7 @@
 	"name": "simple-sftp",
 	"displayName": "SimpleSFTP",
 	"description": "为远端项目创建本地 SFTP 同步工作区，并提供低频文件上传下载能力。",
-	"version": "0.2.17",
+	"version": "0.2.18",
 	"publisher": "simple-local",
 	"extensionKind": [
 		"ui"
@@ -10,7 +10,7 @@
 	"license": "MIT",
 	"scripts": {
 		"test": "node --check extension.js && node --check tar-writer.js && node --test test/*.test.js",
-		"package": "npm exec -- @vscode/vsce package --no-dependencies --out simple-sftp-0.2.17.vsix --allow-missing-repository"
+		"package": "npm exec -- @vscode/vsce package --no-dependencies --out simple-sftp-0.2.18.vsix --allow-missing-repository"
 	},
 	"bin": {
 		"simple-sftp-api": "./bin/simple-sftp-api.js"
@@ -163,12 +163,6 @@
 					"type": "boolean",
 					"default": true,
 					"description": "创建或更新 AGENTS.md 中由 SimpleSFTP 管理的 Codex/agent 说明块。"
-				},
-				"simpleSftp.largeFileThresholdMB": {
-					"type": "number",
-					"default": 50,
-					"minimum": 1,
-					"description": "远端文件达到该大小后会被预选为忽略候选，避免把大文件下载到本地。"
 				},
 				"simpleSftp.connectTimeoutSeconds": {
 					"type": "number",
