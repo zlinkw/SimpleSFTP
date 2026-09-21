@@ -165,7 +165,7 @@ test("managed state uses simple_cluster and reports legacy directories for manua
   assert.match(safeTest, /top === "simple_cluster"/);
 });
 
-test("managed manifest accepts data source and named config but rejects data assets", () => {
+test("managed manifest trusts caller-selected data files while retaining path safety", () => {
   const localPath = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-data-manifest-"));
   const sandbox = { fs, path, vscode: { window: { showWarningMessage() {} } }, toPosixPath: (value) => String(value).replace(/\\/g, "/") };
   vm.createContext(sandbox);
@@ -181,6 +181,12 @@ test("managed manifest accepts data source and named config but rejects data ass
       "data/multimodal_dataset.py",
       "data/datasets/fixed_protocol_manifest.py",
       "data/protocol_config.yaml",
+      "data/datasets/bus_cot_lesion/recipe.yaml",
+      "data/patient_info.json",
+      "data/sample.npy",
+      "data/images/scan.png",
+      "data/weights/model.pt",
+      "data/patients/subject.py",
       "datasets/loader.py",
     ];
     for (const relativePath of allowed) {
@@ -190,16 +196,8 @@ test("managed manifest accepts data source and named config but rejects data ass
     }
     const paths = sandbox.getPaths({ localPath, manifest: Object.fromEntries(allowed.map((name) => [name, {}])) });
     assert.deepEqual([...paths].sort(), allowed.sort());
-    for (const blocked of [
-      "data/patient_info.json",
-      "data/sample.npy",
-      "data/images/scan.png",
-      "data/weights/model.pt",
-      "data/patients/subject.py",
-      "data/datasets/patient_records.json",
-      "datasets/images/scan.png",
-    ]) {
-      assert.throws(() => sandbox.getPaths({ localPath, manifest: { [blocked]: {} } }), /不安全的受管理代码路径/);
+    for (const blocked of [".git/config", ".vscode/settings.json", ".codex/state.json", "../outside.py"]) {
+      assert.throws(() => sandbox.getPaths({ localPath, manifest: { [blocked]: {} } }), /不安全的受管理代码路径|非法远端相对路径/);
     }
   } finally {
     fs.rmSync(localPath, { recursive: true, force: true });

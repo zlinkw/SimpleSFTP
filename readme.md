@@ -101,7 +101,7 @@ code --install-extension .\simple-sftp-<version>.vsix --force
 
 用户可以在 `.vscode/sftp.json` 或目标级 ignore 中设置规则。目标级选择保存后，下次打开仅勾选实际保存的条目；初次使用才采用默认建议。`.git` 和 `.vscode` 始终跳过。SimpleExperiment 会把 `comparison_methods/_repos` 作为初始默认排除项，避免嵌套第三方仓库导致参数过长或上传缓慢。
 
-全量上传不会镜像删除远端文件。manifest 同步只会清理上一版 manifest 存在、当前 manifest 缺失且通过安全检查的受管文件。
+全量上传不会镜像删除远端文件。manifest 同步采用调用方已确认的文件类型与大小规则，不再根据 `data/` 子目录或文件名重复过滤；仍会阻止路径越界以及 `.git`、`.vscode`、`.codex`、旧插件状态目录。manifest 同步只会清理上一版 manifest 存在、当前 manifest 缺失且通过路径安全检查的受管文件。
 
 新版本状态文件写入 `simple_cluster/`。旧版 `zlk_cluster/code_sync_state.json` 只作为只读兼容来源；发现旧目录时会提示人工核对后手动删除，插件不会自动删除它。
 
