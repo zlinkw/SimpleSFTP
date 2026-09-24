@@ -743,6 +743,69 @@ async function syncFromRemote(options = {}) {
   return withHostOperationLease("sync-from-remote", "远端同步到本地", localPath, () => syncFromRemoteCore({ ...options, localPath }));
 }
 
+function directSyncTarget(value, label) {
+  const item = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const host = String(item.host || "").trim();
+  const username = String(item.user || item.username || "").trim();
+  const remotePath = String(item.remotePath || "").trim().replace(/\/+$/, "");
+  const port = normalizeSshPort(item.port || item.sshPort, 22);
+  if (!/^[A-Za-z0-9._-]+$/.test(host) || !/^[A-Za-z0-9._-]+$/.test(username)) throw new Error(`${label} SSH 主机或用户名无效。`);
+  if (!remotePath.startsWith("/") || remotePath === "/" || remotePath.split("/").includes("..")) throw new Error(`${label} 项目根目录不安全。`);
+  return { host, username, remotePath, port };
+}
+
+function directSyncRelativePath(value) {
+  const relative = String(value || "").trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+  if (!relative || relative.startsWith("/") || relative.split("/").some((part) => !part || part === "." || part === "..")) throw new Error("Plan 产物相对路径不安全。");
+  return relative;
+}
+
+function directSyncCommand(source, destination, relativePath, directory, deleteOnly = false) {
+  const sourcePath = path.posix.join(source.remotePath, relativePath);
+  const destinationPath = path.posix.join(destination.remotePath, relativePath);
+  const destinationHost = `${destination.username}@${destination.host}`;
+  const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -p ${destination.port}`;
+  const destinationGuard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && target=$(realpath -m -- ${shellQuote(destinationPath)}) && case "$target" in "$root"/*) ;; *) exit 72;; esac`;
+  if (deleteOnly) return `${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(`${destinationGuard} && rm -rf -- ${shellQuote(destinationPath)}`)}`;
+  const destinationParent = directory ? destinationPath : path.posix.dirname(destinationPath);
+  const parentGuard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && parent=$(realpath -m -- ${shellQuote(destinationParent)}) && case "$parent" in "$root"|"$root"/*) ;; *) exit 72;; esac`;
+  const prepare = `${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(`${parentGuard} && mkdir -p -- ${shellQuote(destinationParent)} && ${destinationGuard}`)}`;
+  const sourceArg = directory ? `${sourcePath}/` : sourcePath;
+  const destinationArg = `${destinationHost}:${directory ? `${destinationPath}/` : destinationPath}`;
+  const sync = `rsync -a -s --delete-missing-args ${directory ? "--delete " : ""}-e ${shellQuote(sshOptions)} -- ${shellQuote(sourceArg)} ${shellQuote(destinationArg)}`;
+  const sourceGuard = `root=$(realpath -e -- ${shellQuote(source.remotePath)}) && target=$(realpath -m -- ${shellQuote(sourcePath)}) && case "$target" in "$root"/*) ;; *) exit 72;; esac`;
+  return `${sourceGuard} && ${prepare} && ${sync}`;
+}
+
+async function syncServerToServer(options = {}) {
+  const source = directSyncTarget(options.source, "来源");
+  const destination = directSyncTarget(options.destination, "目标");
+  const relativePath = directSyncRelativePath(options.relativePath);
+  if (options.directory === true && relativePath.split("/").length < 2) throw new Error("目录同步必须限定到 Plan 独立子目录，禁止清理项目顶层目录。");
+  if (source.host === destination.host && source.port === destination.port && source.remotePath === destination.remotePath) throw new Error("来源与目标相同。" );
+  if (options.confirm !== true || options.pathConfirmed !== true) throw confirmationRequired({
+    method: "sync.serverToServer", operation: "Worker 间直接同步 Plan 产物",
+    requires: ["confirm", "pathConfirmed"],
+    source, destination, relativePath, directory: options.directory === true, deleteOnly: options.deleteOnly === true, deleteStale: true,
+  });
+  const command = directSyncCommand(source, destination, relativePath, options.directory === true, options.deleteOnly === true);
+  const timeoutMs = transferTimeoutMs(source, options);
+  return new Promise((resolve, reject) => {
+    const child = spawn("ssh", ["-o", "BatchMode=yes", ...getSshArgs(source, command)], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    let stdout = "";
+    const timer = timeoutMs > 0 ? setTimeout(() => { child.kill(); reject(new Error("Worker 间 rsync 超时；同步状态保持待处理。")); }, timeoutMs) : undefined;
+    child.stdout.on("data", (chunk) => { stdout = (stdout + chunk.toString("utf8")).slice(-16384); });
+    child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
+    child.on("error", (error) => { if (timer) clearTimeout(timer); reject(error); });
+    child.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      if (code === 0) resolve({ ok: true, source, destination, relativePath, directory: options.directory === true, deletedStale: true, output: stdout.trim() });
+      else reject(new Error(`Worker 间 rsync 失败（退出码 ${code}）：${stderr.trim() || stdout.trim() || "SSH 或 rsync 不可用"}`));
+    });
+  });
+}
+
 async function syncFromRemoteCore(options = {}) {
   try {
     const workspaceFolder = getPrimaryWorkspaceFolder();
@@ -2255,6 +2318,15 @@ function createLocalApiMethods() {
       });
       return result;
     },
+    "sync.serverToServer": async (params = {}) => {
+      const result = await syncServerToServer(params);
+      publishLocalApiEvent("sync.serverToServer", {
+        sourceId: params.source && params.source.id,
+        destinationId: params.destination && params.destination.id,
+        relativePath: result.relativePath,
+      });
+      return result;
+    },
     "transfers.list": async () => {
       return { ok: true, transfers: listActiveTransfers(), operations: [...activeUploadOperations.values()] };
     },
@@ -3622,6 +3694,9 @@ module.exports = {
     createRemoteExtractCommand,
     createRemoteTarCommand,
     createRemoteDownloadScript,
+    directSyncTarget,
+    directSyncRelativePath,
+    directSyncCommand,
     normalizeDownloadScope,
     normalizeDownloadScopePath,
     relativeRemoteScopePath,

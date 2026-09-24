@@ -275,11 +275,13 @@ test("SimpleSFTP self-check passes with live listener", async () => {
   }
 });
 
-test("SimpleSFTP source has an explicit API confirmation gate and no scp/rsync", () => {
+test("SimpleSFTP gates direct rsync behind explicit path confirmation", () => {
   assert.match(extensionSource, /function requireApiConfirmation/);
   assert.match(extensionSource, /requires\.push\("pathConfirmed"\)/);
   assert.match(extensionSource, /confirmationRequired\(/);
-  assert.doesNotMatch(extensionSource, /\bscp\b|\brsync\b/);
+  assert.doesNotMatch(extensionSource, /\bscp\b/);
+  assert.match(extensionSource, /"sync\.serverToServer": async/);
+  assert.match(extensionSource, /rsync -a -s --delete-missing-args/);
 });
 
 test("SimpleSFTP uploads have connect timeout, transfer timeout, cancellation and API control", () => {
