@@ -101,6 +101,35 @@ test("upload file list is checksummed in bounded chunks", () => {
   assert.match(verification.combinedChecksum, /^[a-f0-9]{64}$/);
 });
 
+test("managed upload transfers only files changed since the remote manifest", () => {
+  const localPath = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-delta-"));
+  try {
+    for (const name of ["same.py", "changed.py", "new.py"]) fs.writeFileSync(path.join(localPath, name), name, "utf8");
+    const manifest = {
+      "same.py": { size: 7, sha256: "same" },
+      "changed.py": { size: 10, sha256: "new-hash" },
+      "new.py": { size: 6, sha256: "new" },
+    };
+    const previousManifest = { files: {
+      "same.py": { size: 7, sha256: "same" },
+      "changed.py": { size: 10, sha256: "old-hash" },
+    } };
+    const sandbox = createPlanSandbox(localPath);
+    sandbox.sanitizeRelativeUploadPath = (value) => value;
+    vm.createContext(sandbox);
+    vm.runInContext([
+      source.slice(source.indexOf("function getManagedManifest("), source.indexOf("function getMissingManagedFiles(")),
+      source.slice(source.indexOf("function isSafeRemoteManagedPath("), source.indexOf("function targetScopeKey(")),
+      source.slice(source.indexOf("function createManifestUploadPlan("), source.indexOf("function hashUploadPlanChunks(")),
+      "this.createPlan = createManifestUploadPlan;",
+    ].join("\n"), sandbox);
+    const plan = sandbox.createPlan({ localPath, sftp: {}, manifest, previousManifest });
+    assert.deepEqual([...plan.files.map((file) => file.relativePath)], ["changed.py", "new.py"]);
+  } finally {
+    fs.rmSync(localPath, { recursive: true, force: true });
+  }
+});
+
 test("managed uploads write UTF-8 tar directly instead of invoking Windows tar", () => {
   const start = source.indexOf("function runLocalTarUpload");
   const end = source.indexOf("function createRemoteExtractCommand", start);

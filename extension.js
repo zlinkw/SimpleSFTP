@@ -977,6 +977,7 @@ async function uploadWorkspaceCore(options = {}) {
         localPath,
         sftp,
         manifest,
+        previousManifest,
         uploadOptions: options,
       });
     } else {
@@ -1017,8 +1018,8 @@ async function uploadWorkspaceCore(options = {}) {
   }
 }
 
-async function uploadManifestLocalFilesToRemote({ localPath, sftp, manifest, uploadOptions = {} }) {
-  const uploadPlan = createManifestUploadPlan({ localPath, sftp, manifest });
+async function uploadManifestLocalFilesToRemote({ localPath, sftp, manifest, previousManifest, uploadOptions = {} }) {
+  const uploadPlan = createManifestUploadPlan({ localPath, sftp, manifest, previousManifest });
   if (uploadPlan.fileCount > 0) {
     return await runUploadWithProgress(uploadOptions, `上传受管理代码文件 -> ${sftp.remotePath}`, (token) => runLocalTarUpload({
         localPath,
@@ -2944,8 +2945,14 @@ function createWorkspaceUploadPlan(localPath, sftp) {
   };
 }
 
-function createManifestUploadPlan({ localPath, sftp, manifest }) {
-  const relativePaths = getManifestUploadRelativePaths({ localPath, sftp, manifest });
+function createManifestUploadPlan({ localPath, sftp, manifest, previousManifest }) {
+  const relativePaths = getManifestUploadRelativePaths({ localPath, sftp, manifest })
+    .filter((relativePath) => {
+      const current = manifest[relativePath];
+      const previous = previousManifest?.files?.[relativePath];
+      return !previous || !current || Number(previous.size) !== Number(current.size)
+        || !current.sha256 || String(previous.sha256 || "").toLowerCase() !== String(current.sha256).toLowerCase();
+    });
   const files = relativePaths.map((relativePath) => {
     const fullPath = path.join(localPath, relativePath);
     const size = fs.statSync(fullPath).size;
