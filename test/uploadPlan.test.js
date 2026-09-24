@@ -101,7 +101,7 @@ test("upload file list is checksummed in bounded chunks", () => {
   assert.match(verification.combinedChecksum, /^[a-f0-9]{64}$/);
 });
 
-test("managed upload transfers only files changed since the remote manifest", () => {
+test("managed upload transfers only files failing remote content verification", () => {
   const localPath = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-delta-"));
   try {
     for (const name of ["same.py", "changed.py", "new.py"]) fs.writeFileSync(path.join(localPath, name), name, "utf8");
@@ -110,10 +110,6 @@ test("managed upload transfers only files changed since the remote manifest", ()
       "changed.py": { size: 10, sha256: "new-hash" },
       "new.py": { size: 6, sha256: "new" },
     };
-    const previousManifest = { files: {
-      "same.py": { size: 7, sha256: "same" },
-      "changed.py": { size: 10, sha256: "old-hash" },
-    } };
     const sandbox = createPlanSandbox(localPath);
     sandbox.sanitizeRelativeUploadPath = (value) => value;
     vm.createContext(sandbox);
@@ -123,8 +119,9 @@ test("managed upload transfers only files changed since the remote manifest", ()
       source.slice(source.indexOf("function createManifestUploadPlan("), source.indexOf("function hashUploadPlanChunks(")),
       "this.createPlan = createManifestUploadPlan;",
     ].join("\n"), sandbox);
-    const plan = sandbox.createPlan({ localPath, sftp: {}, manifest, previousManifest });
+    const plan = sandbox.createPlan({ localPath, sftp: {}, manifest, changedPaths: ["changed.py", "new.py"] });
     assert.deepEqual([...plan.files.map((file) => file.relativePath)], ["changed.py", "new.py"]);
+    assert.equal(sandbox.createPlan({ localPath, sftp: {}, manifest }).fileCount, 3);
   } finally {
     fs.rmSync(localPath, { recursive: true, force: true });
   }

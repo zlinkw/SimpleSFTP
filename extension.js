@@ -764,17 +764,19 @@ function directSyncCommand(source, destination, relativePath, directory, deleteO
   const sourcePath = path.posix.join(source.remotePath, relativePath);
   const destinationPath = path.posix.join(destination.remotePath, relativePath);
   const destinationHost = `${destination.username}@${destination.host}`;
-  const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -p ${destination.port}`;
+  const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -p ${destination.port}`;
   const destinationGuard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && target=$(realpath -m -- ${shellQuote(destinationPath)}) && case "$target" in "$root"/*) ;; *) exit 72;; esac`;
-  if (deleteOnly) return `${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(`${destinationGuard} && rm -rf -- ${shellQuote(destinationPath)}`)}`;
+  if (deleteOnly) return `${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(`${destinationGuard} && rm -rf -- ${shellQuote(destinationPath)} && test ! -e ${shellQuote(destinationPath)}`)}`;
   const destinationParent = directory ? destinationPath : path.posix.dirname(destinationPath);
   const parentGuard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && parent=$(realpath -m -- ${shellQuote(destinationParent)}) && case "$parent" in "$root"|"$root"/*) ;; *) exit 72;; esac`;
   const prepare = `${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(`${parentGuard} && mkdir -p -- ${shellQuote(destinationParent)} && ${destinationGuard}`)}`;
   const sourceArg = directory ? `${sourcePath}/` : sourcePath;
   const destinationArg = `${destinationHost}:${directory ? `${destinationPath}/` : destinationPath}`;
-  const sync = `rsync -a -s --delete-missing-args ${directory ? "--delete " : ""}-e ${shellQuote(sshOptions)} -- ${shellQuote(sourceArg)} ${shellQuote(destinationArg)}`;
+  const rsyncArgs = `-a -c -s --delete-missing-args ${directory ? "--delete " : ""}-e ${shellQuote(sshOptions)} -- ${shellQuote(sourceArg)} ${shellQuote(destinationArg)}`;
+  const sync = `rsync ${rsyncArgs}`;
+  const verify = `remaining=$(rsync -n -i ${rsyncArgs}) || exit 74; if [ -n "$remaining" ]; then printf '内容校验不一致: %s\\n' "$remaining"; exit 73; fi`;
   const sourceGuard = `root=$(realpath -e -- ${shellQuote(source.remotePath)}) && target=$(realpath -m -- ${shellQuote(sourcePath)}) && case "$target" in "$root"/*) ;; *) exit 72;; esac`;
-  return `${sourceGuard} && ${prepare} && ${sync}`;
+  return `${sourceGuard} && ${prepare} && ${sync} && ${verify}`;
 }
 
 async function syncServerToServer(options = {}) {
@@ -788,9 +790,16 @@ async function syncServerToServer(options = {}) {
     requires: ["confirm", "pathConfirmed"],
     source, destination, relativePath, directory: options.directory === true, deleteOnly: options.deleteOnly === true, deleteStale: true,
   });
-  const command = directSyncCommand(source, destination, relativePath, options.directory === true, options.deleteOnly === true);
+  if (options.deleteOnly === true) {
+    const target = path.posix.join(destination.remotePath, relativePath);
+    const guard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && target=$(realpath -m -- ${shellQuote(target)}) && case "$target" in "$root"/*) ;; *) exit 72;; esac`;
+    await runSsh(destination, `${guard} && rm -rf -- ${shellQuote(target)} && test ! -e ${shellQuote(target)}`, transferTimeoutMs(destination, options));
+    return { ok: true, source, destination, relativePath, directory: options.directory === true, deletedStale: true };
+  }
+  const command = directSyncCommand(source, destination, relativePath, options.directory === true, false);
   const timeoutMs = transferTimeoutMs(source, options);
-  return new Promise((resolve, reject) => {
+  try {
+    return await new Promise((resolve, reject) => {
     const child = spawn("ssh", ["-o", "BatchMode=yes", ...getSshArgs(source, command)], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
     let stdout = "";
@@ -803,7 +812,263 @@ async function syncServerToServer(options = {}) {
       if (code === 0) resolve({ ok: true, source, destination, relativePath, directory: options.directory === true, deletedStale: true, output: stdout.trim() });
       else reject(new Error(`Worker 间 rsync 失败（退出码 ${code}）：${stderr.trim() || stdout.trim() || "SSH 或 rsync 不可用"}`));
     });
+    });
+  } catch (error) {
+    if (!/host key verification failed|no .* host key|permission denied|connection timed out|connect to host|network is unreachable|could not resolve hostname|connection refused/i.test(formatError(error))) throw error;
+    return relayServerToServer(source, destination, relativePath, options.directory === true, timeoutMs);
+  }
+}
+
+async function inspectRemoteScope(target, relativePath, directory, timeoutMs, required = false) {
+  const script = [
+    "import hashlib,json,os,sys",
+    "root=os.path.realpath(sys.argv[1]); rel=sys.argv[2]; directory=sys.argv[3]=='1'; required=sys.argv[4]=='1'",
+    "parts=rel.split('/'); target=os.path.join(root,*parts)",
+    "if any(p in ('','.','..') for p in parts): raise ValueError('unsafe scope')",
+    "if any(os.path.islink(os.path.join(root,*parts[:i])) for i in range(1,len(parts)+1)): raise ValueError('symlink scope')",
+    "if os.path.commonpath((root,os.path.realpath(target)))!=root: raise ValueError('scope outside project')",
+    "if directory and required and not os.path.isdir(target): raise ValueError('Plan directory missing: '+rel)",
+    "paths=[]",
+    "if directory and os.path.isdir(target):",
+    " for current,dirs,files in os.walk(target,followlinks=False):",
+    "  if any(os.path.islink(os.path.join(current,d)) for d in dirs): raise ValueError('symlink directory in Plan scope')",
+    "  paths.extend(os.path.join(current,name) for name in files)",
+    "elif os.path.isfile(target): paths=[target]",
+    "found={}",
+    "for full in paths:",
+    " if os.path.islink(full) or not os.path.isfile(full): raise ValueError('unsafe file in Plan scope')",
+    " h=hashlib.sha256()",
+    " with open(full,'rb') as stream:",
+    "  before=os.fstat(stream.fileno())",
+    "  for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk)",
+    "  after=os.fstat(stream.fileno())",
+    " if before.st_size!=after.st_size or before.st_mtime_ns!=after.st_mtime_ns: raise ValueError('file changed during Plan sync')",
+    " found[os.path.relpath(full,root).replace(os.sep,'/')]={'sha256':h.hexdigest(),'size':after.st_size}",
+    "print(json.dumps({'files':found},separators=(',',':')))",
+  ].join("\n");
+  const stdout = await runSsh(target, `python3 -c ${shellQuote(script)} ${shellQuote(target.remotePath)} ${shellQuote(relativePath)} ${directory ? "1" : "0"} ${required ? "1" : "0"}`, timeoutMs);
+  const result = JSON.parse(stdout);
+  if (!result.files || typeof result.files !== "object" || Array.isArray(result.files)) throw new Error("Plan 内容清单无效。");
+  return result.files;
+}
+
+function relayTarFiles(source, destination, paths, timeoutMs) {
+  if (!paths.length) return Promise.resolve();
+  const sourceCommand = `cd ${shellQuote(source.remotePath)} && tar --null -T - -cf -`;
+  const destinationCommand = `cd ${shellQuote(destination.remotePath)} && tar -xf -`;
+  return new Promise((resolve, reject) => {
+    const reader = spawn("ssh", getSshArgs(source, sourceCommand), { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    const writer = spawn("ssh", getSshArgs(destination, destinationCommand), { windowsHide: true, stdio: ["pipe", "ignore", "pipe"] });
+    let sourceCode;
+    let destinationCode;
+    let stderr = "";
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) { reader.kill(); writer.kill(); reject(error); } else resolve();
+    };
+    const timer = timeoutMs > 0 ? setTimeout(() => finish(new Error("本机内存转发超过传输时限。")), timeoutMs) : null;
+    reader.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
+    writer.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
+    reader.on("error", (error) => finish(error));
+    writer.on("error", (error) => finish(error));
+    reader.on("close", (code) => { sourceCode = code; if (destinationCode !== undefined) finish(sourceCode === 0 && destinationCode === 0 ? null : new Error(`内存转发失败：${stderr || `${sourceCode}/${destinationCode}`}`)); });
+    writer.on("close", (code) => { destinationCode = code; if (sourceCode !== undefined) finish(sourceCode === 0 && destinationCode === 0 ? null : new Error(`内存转发失败：${stderr || `${sourceCode}/${destinationCode}`}`)); });
+    reader.stdout.pipe(writer.stdin);
+    writer.stdin.on("error", () => {});
+    reader.stdin.on("error", () => {});
+    reader.stdin.end(Buffer.from(paths.map((name) => `${name}\0`).join(""), "utf8"));
   });
+}
+
+async function removeStaleRemoteFiles(destination, scope, paths, timeoutMs) {
+  for (let offset = 0; offset < paths.length; offset += 100) {
+    const encoded = Buffer.from(JSON.stringify(paths.slice(offset, offset + 100)), "utf8").toString("base64");
+    const script = [
+      "import base64,json,os,sys",
+      "root=os.path.realpath(sys.argv[1]); scope=os.path.realpath(os.path.join(root,sys.argv[2]))",
+      "for rel in json.loads(base64.b64decode(sys.argv[3])):",
+      " target=os.path.join(root,*rel.split('/'))",
+      " if os.path.commonpath((scope,os.path.realpath(target)))!=scope or os.path.islink(target) or not os.path.isfile(target): raise ValueError('unsafe stale file')",
+      " os.unlink(target)",
+    ].join("\n");
+    await runSsh(destination, `python3 -c ${shellQuote(script)} ${shellQuote(destination.remotePath)} ${shellQuote(scope)} ${shellQuote(encoded)}`, timeoutMs);
+  }
+}
+
+async function relayServerToServer(source, destination, relativePath, directory, timeoutMs) {
+  const sourceFiles = await inspectRemoteScope(source, relativePath, directory, timeoutMs, directory);
+  const destinationFiles = await inspectRemoteScope(destination, relativePath, directory, timeoutMs);
+  if (directory) {
+    const target = path.posix.join(destination.remotePath, relativePath);
+    const guard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && target=$(realpath -m -- ${shellQuote(target)}) && case "$target" in "$root"/*) ;; *) exit 72;; esac`;
+    await runSsh(destination, `${guard} && mkdir -p -- ${shellQuote(target)}`, timeoutMs);
+  }
+  const changed = Object.keys(sourceFiles).filter((name) => sourceFiles[name].sha256 !== destinationFiles[name]?.sha256).sort();
+  const stale = Object.keys(destinationFiles).filter((name) => !sourceFiles[name]).sort();
+  await relayTarFiles(source, destination, changed, timeoutMs);
+  if (stale.length) await removeStaleRemoteFiles(destination, relativePath, stale, timeoutMs);
+  const verified = await inspectRemoteScope(destination, relativePath, directory, timeoutMs);
+  if (JSON.stringify(Object.entries(sourceFiles).sort()) !== JSON.stringify(Object.entries(verified).sort()))
+    throw new Error("本机内存转发后内容 SHA256 不一致；同步保持待处理。");
+  return { ok: true, source, destination, relativePath, directory, deletedStale: stale.length > 0, transferredFiles: changed.length, verification: "sha256", transport: "memory-relay" };
+}
+
+async function listPlanLogPaths(options = {}) {
+  const source = directSyncTarget(options.source, "来源");
+  const statePath = directSyncRelativePath(options.statePath);
+  if (!statePath.startsWith("simple_cluster/tmp/cluster_scheduler/") || !statePath.endsWith("_state.json"))
+    throw new Error("Plan 状态文件路径不受支持。");
+  const text = await runSsh(source, `cat -- ${shellQuote(path.posix.join(source.remotePath, statePath))}`, transferTimeoutMs(source, options));
+  if (Buffer.byteLength(text, "utf8") > 20 * 1024 * 1024) throw new Error("Plan 状态文件过大。");
+  return { ok: true, paths: planLogPathsFromState(JSON.parse(text), options.planFile) };
+}
+
+function planLogPathsFromState(state, planFile) {
+  const expectedPlan = String(planFile || "").replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+  const actualPlan = String(state.plan || "").replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+  if (!expectedPlan || actualPlan !== expectedPlan) throw new Error("Plan 状态文件与目标 Plan 不匹配。");
+  const paths = new Set();
+  const add = (raw) => {
+    if (!raw) return;
+    const relative = directSyncRelativePath(raw);
+    if (!relative.startsWith("simple_cluster/tmp/cluster_scheduler/") && !relative.startsWith("simple_cluster/debug_runs/") && !relative.startsWith("tmp/tmux_logs/"))
+      throw new Error(`Plan 日志路径超出允许范围：${relative}`);
+    paths.add(relative);
+  };
+  add(state.scheduler_log);
+  for (const key of ["completed_experiments", "failed_experiments", "stopped_experiments", "running_experiments", "testing_experiments"])
+    for (const row of Array.isArray(state[key]) ? state[key] : []) add(row?.log_path);
+  return [...paths].sort();
+}
+
+async function projectInventory(options = {}) {
+  const source = directSyncTarget(options.source, "来源");
+  const script = [
+    "import hashlib,json,os,sys",
+    "root=os.path.realpath(sys.argv[1]); found={}; limit=100000",
+    "blocked={'.git','.vscode','.codex','zlk_cluster','.venv','venv','env','node_modules','__pycache__','.cache','.pytest_cache','.mypy_cache','.ruff_cache','.tox'}",
+    "def allowed(rel,isdir=False):",
+    " parts=rel.replace(os.sep,'/').lower().split('/')",
+    " if any(p in blocked for p in parts): return False",
+    " if parts[0]!='simple_cluster': return True",
+    " if len(parts)<2: return True",
+    " if parts[1] in ('results','debug_runs'): return not rel.endswith('plan_sync_ledger.json')",
+    " if parts[1]=='tmp' and len(parts)==2: return isdir",
+    " if parts[1]=='tmp' and len(parts)>2 and parts[2]=='tmux_logs': return True",
+    " if parts[1]=='tmp' and len(parts)>2 and parts[2]=='cluster_scheduler': return isdir or parts[-1].endswith('.log')",
+    " return False",
+    "for current,dirs,files in os.walk(root,followlinks=False):",
+    " dirs[:]=[d for d in dirs if not os.path.islink(os.path.join(current,d)) and allowed(os.path.relpath(os.path.join(current,d),root),True)]",
+    " for name in files:",
+    "  full=os.path.join(current,name); rel=os.path.relpath(full,root).replace(os.sep,'/')",
+    "  if not allowed(rel) or os.path.islink(full) or not os.path.isfile(full): continue",
+    "  with open(full,'rb') as stream:",
+    "   before=os.fstat(stream.fileno()); h=hashlib.sha256()",
+    "   for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk)",
+    "   after=os.fstat(stream.fileno())",
+    "  if before.st_size!=after.st_size or before.st_mtime_ns!=after.st_mtime_ns: raise RuntimeError('file changed during inventory: '+rel)",
+    "  found[rel]={'sha256':h.hexdigest(),'size':after.st_size}",
+    "  if len(found)>limit: raise RuntimeError('project inventory exceeds 100000 files')",
+    "print(json.dumps({'files':found},separators=(',',':')))",
+  ].join("\n");
+  const output = await runSsh(source, `python3 -c ${shellQuote(script)} ${shellQuote(source.remotePath)}`, transferTimeoutMs(source, options));
+  const result = JSON.parse(output);
+  if (!result.files || typeof result.files !== "object" || Array.isArray(result.files)) throw new Error("远端项目清单无效。");
+  return { ok: true, files: result.files };
+}
+
+function runRemoteBatchSsh(source, command, paths, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("ssh", ["-o", "BatchMode=yes", ...getSshArgs(source, command)], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error); else resolve(value);
+    };
+    const timer = timeoutMs > 0 ? setTimeout(() => { child.kill(); finish(new Error("跨 Worker 批量同步超时。")); }, timeoutMs) : null;
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+      if (stdout.length > 4 * 1024 * 1024) { child.kill(); finish(new Error("远端批量清单超过 4 MB。")); }
+    });
+    child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
+    child.on("error", (error) => finish(error));
+    child.on("close", (code) => code === 0
+      ? finish(null, stdout.trim())
+      : finish(new Error(`跨 Worker rsync 失败（${code}）：${stderr.trim() || stdout.trim() || "SSH 或 rsync 不可用"}`)));
+    child.stdin.on("error", () => {});
+    child.stdin.end(Buffer.from(paths.map((name) => `${name}\0`).join(""), "utf8"));
+  });
+}
+
+async function inspectRemoteBatchFiles(target, paths, timeoutMs) {
+  const script = [
+    "import hashlib,json,os,sys",
+    "root=os.path.realpath(sys.argv[1]); found={}",
+    "for raw in sys.stdin.buffer.read().split(b'\\0'):",
+    " if not raw: continue",
+    " rel=raw.decode('utf-8'); parts=rel.split('/')",
+    " if any(p in ('','.','..') for p in parts): raise ValueError('unsafe batch path')",
+    " if any(os.path.islink(os.path.join(root,*parts[:i])) for i in range(1,len(parts)+1)): raise ValueError('symlink batch path: '+rel)",
+    " full=os.path.join(root,*parts)",
+    " if os.path.commonpath((root,os.path.realpath(full)))!=root: raise ValueError('batch path outside project')",
+    " if not os.path.exists(full): found[rel]=None; continue",
+    " if not os.path.isfile(full): raise ValueError('batch path is not a file: '+rel)",
+    " with open(full,'rb') as stream:",
+    "  before=os.fstat(stream.fileno()); h=hashlib.sha256()",
+    "  for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk)",
+    "  after=os.fstat(stream.fileno())",
+    " if before.st_size!=after.st_size or before.st_mtime_ns!=after.st_mtime_ns: raise ValueError('file changed during batch sync: '+rel)",
+    " found[rel]=h.hexdigest()",
+    "print(json.dumps(found,separators=(',',':')))",
+  ].join("\n");
+  const stdout = await runRemoteBatchSsh(target, `python3 -c ${shellQuote(script)} ${shellQuote(target.remotePath)}`, paths, timeoutMs);
+  const found = JSON.parse(stdout);
+  if (!found || typeof found !== "object" || Array.isArray(found) || Object.keys(found).length !== paths.length)
+    throw new Error("远端批量内容清单不完整。");
+  return found;
+}
+
+async function syncServerToServerBatch(options = {}) {
+  const source = directSyncTarget(options.source, "来源");
+  const destination = directSyncTarget(options.destination, "目标");
+  const paths = [...new Set((Array.isArray(options.relativePaths) ? options.relativePaths : []).map(directSyncRelativePath))].sort();
+  if (!paths.length || paths.length > 5000) throw new Error("批量同步需要 1–5000 个项目内文件路径。");
+  if (source.host === destination.host && source.port === destination.port && source.remotePath === destination.remotePath) throw new Error("来源与目标相同。");
+  if (options.confirm !== true || options.pathConfirmed !== true) throw confirmationRequired({
+    method: "sync.serverToServerBatch", operation: "Worker 间批量补齐项目文件", requires: ["confirm", "pathConfirmed"],
+    source, destination, relativePaths: paths,
+  });
+  const destinationHost = `${destination.username}@${destination.host}`;
+  const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -p ${destination.port}`;
+  const destinationGuard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && test "$root" = ${shellQuote(destination.remotePath)}`;
+  const sourceGuard = `root=$(realpath -e -- ${shellQuote(source.remotePath)}) && test "$root" = ${shellQuote(source.remotePath)}`;
+  const prepare = `${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(destinationGuard)}`;
+  const args = `-a -c -s --from0 --files-from=- -e ${shellQuote(sshOptions)} -- ${shellQuote(source.remotePath + "/")} ${shellQuote(destinationHost + ":" + destination.remotePath + "/")}`;
+  const prefix = `${sourceGuard} && ${prepare} && `;
+  const timeout = transferTimeoutMs(source, options);
+  try {
+    await runRemoteBatchSsh(source, `${prefix}rsync ${args}`, paths, timeout);
+    const remaining = await runRemoteBatchSsh(source, `${prefix}rsync -n -i ${args}`, paths, timeout);
+    if (remaining) throw new Error(`跨 Worker 批量内容校验不一致：${remaining.slice(0, 2000)}`);
+    return { ok: true, paths: paths.length, verification: "rsync-checksum", transport: "direct-rsync" };
+  } catch (error) {
+    if (!/host key verification failed|no .* host key|permission denied|connection timed out|connect to host|network is unreachable|could not resolve hostname|connection refused/i.test(formatError(error))) throw error;
+    const sourceHashes = await inspectRemoteBatchFiles(source, paths, timeout);
+    if (paths.some((name) => !sourceHashes[name])) throw new Error("来源 Worker 缺少批量同步文件；同步保持待处理。");
+    const destinationHashes = await inspectRemoteBatchFiles(destination, paths, timeout);
+    const changed = paths.filter((name) => sourceHashes[name] !== destinationHashes[name]);
+    await relayTarFiles(source, destination, changed, timeout);
+    const verified = await inspectRemoteBatchFiles(destination, paths, timeout);
+    if (paths.some((name) => sourceHashes[name] !== verified[name])) throw new Error("批量内存转发后 SHA256 不一致；同步保持待处理。");
+    return { ok: true, paths: paths.length, transferredFiles: changed.length, verification: "sha256", transport: "memory-relay" };
+  }
 }
 
 async function syncFromRemoteCore(options = {}) {
@@ -973,13 +1238,17 @@ async function uploadWorkspaceCore(options = {}) {
     const legacyManagedDir = previousState && typeof previousState === "object" ? previousState.legacyManagedDir : "";
     let uploadStats;
     if (manifest) {
+      const before = await inspectRemoteManagedFiles(sftp, manifest, transferTimeoutMs(sftp, options));
       uploadStats = await uploadManifestLocalFilesToRemote({
         localPath,
         sftp,
         manifest,
-        previousManifest,
+        changedPaths: before.mismatches,
         uploadOptions: options,
       });
+      const after = await inspectRemoteManagedFiles(sftp, manifest, transferTimeoutMs(sftp, options));
+      if (after.mismatches.length) throw new Error(`远端代码内容校验失败：${after.mismatches.slice(0, 12).join("、")}`);
+      uploadStats.verification = { method: "remote-sha256", checkedFiles: Object.keys(manifest).length, changedFiles: before.mismatches.length };
     } else {
       uploadStats = await uploadAllLocalToRemote({ localPath, sftp, writeState: options.stateFileMode !== "virtual", pathConfirmed: true, options });
     }
@@ -1018,8 +1287,8 @@ async function uploadWorkspaceCore(options = {}) {
   }
 }
 
-async function uploadManifestLocalFilesToRemote({ localPath, sftp, manifest, previousManifest, uploadOptions = {} }) {
-  const uploadPlan = createManifestUploadPlan({ localPath, sftp, manifest, previousManifest });
+async function uploadManifestLocalFilesToRemote({ localPath, sftp, manifest, changedPaths, uploadOptions = {} }) {
+  const uploadPlan = createManifestUploadPlan({ localPath, sftp, manifest, changedPaths });
   if (uploadPlan.fileCount > 0) {
     return await runUploadWithProgress(uploadOptions, `上传受管理代码文件 -> ${sftp.remotePath}`, (token) => runLocalTarUpload({
         localPath,
@@ -1377,6 +1646,58 @@ async function readRemoteCodeManifest(sftp) {
   return null;
 }
 
+function inspectRemoteManagedFiles(sftp, manifest, timeoutMs) {
+  const files = getManagedManifest(manifest);
+  if (!files) throw new Error("代码 manifest 格式无效。");
+  for (const [relativePath, item] of Object.entries(files)) {
+    if (!isSafeRemoteManagedPath(relativePath) || !/^[a-f0-9]{64}$/i.test(String(item?.sha256 || "")))
+      throw new Error(`代码 manifest 路径或 SHA256 无效：${relativePath}`);
+  }
+  const script = [
+    "import hashlib,json,os,sys",
+    "root=os.path.realpath(sys.argv[1]); files=json.load(sys.stdin); bad=[]",
+    "for rel,item in files.items():",
+    " parts=rel.split('/')",
+    " if not rel or any(p in ('','.','..') for p in parts): raise ValueError('unsafe path')",
+    " target=os.path.join(root,*parts)",
+    " if any(os.path.islink(os.path.join(root,*parts[:i])) for i in range(1,len(parts)+1)): raise ValueError('symlink path: '+rel)",
+    " if os.path.commonpath((root,os.path.realpath(target)))!=root: raise ValueError('path outside project')",
+    " if not os.path.isfile(target): bad.append(rel); continue",
+    " h=hashlib.sha256()",
+    " with open(target,'rb') as stream:",
+    "  for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk)",
+    " if h.hexdigest()!=str(item.get('sha256','')).lower(): bad.append(rel)",
+    "print(json.dumps({'mismatches':bad}))",
+  ].join("\n");
+  const command = `python3 -c ${shellQuote(script)} ${shellQuote(String(sftp.remotePath).replace(/\/+$/, ""))}`;
+  return new Promise((resolve, reject) => {
+    const child = spawn("ssh", getSshArgs(sftp, command), { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error); else resolve(value);
+    };
+    const timer = setTimeout(() => { child.kill(); finish(new Error("远端代码 SHA256 校验超时。")); }, Math.max(1000, Number(timeoutMs) || 120000));
+    child.stdout.on("data", (chunk) => { stdout = (stdout + chunk.toString("utf8")).slice(-20 * 1024 * 1024); });
+    child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
+    child.on("error", (error) => finish(error));
+    child.on("close", (code) => {
+      if (code !== 0) return finish(new Error(`远端代码 SHA256 校验失败：${stderr.trim() || `SSH 退出码 ${code}`}`));
+      try {
+        const result = JSON.parse(stdout);
+        if (!Array.isArray(result.mismatches) || result.mismatches.some((name) => !Object.hasOwn(files, name))) throw new Error("校验结果无效");
+        finish(null, result);
+      } catch (error) { finish(new Error(`远端代码 SHA256 校验响应无效：${formatError(error)}`)); }
+    });
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify(files));
+  });
+}
+
 async function writeRemoteCodeSyncState(sftp, state, manifest) {
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) return;
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-code-sync-state-"));
@@ -1454,8 +1775,8 @@ function normalizeDownloadExtensions(values) {
 
 function normalizeDownloadMaxFileSizeMB(value) {
   const size = Number(value);
-  if (!Number.isFinite(size) || size < 0.1 || size > 1024) {
-    throw new Error("单文件大小上限必须在 0.1–1024 MB 之间。");
+  if (!Number.isFinite(size) || size < 0.1 || size > 1048576) {
+    throw new Error("单文件大小上限必须在 0.1–1048576 MB 之间。");
   }
   return Math.round(size * 100) / 100;
 }
@@ -1466,10 +1787,23 @@ function normalizeDownloadScopePath(value) {
   if (path.posix.isAbsolute(normalized) || normalized.split("/").some((part) => !part || part === "." || part === "..")) {
     throw new Error(`下载范围必须是远端项目内相对路径：${value}`);
   }
-  if (normalized.toLowerCase().split("/").some((part) => [".git", ".vscode", ".codex", "simple_cluster", "zlk_cluster"].includes(part))) {
+  if (downloadScopeBlockedPath(normalized)) {
     throw new Error(`下载范围包含插件或版本控制状态目录：${value}`);
   }
   return normalized;
+}
+
+function downloadScopeBlockedPath(relative) {
+  const parts = String(relative || "").toLowerCase().split("/");
+  if (parts.some((part) => [".git", ".vscode", ".codex", "zlk_cluster"].includes(part))) return true;
+  if (parts[0] !== "simple_cluster") return false;
+  if (parts.length === 1) return false;
+  if (parts[1] === "results" || parts[1] === "debug_runs") return false;
+  if (parts[1] === "tmp" && parts.length === 2) return false;
+  if (parts[1] === "tmp" && parts[2] === "cluster_scheduler")
+    return parts.length > 3 && parts[3] !== "logs" && !parts.at(-1).endsWith(".log");
+  if (parts[1] === "tmp" && parts[2] === "tmux_logs") return false;
+  return true;
 }
 
 function normalizeDownloadScope(value = {}) {
@@ -1574,7 +1908,7 @@ async function configureDownloadScopeCore(options = {}) {
     } else if (action.id === "max-size") {
       const value = await vscode.window.showInputBox({
         title: "下载单文件大小上限",
-        prompt: "单位 MB，允许 0.1–1024。",
+        prompt: "单位 MB，允许 0.1–1048576。",
         value: String(current.maxFileSizeMB),
         ignoreFocusOut: true,
         validateInput: (input) => { try { normalizeDownloadMaxFileSizeMB(Number(input)); return undefined; } catch (error) { return formatError(error); } },
@@ -1595,11 +1929,11 @@ async function configureDownloadScopeCore(options = {}) {
       const removed = new Set(picked.map((item) => item.label));
       next.paths = current.paths.filter((relative) => !removed.has(relative));
     } else if (action.id === "folder") {
-      const selected = await pickRemoteDirectory({ remoteBase: sftp.remotePath, sftp, title: "选择允许下载的远端文件夹" });
+      const selected = await pickRemoteDirectory({ remoteBase: sftp.remotePath, sftp, title: "选择允许下载的远端文件夹", showHiddenTopLevel: true });
       if (!selected) return { ok: false, cancelled: true };
       next.paths = [...new Set([...current.paths, relativeRemoteScopePath(sftp.remotePath, selected)])].sort((a, b) => a.localeCompare(b));
     } else if (action.id === "file") {
-      const selectedDir = await pickRemoteDirectory({ remoteBase: sftp.remotePath, sftp, title: "进入远端文件所在目录" });
+      const selectedDir = await pickRemoteDirectory({ remoteBase: sftp.remotePath, sftp, title: "进入远端文件所在目录", showHiddenTopLevel: true });
       if (!selectedDir) return { ok: false, cancelled: true };
       const files = await listRemoteFiles(sftp, selectedDir);
       const picked = await vscode.window.showQuickPick(files.map((file) => ({ label: file.name, description: formatBytes(file.sizeBytes), file })), { title: `选择远端文件：${selectedDir}`, canPickMany: true, ignoreFocusOut: true });
@@ -1630,7 +1964,7 @@ function mergeIgnorePatterns(...groups) {
   return [...out].sort((a, b) => a.localeCompare(b));
 }
 
-async function pickRemoteDirectory({ remoteBase, sftp, title = "选择远端项目根目录" }) {
+async function pickRemoteDirectory({ remoteBase, sftp, title = "选择远端项目根目录", showHiddenTopLevel = false }) {
   let current = remoteBase.replace(/\/+$/, "");
   for (;;) {
     const dirs = await listRemoteDirs(sftp, current);
@@ -1656,7 +1990,7 @@ async function pickRemoteDirectory({ remoteBase, sftp, title = "选择远端项�
     }
 
     for (const dir of dirs) {
-      if (current === remoteBase.replace(/\/+$/, "") && HIDDEN_TOP_LEVEL.has(dir)) {
+      if (!showHiddenTopLevel && current === remoteBase.replace(/\/+$/, "") && HIDDEN_TOP_LEVEL.has(dir)) {
         continue;
       }
       items.push({
@@ -2319,6 +2653,9 @@ function createLocalApiMethods() {
       });
       return result;
     },
+    "sync.planLogPaths": async (params = {}) => listPlanLogPaths(params),
+    "sync.projectInventory": async (params = {}) => projectInventory(params),
+    "sync.serverToServerBatch": async (params = {}) => syncServerToServerBatch(params),
     "sync.serverToServer": async (params = {}) => {
       const result = await syncServerToServer(params);
       publishLocalApiEvent("sync.serverToServer", {
@@ -2945,14 +3282,10 @@ function createWorkspaceUploadPlan(localPath, sftp) {
   };
 }
 
-function createManifestUploadPlan({ localPath, sftp, manifest, previousManifest }) {
+function createManifestUploadPlan({ localPath, sftp, manifest, changedPaths }) {
+  const changed = Array.isArray(changedPaths) ? new Set(changedPaths) : null;
   const relativePaths = getManifestUploadRelativePaths({ localPath, sftp, manifest })
-    .filter((relativePath) => {
-      const current = manifest[relativePath];
-      const previous = previousManifest?.files?.[relativePath];
-      return !previous || !current || Number(previous.size) !== Number(current.size)
-        || !current.sha256 || String(previous.sha256 || "").toLowerCase() !== String(current.sha256).toLowerCase();
-    });
+    .filter((relativePath) => !changed || changed.has(relativePath));
   const files = relativePaths.map((relativePath) => {
     const fullPath = path.join(localPath, relativePath);
     const size = fs.statSync(fullPath).size;
@@ -3383,7 +3716,17 @@ function createRemoteDownloadScript(remotePath, downloadScope) {
       "extensions=[str(v).lower() for v in (scope.get('extensions') or ['*'])]",
       "allow_any='*' in extensions",
       "max_bytes=int(float(scope.get('maxFileSizeMB') or 1024)*1024*1024)",
-      "blocked={'.git','.vscode','.codex','simple_cluster','zlk_cluster'}",
+      "blocked={'.git','.vscode','.codex','zlk_cluster'}",
+      "def blocked_path(rel):",
+      "    parts=rel.replace('\\\\','/').lower().split('/')",
+      "    if any(p in blocked for p in parts): return True",
+      "    if parts[0]!='simple_cluster': return False",
+      "    if len(parts)==1: return False",
+      "    if len(parts)>1 and parts[1] in ('results','debug_runs'): return False",
+      "    if len(parts)==2 and parts[1]=='tmp': return False",
+      "    if len(parts)>2 and parts[1]=='tmp' and parts[2]=='tmux_logs': return False",
+      "    if len(parts)>2 and parts[1]=='tmp' and parts[2]=='cluster_scheduler': return len(parts)>3 and parts[3]!='logs' and not parts[-1].endswith('.log')",
+      "    return True",
       "selected=[]",
       "seen=set()",
       "def inside(value):",
@@ -3391,7 +3734,7 @@ function createRemoteDownloadScript(remotePath, downloadScope) {
       "    except ValueError: return False",
       "def allowed(rel, full):",
       "    if not rel or rel in seen or os.path.islink(full) or not os.path.isfile(full): return False",
-      "    if any(part.lower() in blocked for part in rel.replace('\\\\','/').split('/')): return False",
+      "    if blocked_path(rel): return False",
       "    if os.path.getsize(full) > max_bytes: return False",
       "    lower=rel.lower()",
       "    return allow_any or any(lower.endswith(ext) for ext in extensions)",
@@ -3405,7 +3748,7 @@ function createRemoteDownloadScript(remotePath, downloadScope) {
       "        continue",
       "    if not os.path.isdir(target): continue",
       "    for current,dirs,files in os.walk(target,followlinks=False):",
-      "        dirs[:]=[d for d in dirs if not os.path.islink(os.path.join(current,d)) and not any(part.lower() in blocked for part in os.path.relpath(os.path.join(current,d),root).replace(os.sep,'/').split('/'))]",
+      "        dirs[:]=[d for d in dirs if not os.path.islink(os.path.join(current,d)) and not blocked_path(os.path.relpath(os.path.join(current,d),root).replace(os.sep,'/'))]",
       "        for name in files:",
       "            full=os.path.join(current,name)",
       "            rel=os.path.relpath(full,root).replace(os.sep,'/')",
@@ -3704,6 +4047,7 @@ module.exports = {
     directSyncTarget,
     directSyncRelativePath,
     directSyncCommand,
+    planLogPathsFromState,
     normalizeDownloadScope,
     normalizeDownloadScopePath,
     relativeRemoteScopePath,
