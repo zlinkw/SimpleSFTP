@@ -22,8 +22,26 @@ test("direct rsync scopes delete to one Plan directory", () => {
   assert.match(command, /StrictHostKeyChecking=accept-new/);
   const deleteCommand = __test.directSyncCommand(source, destination, "work_dirs/old_run", true, true);
   assert.match(deleteCommand, /rm -rf --/);
+  assert.match(deleteCommand, /cd --/);
+  assert.match(deleteCommand, /\.\/old_run/);
+  assert.doesNotMatch(deleteCommand, /rm -rf -- '\/projects\/demo\/work_dirs\/old_run'/);
   assert.match(deleteCommand, /test ! -e/);
   assert.doesNotMatch(deleteCommand, /rsync -a/);
+});
+
+test("single-endpoint delete is confined, requires two confirmations and exact path", async () => {
+  const methods = __test.createLocalApiMethods();
+  const target = { host: "worker", user: "research", remotePath: "/projects/demo" };
+  assert.equal(typeof methods["sync.deletePath"], "function");
+  await assert.rejects(methods["sync.deletePath"]({ target, relativePath: "results/a.bin" }),
+    (error) => error.apiCode === 2001);
+  await assert.rejects(methods["sync.deletePath"]({ target, relativePath: "results/a.bin", confirm: true, pathConfirmed: true,
+    secondConfirmation: true, confirmedAbsolutePath: "/projects/demo/results/b.bin" }), (error) => error.apiCode === 2001);
+  const command = __test.guardedRemoteDeleteCommand(__test.directSyncTarget(target, "目标"), "results/a.bin");
+  assert.match(command, /cd -- "\$parent"/);
+  assert.match(command, /PARENT_CD_FAILED/);
+  assert.match(command, /rm -rf -- '\.\/a\.bin'/);
+  assert.throws(() => __test.guardedRemoteDeleteCommand(__test.directSyncTarget(target, "目标"), "simple_cluster"), /机器状态/);
 });
 
 test("direct rsync rejects remote root escape", () => {

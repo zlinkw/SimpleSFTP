@@ -760,13 +760,39 @@ function directSyncRelativePath(value) {
   return relative;
 }
 
+function guardedRemoteDeleteCommand(target, relativePath) {
+  if (!projectTreePathAllowed(relativePath) || relativePath === "simple_cluster") throw new Error("删除路径属于机器状态或包含机器状态。");
+  const absolute = path.posix.join(target.remotePath, relativePath);
+  const parent = path.posix.dirname(absolute);
+  const leaf = `./${path.posix.basename(absolute)}`;
+  return `root=$(realpath -e -- ${shellQuote(target.remotePath)}) || { echo PARENT_CD_FAILED >&2; exit 75; }; parent=$(realpath -e -- ${shellQuote(parent)}) || { echo PARENT_CD_FAILED >&2; exit 75; }; case "$parent" in "$root"|"$root"/*) ;; *) exit 72;; esac; cd -- "$parent" || { echo PARENT_CD_FAILED >&2; exit 75; }; test "$(pwd -P)" = "$parent" || { echo PARENT_CD_FAILED >&2; exit 75; }; test ! -L ${shellQuote(leaf)} || exit 72; rm -rf -- ${shellQuote(leaf)} && test ! -e ${shellQuote(leaf)}`;
+}
+
+async function deleteProjectPath(options = {}) {
+  const target = directSyncTarget(options.target, "删除目标");
+  const relativePath = directSyncRelativePath(options.relativePath);
+  const absolutePath = path.posix.join(target.remotePath, relativePath);
+  if (options.confirmedAbsolutePath !== absolutePath || options.confirm !== true || options.pathConfirmed !== true || options.secondConfirmation !== true)
+    throw confirmationRequired({ method: "sync.deletePath", operation: "永久删除单台 Worker 的项目路径", target, relativePath, absolutePath,
+      requires: ["confirm", "pathConfirmed", "secondConfirmation", "confirmedAbsolutePath"] });
+  const command = guardedRemoteDeleteCommand(target, relativePath);
+  try {
+    await runSsh(target, command, transferTimeoutMs(target, options));
+  } catch (error) {
+    const message = formatError(error);
+    if (message.includes("PARENT_CD_FAILED")) throw new Error(`PARENT_CD_FAILED：无法进入或验证父目录 ${path.posix.dirname(absolutePath)}；禁止删除。`);
+    throw error;
+  }
+  return { ok: true, target: target.host, relativePath, absolutePath };
+}
+
 function directSyncCommand(source, destination, relativePath, directory, deleteOnly = false) {
   const sourcePath = path.posix.join(source.remotePath, relativePath);
   const destinationPath = path.posix.join(destination.remotePath, relativePath);
   const destinationHost = `${destination.username}@${destination.host}`;
   const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p ${destination.port}`;
   const destinationGuard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && target=$(realpath -m -- ${shellQuote(destinationPath)}) && case "$target" in "$root"/*) ;; *) exit 72;; esac`;
-  if (deleteOnly) return `${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(`${destinationGuard} && rm -rf -- ${shellQuote(destinationPath)} && test ! -e ${shellQuote(destinationPath)}`)}`;
+  if (deleteOnly) return `${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(guardedRemoteDeleteCommand(destination, relativePath))}`;
   const destinationParent = directory ? destinationPath : path.posix.dirname(destinationPath);
   const parentGuard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && parent=$(realpath -m -- ${shellQuote(destinationParent)}) && case "$parent" in "$root"|"$root"/*) ;; *) exit 72;; esac`;
   const prepare = `${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(`${parentGuard} && mkdir -p -- ${shellQuote(destinationParent)} && ${destinationGuard}`)}`;
@@ -783,7 +809,8 @@ async function syncServerToServer(options = {}) {
   const source = directSyncTarget(options.source, "来源");
   const destination = directSyncTarget(options.destination, "目标");
   const relativePath = directSyncRelativePath(options.relativePath);
-  if (options.directory === true && relativePath.split("/").length < 2) throw new Error("目录同步必须限定到 Plan 独立子目录，禁止清理项目顶层目录。");
+  if (options.directory === true && relativePath.split("/").length < 2 && options.manualRetain !== true) throw new Error("目录同步必须限定到 Plan 独立子目录，禁止清理项目顶层目录。");
+  if (options.manualRetain === true && (!projectTreePathAllowed(relativePath) || options.directory === true && relativePath === "simple_cluster")) throw new Error("手动保留版本路径属于机器状态或包含机器状态。");
   if (source.host === destination.host && source.port === destination.port && source.remotePath === destination.remotePath) throw new Error("来源与目标相同。" );
   if (options.confirm !== true || options.pathConfirmed !== true) throw confirmationRequired({
     method: "sync.serverToServer", operation: "Worker 间直接同步 Plan 产物",
@@ -791,9 +818,7 @@ async function syncServerToServer(options = {}) {
     source, destination, relativePath, directory: options.directory === true, deleteOnly: options.deleteOnly === true, deleteStale: true,
   });
   if (options.deleteOnly === true) {
-    const target = path.posix.join(destination.remotePath, relativePath);
-    const guard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && target=$(realpath -m -- ${shellQuote(target)}) && case "$target" in "$root"/*) ;; *) exit 72;; esac`;
-    await runSsh(destination, `${guard} && rm -rf -- ${shellQuote(target)} && test ! -e ${shellQuote(target)}`, transferTimeoutMs(destination, options));
+    await runSsh(destination, guardedRemoteDeleteCommand(destination, relativePath), transferTimeoutMs(destination, options));
     return { ok: true, source, destination, relativePath, directory: options.directory === true, deletedStale: true };
   }
   const command = directSyncCommand(source, destination, relativePath, options.directory === true, false);
@@ -893,7 +918,12 @@ async function removeStaleRemoteFiles(destination, scope, paths, timeoutMs) {
       "for rel in json.loads(base64.b64decode(sys.argv[3])):",
       " target=os.path.join(root,*rel.split('/'))",
       " if os.path.commonpath((scope,os.path.realpath(target)))!=scope or os.path.islink(target) or not os.path.isfile(target): raise ValueError('unsafe stale file')",
-      " os.unlink(target)",
+      " parent=os.path.realpath(os.path.dirname(target))",
+      " if os.path.commonpath((scope,parent))!=scope: raise ValueError('unsafe stale parent')",
+      " try: os.chdir(parent)",
+      " except OSError as error: raise RuntimeError('PARENT_CD_FAILED: '+str(error))",
+      " if os.path.realpath(os.getcwd())!=parent: raise RuntimeError('PARENT_CD_FAILED')",
+      " os.unlink('./'+os.path.basename(target))",
     ].join("\n");
     await runSsh(destination, `python3 -c ${shellQuote(script)} ${shellQuote(destination.remotePath)} ${shellQuote(scope)} ${shellQuote(encoded)}`, timeoutMs);
   }
@@ -990,13 +1020,13 @@ async function projectInventory(options = {}) {
     "  stat=os.stat(full,follow_symlinks=False); identity=(stat.st_dev,stat.st_ino,stat.st_size,stat.st_mtime_ns,stat.st_ctime_ns)",
     "  cached=cache.get(rel)",
     "  if cached is not None and cached[:5]==identity:",
-    "   found[rel]={'sha256':cached[5],'size':stat.st_size}; reused+=1; continue",
+    "   found[rel]={'sha256':cached[5],'size':stat.st_size,'modifiedAtMs':stat.st_mtime_ns//1000000}; reused+=1; continue",
     "  with open(full,'rb') as stream:",
     "   before=os.fstat(stream.fileno()); h=hashlib.sha256()",
     "   for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk)",
     "   after=os.fstat(stream.fileno())",
     "  if identity!=(before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns) or identity!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns): raise RuntimeError('file changed during inventory: '+rel)",
-    "  digest=h.hexdigest(); found[rel]={'sha256':digest,'size':after.st_size}; hashed+=1",
+    "  digest=h.hexdigest(); found[rel]={'sha256':digest,'size':after.st_size,'modifiedAtMs':after.st_mtime_ns//1000000}; hashed+=1",
     "  if db is not None: updates.append((cache_root,rel,*identity,digest))",
     "if db is not None:",
     " try:",
@@ -1045,7 +1075,8 @@ async function projectTree(options = {}) {
     " if item.is_symlink(): continue",
     " if not item.is_dir(follow_symlinks=False) and not item.is_file(follow_symlinks=False): continue",
     " name=item.name; child=name if rel=='.' else rel+'/'+name",
-    " entries.append({'name':name,'path':child,'directory':item.is_dir(follow_symlinks=False)})",
+    " stat=item.stat(follow_symlinks=False)",
+    " entries.append({'name':name,'path':child,'directory':item.is_dir(follow_symlinks=False),'size':stat.st_size if item.is_file(follow_symlinks=False) else None,'modifiedAtMs':stat.st_mtime_ns//1000000})",
     "print(json.dumps(entries,ensure_ascii=False,separators=(',',':')))",
   ].join("\n");
   const output = await runSsh(source, `python3 -c ${shellQuote(script)} ${shellQuote(source.remotePath)} ${shellQuote(relativePath)}`, transferTimeoutMs(source, options));
@@ -1311,7 +1342,7 @@ async function uploadWorkspaceCore(options = {}) {
     migrateLegacyCodeSyncState(localPath);
     const state = createCodeSyncState(sftp, options);
     const manifest = getManagedManifest(options.manifest);
-    const previousState = manifest && options.pruneManagedFiles !== false
+    const previousState = manifest && options.pruneManagedFiles !== false && options.transientManifest !== true
       ? await readRemoteCodeManifest(sftp).catch(() => null)
       : null;
     const previousManifest = previousState && typeof previousState === "object" ? previousState.manifest : null;
@@ -1332,11 +1363,11 @@ async function uploadWorkspaceCore(options = {}) {
     } else {
       uploadStats = await uploadAllLocalToRemote({ localPath, sftp, writeState: options.stateFileMode !== "virtual", pathConfirmed: true, options });
     }
-    const missingManagedFiles = manifest && options.pruneManagedFiles !== false
+    const missingManagedFiles = manifest && options.pruneManagedFiles !== false && options.transientManifest !== true
       ? getMissingManagedFiles(previousManifest, manifest, sftp.ignore)
       : [];
     const prune = await pruneRemoteMissingManagedFiles(sftp, missingManagedFiles);
-    await writeRemoteCodeSyncState(sftp, state, options.manifest);
+    if (options.transientManifest !== true) await writeRemoteCodeSyncState(sftp, state, options.manifest);
     if (options.stateFileMode !== "virtual") {
       writeLocalCodeSyncState(localPath, state);
     }
@@ -1647,13 +1678,13 @@ async function pruneRemoteMissingManagedFiles(sftp, missing) {
       "    base=os.path.abspath(root)",
       "    if not (target == base or target.startswith(base + os.sep)):",
       "        continue",
+      "    parent=os.path.realpath(os.path.dirname(target))",
+      "    if os.path.commonpath((os.path.realpath(base),parent))!=os.path.realpath(base): continue",
       "    if os.path.isfile(target) or os.path.islink(target):",
-      "        os.remove(target); deleted += 1",
-      "        parent=os.path.dirname(target)",
-      "        while parent.startswith(base + os.sep) and parent != base:",
-      "            try: os.rmdir(parent)",
-      "            except OSError: break",
-      "            parent=os.path.dirname(parent)",
+      "        try: os.chdir(parent)",
+      "        except OSError as error: raise RuntimeError('PARENT_CD_FAILED: '+str(error))",
+      "        if os.path.realpath(os.getcwd())!=parent: raise RuntimeError('PARENT_CD_FAILED')",
+      "        os.remove('./'+os.path.basename(target)); deleted += 1",
       "print(deleted)",
     ].join("\n");
     const stdout = await runSsh(sftp, `python3 - <<'PY'\n${script}\nPY`, 60000);
@@ -2736,6 +2767,7 @@ function createLocalApiMethods() {
     "sync.planLogPaths": async (params = {}) => listPlanLogPaths(params),
     "sync.projectInventory": async (params = {}) => projectInventory(params),
     "sync.projectTree": async (params = {}) => projectTree(params),
+    "sync.deletePath": async (params = {}) => deleteProjectPath(params),
     "sync.serverToServerBatch": async (params = {}) => syncServerToServerBatch(params),
     "sync.serverToServer": async (params = {}) => {
       const result = await syncServerToServer(params);
@@ -4128,6 +4160,7 @@ module.exports = {
     directSyncTarget,
     directSyncRelativePath,
     directSyncCommand,
+    guardedRemoteDeleteCommand,
     batchDestinationGuardCommand,
     planLogPathsFromState,
     projectTreePathAllowed,
