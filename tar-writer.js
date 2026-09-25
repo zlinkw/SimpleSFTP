@@ -6,7 +6,7 @@ const { Buffer } = require("node:buffer");
 
 const BLOCK_SIZE = 512;
 
-async function writeTarEntriesToStream({ localPath, files, stream }) {
+async function writeTarEntriesToStream({ localPath, files, stream, onFileBytes }) {
   if (!Array.isArray(files)) throw new TypeError("files must be an array");
   if (!stream || typeof stream.write !== "function") throw new TypeError("stream is required");
 
@@ -21,7 +21,7 @@ async function writeTarEntriesToStream({ localPath, files, stream }) {
       seenDirectories.add(directory);
       await writeLocalDirectoryEntry(stream, localPath, directory);
     }
-    await writeLocalFileEntry(stream, localPath, relativePath, file.fullPath || path.join(localPath, relativePath));
+    await writeLocalFileEntry(stream, localPath, relativePath, file.fullPath || path.join(localPath, relativePath), onFileBytes);
   }
   await write(stream, Buffer.alloc(BLOCK_SIZE * 2));
 }
@@ -39,7 +39,7 @@ async function writeLocalDirectoryEntry(stream, localPath, relativePath) {
   await write(stream, header);
 }
 
-async function writeLocalFileEntry(stream, localPath, relativePath, fullPath) {
+async function writeLocalFileEntry(stream, localPath, relativePath, fullPath, onFileBytes) {
   const stat = await fs.promises.lstat(fullPath);
   if (stat.isSymbolicLink()) throw new Error(`上传清单包含符号链接：${relativePath}`);
   if (!stat.isFile()) throw new Error(`上传清单包含非普通文件：${relativePath}`);
@@ -56,6 +56,7 @@ async function writeLocalFileEntry(stream, localPath, relativePath, fullPath) {
   try {
     for await (const chunk of input) {
       await write(stream, chunk);
+      if (onFileBytes) onFileBytes(chunk.length);
     }
   } catch (error) {
     input.destroy();

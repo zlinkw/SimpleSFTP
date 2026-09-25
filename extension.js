@@ -1206,11 +1206,12 @@ function directTarBatchCommand(source, destination) {
   return `bash -o pipefail -c ${shellQuote(sourceCommand)}`;
 }
 
-async function transferPartitionedTar(source, destination, paths, timeoutMs) {
+async function transferPartitionedTar(source, destination, paths, timeoutMs, onPartition) {
   // fpsync-style bounded partitions, with tar as the copy tool. No remote
   // installation or staging directory is needed for an explicit hash delta.
   const groups = partitionTransferPaths(paths);
   let next = 0;
+  let completed = 0;
   const directCommand = directTarBatchCommand(source, destination);
   const workers = Array.from({ length: Math.min(4, groups.length) }, async () => {
     while (next < groups.length) {
@@ -1221,6 +1222,8 @@ async function transferPartitionedTar(source, destination, paths, timeoutMs) {
         if (!/host key verification failed|no .* host key|permission denied|connection timed out|connect to host|network is unreachable|could not resolve hostname|connection refused/i.test(formatError(error))) throw error;
         await relayTarFiles(source, destination, group, timeoutMs);
       }
+      completed += 1;
+      if (onPartition) onPartition(completed, groups.length);
     }
   });
   await Promise.all(workers);
@@ -1228,6 +1231,14 @@ async function transferPartitionedTar(source, destination, paths, timeoutMs) {
 }
 
 async function syncServerToServerFpsync(options = {}) {
+  return vscode.window.withProgress({
+    location: vscode.ProgressLocation.Notification,
+    title: "Worker 间分批打包同步",
+    cancellable: false,
+  }, (progress) => syncServerToServerFpsyncCore(options, progress));
+}
+
+async function syncServerToServerFpsyncCore(options = {}, progress) {
   const source = directSyncTarget(options.source, "来源");
   const destination = directSyncTarget(options.destination, "目标");
   if (source.host === destination.host && source.port === destination.port && source.remotePath === destination.remotePath) throw new Error("来源与目标相同。");
@@ -1260,11 +1271,17 @@ async function syncServerToServerFpsync(options = {}) {
   const paths = directory ? Object.keys(sourceHashes).sort() : requested;
   const digest = (entry) => typeof entry === "string" ? entry : entry && entry.sha256;
   const changed = paths.filter((name) => digest(sourceHashes[name]) !== digest(destinationHashes[name]));
-  const partitions = await transferPartitionedTar(source, destination, changed, timeoutMs);
+  let reportedPercent = 0;
+  const partitions = await transferPartitionedTar(source, destination, changed, timeoutMs, (completed, total) => {
+    const percent = Math.min(99, Math.floor(completed * 100 / total));
+    progress.report({ increment: percent - reportedPercent, message: `${completed}/${total} 个分包已传输` });
+    reportedPercent = percent;
+  });
   const verified = directory
     ? await inspectRemoteScope(destination, relativePath, true, timeoutMs)
     : await inspectRemoteBatchFiles(destination, requested, timeoutMs);
   if (paths.some((name) => digest(sourceHashes[name]) !== digest(verified[name]))) throw new Error("分批打包同步后 SHA256 不一致；同步保持待处理。");
+  progress.report({ increment: 100 - reportedPercent, message: "传输与哈希校验完成" });
   return { ok: true, paths: paths.length, transferredFiles: changed.length, partitions,
     verification: "sha256", transport: "partitioned-tar", directory, relativePath };
 }
@@ -1442,7 +1459,9 @@ async function uploadWorkspaceCore(options = {}) {
     const legacyManagedDir = previousState && typeof previousState === "object" ? previousState.legacyManagedDir : "";
     let uploadStats;
     if (manifest) {
-      const before = await inspectRemoteManagedFiles(sftp, manifest, transferTimeoutMs(sftp, options));
+      const before = options.preComparedManifest === true
+        ? { mismatches: Object.keys(manifest) }
+        : await inspectRemoteManagedFiles(sftp, manifest, transferTimeoutMs(sftp, options));
       uploadStats = await uploadManifestLocalFilesToRemote({
         localPath,
         sftp,
@@ -1494,7 +1513,7 @@ async function uploadWorkspaceCore(options = {}) {
 async function uploadManifestLocalFilesToRemote({ localPath, sftp, manifest, changedPaths, uploadOptions = {} }) {
   const uploadPlan = createManifestUploadPlan({ localPath, sftp, manifest, changedPaths });
   if (uploadPlan.fileCount > 0) {
-    return await runUploadWithProgress(uploadOptions, `上传受管理代码文件 -> ${sftp.remotePath}`, (token) => runLocalTarUpload({
+    return await runUploadWithProgress(uploadOptions, `上传受管理代码文件 -> ${sftp.remotePath}`, (token, progress) => runLocalTarUpload({
         localPath,
         sftp,
         uploadPlan,
@@ -1502,6 +1521,7 @@ async function uploadManifestLocalFilesToRemote({ localPath, sftp, manifest, cha
         timeoutMs: transferTimeoutMs(sftp, uploadOptions),
         token,
         transferId: uploadOptions.transferId,
+        progress,
       }));
   }
   return {
@@ -1569,7 +1589,7 @@ async function uploadFilesCore(options = {}) {
       uploadPlanFiles.push({ relativePath: "runtime_manifest.json", fullPath: manifestPath, size: fs.statSync(manifestPath).size });
     }
     setUploadOperationStage(options.transferId, "transferring");
-    const stats = await runUploadWithProgress(options, `上传指定文件 -> ${sftp.remotePath}`, (token) => runLocalTarUpload({
+    const stats = await runUploadWithProgress(options, `上传指定文件 -> ${sftp.remotePath}`, (token, progress) => runLocalTarUpload({
         localPath: tempDir,
         sftp,
         uploadPlan: { files: uploadPlanFiles, fileCount: uploadPlanFiles.length, byteCount: uploadPlanFiles.reduce((total, file) => total + file.size, 0), excludedRuleHits: 0, excludedNestedGitRepos: 0, nestedGitRoots: [] },
@@ -1577,6 +1597,7 @@ async function uploadFilesCore(options = {}) {
         timeoutMs: transferTimeoutMs(sftp, options),
         token,
         transferId: options.transferId,
+        progress,
       }));
     setUploadOperationStage(options.transferId, "transfer-complete");
     return {
@@ -2509,6 +2530,8 @@ function createTransferController({ id, operation, localPath, remotePath, host }
     host,
     startedAt: new Date().toISOString(),
     status: "running",
+    totalBytes: 0,
+    transferredBytes: 0,
     onCancel(listener) {
       if (disposed) return;
       if (cancelled) {
@@ -2539,7 +2562,7 @@ function createTransferController({ id, operation, localPath, remotePath, host }
 }
 
 function listActiveTransfers() {
-  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status }) => ({
+  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status, totalBytes, transferredBytes }) => ({
     id,
     operation,
     localPath,
@@ -2547,6 +2570,8 @@ function listActiveTransfers() {
     host,
     startedAt,
     status,
+    totalBytes,
+    transferredBytes,
   }));
 }
 
@@ -2564,14 +2589,12 @@ function uploadProgressCancellable(options = {}) {
 }
 
 function runUploadWithProgress(options, title, operation) {
-  // JSON-RPC callers can track and cancel transfers through transfers.list/cancel.
-  // Do not couple their response to the VS Code notification lifecycle.
-  if (options && options.apiMode === true) return operation(undefined);
+  // API callers also need the same visible byte progress as command callers.
   return vscode.window.withProgress({
     location: vscode.ProgressLocation.Notification,
     title,
     cancellable: uploadProgressCancellable(options),
-  }, (_progress, token) => operation(token));
+  }, (progress, token) => operation(token, progress));
 }
 
 async function confirmTransferPath({ localPath, sftp, operation, detail, options = {} }) {
@@ -3405,13 +3428,14 @@ async function uploadChangedLocalFilesCore({ localPath, sftp }) {
       title: `SimpleSFTP 正在上传 ${changedFiles.length} 个变更文件`,
       cancellable: uploadProgressCancellable(),
     },
-    (_progress, token) => runLocalTarUpload({
+    (progress, token) => runLocalTarUpload({
       localPath,
       sftp,
       uploadPlan,
       operation: "上传变更文件",
       timeoutMs: transferTimeoutMs(sftp),
       token,
+      progress,
     })
   );
 
@@ -3448,7 +3472,7 @@ async function uploadAllLocalToRemoteCore({ localPath, sftp, writeState = true, 
   if (!uploadPlan.fileCount) {
     throw new Error("没有要上传的文件；所有文件都被忽略规则排除。");
   }
-  const stats = await runUploadWithProgress(options, `上传全部本地文件 -> ${sftp.remotePath}`, (token) => runLocalTarUpload({
+  const stats = await runUploadWithProgress(options, `上传全部本地文件 -> ${sftp.remotePath}`, (token, progress) => runLocalTarUpload({
       localPath,
       sftp,
       uploadPlan,
@@ -3456,6 +3480,7 @@ async function uploadAllLocalToRemoteCore({ localPath, sftp, writeState = true, 
       timeoutMs: transferTimeoutMs(sftp, options),
       token,
       transferId: options.transferId,
+      progress,
     }));
   if (writeState) {
     writeUploadState(localPath, {
@@ -3682,7 +3707,7 @@ function getWorkspaceFolderForFile(filePath) {
     .map(({ folder }) => folder)[0] || null;
 }
 
-function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, token, transferId }) {
+function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, token, transferId, progress }) {
   const remoteCommand = createRemoteExtractCommand(sftp.remotePath);
   const plan = uploadPlan || createWorkspaceUploadPlan(localPath, sftp);
   const manifestContent = `${plan.files.map((file) => tarEntryPath(file.relativePath)).join("\n")}\n`;
@@ -3696,6 +3721,8 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
       remotePath: String(sftp && sftp.remotePath || ""),
       host: String(sftp && sftp.host || ""),
     });
+    controller.totalBytes = plan.byteCount;
+    let reportedPercent = 0;
     const sshProc = spawn("ssh", getSshArgs(sftp, remoteCommand), {
       windowsHide: true,
       stdio: ["pipe", "ignore", "pipe"],
@@ -3750,6 +3777,7 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
         }));
         return;
       }
+      if (progress && reportedPercent < 100) progress.report({ increment: 100 - reportedPercent, message: "已上传并完成远端解包" });
       resolve({
         fileCount: plan.fileCount,
         byteCount: plan.byteCount,
@@ -3785,7 +3813,16 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
     });
     sshProc.stdin.on("error", () => {});
 
-    writeTarEntriesToStream({ localPath, files: plan.files, stream: sshProc.stdin })
+    writeTarEntriesToStream({ localPath, files: plan.files, stream: sshProc.stdin, onFileBytes: (bytes) => {
+      controller.transferredBytes += bytes;
+      if (progress && plan.byteCount > 0) {
+        const percent = Math.min(99, Math.floor(controller.transferredBytes * 100 / plan.byteCount));
+        if (percent > reportedPercent) {
+          progress.report({ increment: percent - reportedPercent, message: `${percent}% · ${controller.transferredBytes}/${plan.byteCount} 字节` });
+          reportedPercent = percent;
+        }
+      }
+    } })
       .then(() => sshProc.stdin.end())
       .catch(fail);
     sshProc.on("close", (code, signal) => {
@@ -3820,17 +3857,18 @@ async function downloadRemoteToLocalCore({ localPath, sftp, downloadScope }) {
       title,
       cancellable: uploadProgressCancellable(),
     },
-    (_progress, token) => runRemoteTarExtract({
+    (progress, token) => runRemoteTarExtract({
       localPath,
       sftp,
       downloadScope,
       timeoutMs: transferTimeoutMs(sftp),
       token,
+      progress,
     })
   );
 }
 
-function runRemoteTarExtract({ localPath, sftp, downloadScope, timeoutMs, token, transferId }) {
+function runRemoteTarExtract({ localPath, sftp, downloadScope, timeoutMs, token, transferId, progress }) {
   const remoteCommand = createRemoteTarCommand(sftp, downloadScope);
   return new Promise((resolve, reject) => {
     const controller = createTransferController({
@@ -3857,6 +3895,7 @@ function runRemoteTarExtract({ localPath, sftp, downloadScope, timeoutMs, token,
     let cancelListener;
     let tokenDisposable;
     let timer;
+    let lastProgressAt = 0;
 
     const stopController = () => {
       clearTimeout(timer);
@@ -3927,6 +3966,14 @@ function runRemoteTarExtract({ localPath, sftp, downloadScope, timeoutMs, token,
     });
     tarProc.stdin.on("error", () => {});
 
+    sshProc.stdout.on("data", (chunk) => {
+      controller.transferredBytes += chunk.length;
+      const now = Date.now();
+      if (progress && now - lastProgressAt >= 250) {
+        progress.report({ message: `已接收 ${(controller.transferredBytes / 1048576).toFixed(1)} MiB，正在解包` });
+        lastProgressAt = now;
+      }
+    });
     sshProc.stdout.pipe(tarProc.stdin);
     sshProc.on("close", (code, signal) => {
       sshCode = code === null ? `signal ${signal || "unknown"}` : code;

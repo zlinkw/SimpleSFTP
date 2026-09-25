@@ -135,7 +135,8 @@ test("managed uploads write UTF-8 tar directly instead of invoking Windows tar",
   assert.doesNotMatch(upload, /createLocalTarArgs/);
   assert.doesNotMatch(source, /"--",\s*\.\.\.relativePaths\.map\(toTarPath\)/);
   assert.doesNotMatch(upload, /spawn\("tar"/);
-  assert.match(upload, /writeTarEntriesToStream\(\{ localPath, files: plan\.files, stream: sshProc\.stdin \}\)/);
+  assert.match(upload, /writeTarEntriesToStream\(\{ localPath, files: plan\.files, stream: sshProc\.stdin, onFileBytes:/);
+  assert.match(upload, /controller\.transferredBytes \+= bytes/);
   assert.match(source, /manifestSha256:/);
   assert.match(source, /hashUploadPlanChunks\(plan\.files\)/);
 });
@@ -156,6 +157,7 @@ test("tar writer preserves UTF-8 and long POSIX paths", async () => {
 
   try {
     const archive = fs.createWriteStream(path.join(root, "workspace.tar"));
+    let transferredBytes = 0;
     const written = writer.writeTarEntriesToStream({
       localPath: root,
       files: [
@@ -163,6 +165,7 @@ test("tar writer preserves UTF-8 and long POSIX paths", async () => {
         { relativePath: longRelative, fullPath: path.join(root, longRelative) },
       ],
       stream: archive,
+      onFileBytes: (bytes) => { transferredBytes += bytes; },
     });
     await written;
     await new Promise((resolve, reject) => {
@@ -174,6 +177,7 @@ test("tar writer preserves UTF-8 and long POSIX paths", async () => {
     await execFileAsync("tar", ["-xf", path.join(root, "workspace.tar"), "-C", extract]);
     assert.equal(fs.readFileSync(path.join(extract, unicodeRelative), "utf8"), "中文内容\n");
     assert.equal(fs.readFileSync(path.join(extract, longRelative), "utf8"), "ok\n");
+    assert.equal(transferredBytes, Buffer.byteLength("中文内容\n") + Buffer.byteLength("ok\n"));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
