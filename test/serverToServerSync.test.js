@@ -67,3 +67,14 @@ test("project batch transfer validates exact paths and requires confirmation", a
   await assert.rejects(methods["sync.serverToServerBatch"](params), (error) => error.apiCode === 2001);
   await assert.rejects(methods["sync.serverToServerBatch"]({ ...params, relativePaths: ["../outside"] }), /不安全/);
 });
+
+test("Worker scope tree lists every file type while excluding machine state", () => {
+  const methods = __test.createLocalApiMethods();
+  assert.equal(typeof methods["sync.projectTree"], "function");
+  assert.equal(__test.projectTreePathAllowed("datasets/raw/image.dcm"), true);
+  assert.equal(__test.projectTreePathAllowed("work_dirs/p/weight.safetensors"), true);
+  assert.equal(__test.projectTreePathAllowed("simple_cluster/results/p/log.txt"), true);
+  assert.equal(__test.projectTreePathAllowed("simple_cluster/tmp/cluster_scheduler/queue_state.json"), false);
+  assert.equal(__test.projectTreePathAllowed("simple_cluster/results/project_mirror_state.json"), false);
+  assert.equal(__test.projectTreePathAllowed(".venv/lib/module.py"), false);
+});

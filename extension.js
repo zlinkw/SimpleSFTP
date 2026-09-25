@@ -948,17 +948,18 @@ async function projectInventory(options = {}) {
   const source = directSyncTarget(options.source, "来源");
   const script = [
     "import hashlib,json,os,sys",
-    "root=os.path.realpath(sys.argv[1]); found={}; limit=100000",
+    "root=os.path.realpath(sys.argv[1]); found={}",
     "blocked={'.git','.vscode','.codex','zlk_cluster','.venv','venv','env','node_modules','__pycache__','.cache','.pytest_cache','.mypy_cache','.ruff_cache','.tox'}",
     "def allowed(rel,isdir=False):",
     " parts=rel.replace(os.sep,'/').lower().split('/')",
     " if any(p in blocked for p in parts): return False",
+    " if parts[-1].startswith('.env') or parts[-1] in ('plan_sync_ledger.json','project_mirror_state.json'): return False",
     " if parts[0]!='simple_cluster': return True",
     " if len(parts)<2: return True",
-    " if parts[1] in ('results','debug_runs'): return not rel.endswith('plan_sync_ledger.json')",
+    " if parts[1] in ('results','debug_runs'): return True",
     " if parts[1]=='tmp' and len(parts)==2: return isdir",
     " if parts[1]=='tmp' and len(parts)>2 and parts[2]=='tmux_logs': return True",
-    " if parts[1]=='tmp' and len(parts)>2 and parts[2]=='cluster_scheduler': return isdir or parts[-1].endswith('.log')",
+    " if parts[1]=='tmp' and len(parts)>2 and parts[2]=='cluster_scheduler': return (len(parts)==3 and isdir) or (len(parts)>3 and parts[3]=='logs') or (len(parts)==4 and parts[-1].endswith('.log'))",
     " return False",
     "for current,dirs,files in os.walk(root,followlinks=False):",
     " dirs[:]=[d for d in dirs if not os.path.islink(os.path.join(current,d)) and allowed(os.path.relpath(os.path.join(current,d),root),True)]",
@@ -971,13 +972,53 @@ async function projectInventory(options = {}) {
     "   after=os.fstat(stream.fileno())",
     "  if before.st_size!=after.st_size or before.st_mtime_ns!=after.st_mtime_ns: raise RuntimeError('file changed during inventory: '+rel)",
     "  found[rel]={'sha256':h.hexdigest(),'size':after.st_size}",
-    "  if len(found)>limit: raise RuntimeError('project inventory exceeds 100000 files')",
     "print(json.dumps({'files':found},separators=(',',':')))",
   ].join("\n");
   const output = await runSsh(source, `python3 -c ${shellQuote(script)} ${shellQuote(source.remotePath)}`, transferTimeoutMs(source, options));
   const result = JSON.parse(output);
   if (!result.files || typeof result.files !== "object" || Array.isArray(result.files)) throw new Error("远端项目清单无效。");
   return { ok: true, files: result.files };
+}
+
+function projectTreePathAllowed(relative) {
+  const parts = String(relative || "").toLowerCase().split("/");
+  if (parts.some((part) => [".git", ".vscode", ".codex", "zlk_cluster", ".venv", "venv", "env", "node_modules", "__pycache__", ".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"].includes(part))) return false;
+  if (parts.at(-1).startsWith(".env")) return false;
+  if (["plan_sync_ledger.json", "project_mirror_state.json"].includes(parts.at(-1))) return false;
+  if (parts[0] !== "simple_cluster" || parts.length < 2) return true;
+  if (["results", "debug_runs"].includes(parts[1])) return true;
+  if (parts[1] !== "tmp") return false;
+  if (parts.length === 2 || parts[2] === "tmux_logs") return true;
+  if (parts[2] === "cluster_scheduler") return parts.length === 3 || parts[3] === "logs" || parts.length === 4 && parts.at(-1).endsWith(".log");
+  return false;
+}
+
+async function projectTree(options = {}) {
+  const source = directSyncTarget(options.source, "来源");
+  const relativePath = String(options.relativePath || ".") === "." ? "." : directSyncRelativePath(options.relativePath);
+  if (relativePath !== "." && !projectTreePathAllowed(relativePath)) throw new Error("远端目录属于机器状态，不可纳入同步范围。");
+  const script = [
+    "import json,os,sys",
+    "root=os.path.realpath(sys.argv[1]); rel=sys.argv[2]",
+    "parts=[] if rel=='.' else rel.split('/')",
+    "if any(p in ('','.','..') for p in parts): raise ValueError('unsafe tree path')",
+    "if any(os.path.islink(os.path.join(root,*parts[:i])) for i in range(1,len(parts)+1)): raise ValueError('symlink tree path')",
+    "target=os.path.join(root,*parts)",
+    "if os.path.commonpath((root,os.path.realpath(target)))!=root: raise ValueError('tree directory outside project')",
+    "if not os.path.exists(target): print('[]'); sys.exit(0)",
+    "if not os.path.isdir(target): print('[]'); sys.exit(0)",
+    "entries=[]",
+    "for item in os.scandir(target):",
+    " if item.is_symlink(): continue",
+    " if not item.is_dir(follow_symlinks=False) and not item.is_file(follow_symlinks=False): continue",
+    " name=item.name; child=name if rel=='.' else rel+'/'+name",
+    " entries.append({'name':name,'path':child,'directory':item.is_dir(follow_symlinks=False)})",
+    "print(json.dumps(entries,ensure_ascii=False,separators=(',',':')))",
+  ].join("\n");
+  const output = await runSsh(source, `python3 -c ${shellQuote(script)} ${shellQuote(source.remotePath)} ${shellQuote(relativePath)}`, transferTimeoutMs(source, options));
+  const entries = JSON.parse(output);
+  if (!Array.isArray(entries)) throw new Error("远端目录清单无效。");
+  return { ok: true, relativePath, entries: entries.filter((entry) => projectTreePathAllowed(entry.path)).sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name)) };
 }
 
 function runRemoteBatchSsh(source, command, paths, timeoutMs) {
@@ -2655,6 +2696,7 @@ function createLocalApiMethods() {
     },
     "sync.planLogPaths": async (params = {}) => listPlanLogPaths(params),
     "sync.projectInventory": async (params = {}) => projectInventory(params),
+    "sync.projectTree": async (params = {}) => projectTree(params),
     "sync.serverToServerBatch": async (params = {}) => syncServerToServerBatch(params),
     "sync.serverToServer": async (params = {}) => {
       const result = await syncServerToServer(params);
@@ -4048,6 +4090,7 @@ module.exports = {
     directSyncRelativePath,
     directSyncCommand,
     planLogPathsFromState,
+    projectTreePathAllowed,
     normalizeDownloadScope,
     normalizeDownloadScopePath,
     relativeRemoteScopePath,
