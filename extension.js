@@ -1230,6 +1230,85 @@ async function syncServerToServerBatch(options = {}) {
   }
 }
 
+function partitionTransferPaths(paths, maxFiles = 1000) {
+  const groups = [];
+  for (let offset = 0; offset < paths.length; offset += maxFiles) {
+    groups.push(paths.slice(offset, offset + maxFiles));
+  }
+  return groups;
+}
+
+function directTarBatchCommand(source, destination) {
+  const destinationHost = `${destination.username}@${destination.host}`;
+  const destinationCommand = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && test "$root" = ${shellQuote(destination.remotePath)} && cd -- "$root" && tar -xf -`;
+  const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${destination.port}`;
+  const sourceCommand = `root=$(realpath -e -- ${shellQuote(source.remotePath)}) && test "$root" = ${shellQuote(source.remotePath)} && cd -- "$root" && tar --null -T - -cf - | ${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(destinationCommand)}`;
+  return `bash -o pipefail -c ${shellQuote(sourceCommand)}`;
+}
+
+async function transferPartitionedTar(source, destination, paths, timeoutMs) {
+  // fpsync-style bounded partitions, with tar as the copy tool. No remote
+  // installation or staging directory is needed for an explicit hash delta.
+  const groups = partitionTransferPaths(paths);
+  let next = 0;
+  const directCommand = directTarBatchCommand(source, destination);
+  const workers = Array.from({ length: Math.min(4, groups.length) }, async () => {
+    while (next < groups.length) {
+      const group = groups[next++];
+      try {
+        await runRemoteBatchSsh(source, directCommand, group, timeoutMs);
+      } catch (error) {
+        if (!/host key verification failed|no .* host key|permission denied|connection timed out|connect to host|network is unreachable|could not resolve hostname|connection refused/i.test(formatError(error))) throw error;
+        await relayTarFiles(source, destination, group, timeoutMs);
+      }
+    }
+  });
+  await Promise.all(workers);
+  return groups.length;
+}
+
+async function syncServerToServerFpsync(options = {}) {
+  const source = directSyncTarget(options.source, "来源");
+  const destination = directSyncTarget(options.destination, "目标");
+  if (source.host === destination.host && source.port === destination.port && source.remotePath === destination.remotePath) throw new Error("来源与目标相同。");
+  const directory = options.directory === true;
+  const relativePath = directory ? directSyncRelativePath(options.relativePath) : "";
+  if (directory && relativePath.split("/").length < 2 && options.manualRetain !== true) throw new Error("目录同步必须限定到 Plan 独立子目录。");
+  const requested = directory ? [] : [...new Set((Array.isArray(options.relativePaths) ? options.relativePaths : []).map(directSyncRelativePath))].sort();
+  if (!directory && (!requested.length || requested.length > 5000)) throw new Error("批量同步需要 1–5000 个项目内文件路径。");
+  if (options.confirm !== true || options.pathConfirmed !== true) throw confirmationRequired({
+    method: "sync.serverToServerFpsync", operation: "Worker 间分批打包同步", requires: ["confirm", "pathConfirmed"],
+    source, destination, relativePath, relativePaths: requested, directory,
+  });
+  const timeoutMs = transferTimeoutMs(source, options);
+  let sourceHashes;
+  let destinationHashes;
+  if (directory) {
+    [sourceHashes, destinationHashes] = await Promise.all([
+      inspectRemoteScope(source, relativePath, true, timeoutMs, true),
+      inspectRemoteScope(destination, relativePath, true, timeoutMs),
+    ]);
+    const stale = Object.keys(destinationHashes).filter((name) => !sourceHashes[name]);
+    if (stale.length) throw new Error(`目标目录有 ${stale.length} 个旧文件，需要先通过双重确认清理：${stale.slice(0, 3).join("、")}`);
+  } else {
+    [sourceHashes, destinationHashes] = await Promise.all([
+      inspectRemoteBatchFiles(source, requested, timeoutMs),
+      inspectRemoteBatchFiles(destination, requested, timeoutMs),
+    ]);
+    if (requested.some((name) => !sourceHashes[name])) throw new Error("来源 Worker 缺少批量同步文件；同步保持待处理。");
+  }
+  const paths = directory ? Object.keys(sourceHashes).sort() : requested;
+  const digest = (entry) => typeof entry === "string" ? entry : entry && entry.sha256;
+  const changed = paths.filter((name) => digest(sourceHashes[name]) !== digest(destinationHashes[name]));
+  const partitions = await transferPartitionedTar(source, destination, changed, timeoutMs);
+  const verified = directory
+    ? await inspectRemoteScope(destination, relativePath, true, timeoutMs)
+    : await inspectRemoteBatchFiles(destination, requested, timeoutMs);
+  if (paths.some((name) => digest(sourceHashes[name]) !== digest(verified[name]))) throw new Error("分批打包同步后 SHA256 不一致；同步保持待处理。");
+  return { ok: true, paths: paths.length, transferredFiles: changed.length, partitions,
+    verification: "sha256", transport: "partitioned-tar", directory, relativePath };
+}
+
 async function syncFromRemoteCore(options = {}) {
   try {
     const workspaceFolder = getPrimaryWorkspaceFolder();
@@ -1514,15 +1593,14 @@ async function uploadFilesCore(options = {}) {
     for (const item of files) {
       const rawLocalPath = typeof item === "string" ? item : String(item && (item.localPath || item.path) || "");
       const localPath = resolveUploadFilePath(rawLocalPath);
-      if (!localPath || !fs.existsSync(localPath) || !fs.statSync(localPath).isFile()) {
+      if (!localPath || !fs.existsSync(localPath) || !fs.lstatSync(localPath).isFile()) {
         throw new Error(`本地文件不存在：${localPath || "-"}`);
       }
       const remoteName = sanitizeRelativeUploadPath(typeof item === "string" ? path.basename(localPath) : (item.remoteName || item.relativePath || path.basename(localPath)));
       const targetPath = path.join(tempDir, remoteName);
       fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-      fs.copyFileSync(localPath, targetPath);
       relativePaths.push(toPosixPath(remoteName));
-      uploadPlanFiles.push({ relativePath: toPosixPath(remoteName), fullPath: targetPath, size: fs.statSync(targetPath).size });
+      uploadPlanFiles.push({ relativePath: toPosixPath(remoteName), fullPath: localPath, size: fs.statSync(localPath).size });
     }
     if (options.manifest) {
       const manifestPath = path.join(tempDir, "runtime_manifest.json");
@@ -2869,6 +2947,7 @@ function createLocalApiMethods() {
     "sync.projectTree": async (params = {}) => projectTree(params),
     "sync.deletePath": async (params = {}) => deleteProjectPath(params),
     "sync.serverToServerBatch": async (params = {}) => syncServerToServerBatch(params),
+    "sync.serverToServerFpsync": async (params = {}) => syncServerToServerFpsync(params),
     "sync.serverToServer": async (params = {}) => {
       const result = await syncServerToServer(params);
       publishLocalApiEvent("sync.serverToServer", {
@@ -4262,6 +4341,8 @@ module.exports = {
     guardedRemoteDeleteCommand,
     removeLocalStagingDirectory,
     batchDestinationGuardCommand,
+    directTarBatchCommand,
+    partitionTransferPaths,
     planLogPathsFromState,
     projectInventoryScript,
     projectTreePathAllowed,

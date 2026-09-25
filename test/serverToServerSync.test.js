@@ -110,6 +110,28 @@ test("project batch transfer validates exact paths and requires confirmation", a
   await assert.rejects(methods["sync.serverToServerBatch"]({ ...params, relativePaths: ["../outside"] }), /不安全/);
 });
 
+test("partitioned packed transfer groups small files and blocks unconfirmed writes", async () => {
+  const groups = __test.partitionTransferPaths(Array.from({ length: 2001 }, (_, i) => `runs/${i}.log`));
+  assert.deepEqual(groups.map((group) => group.length), [1000, 1000, 1]);
+  const direct = __test.directTarBatchCommand(
+    __test.directSyncTarget({ host: "source", user: "research", remotePath: "/projects/demo" }, "来源"),
+    __test.directSyncTarget({ host: "target", user: "research", remotePath: "/projects/demo" }, "目标"),
+  );
+  assert.match(direct, /bash -o pipefail -c/);
+  assert.match(direct, /tar --null -T - -cf -/);
+  assert.match(direct, /tar -xf -/);
+  assert.doesNotMatch(direct, /--delete|rm -/);
+  const method = __test.createLocalApiMethods()["sync.serverToServerFpsync"];
+  const params = {
+    source: { host: "source", user: "research", remotePath: "/projects/demo" },
+    destination: { host: "target", user: "research", remotePath: "/projects/demo" },
+    relativePaths: ["runs/1.log", "runs/2.log"],
+  };
+  assert.equal(typeof method, "function");
+  await assert.rejects(method(params), (error) => error.apiCode === 2001);
+  await assert.rejects(method({ ...params, relativePaths: ["../outside"] }), /不安全/);
+});
+
 test("Worker scope tree lists every file type while excluding machine state", () => {
   const methods = __test.createLocalApiMethods();
   assert.equal(typeof methods["sync.projectTree"], "function");
