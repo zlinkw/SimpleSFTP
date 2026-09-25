@@ -55,6 +55,16 @@ test("single-endpoint delete is confined, requires two confirmations and exact p
   assert.throws(() => __test.guardedRemoteDeleteCommand(__test.directSyncTarget(target, "目标"), "simple_cluster"), /机器状态/);
 });
 
+test("local staging cleanup rejects paths outside its verified temporary root", () => {
+  assert.throws(() => __test.removeLocalStagingDirectory(process.cwd()), /暂存根目录/);
+  const source = fs.readFileSync(path.join(__dirname, "../extension.js"), "utf8");
+  const section = source.slice(source.indexOf("function removeLocalStagingDirectory("), source.indexOf("async function deleteProjectPath("));
+  assert.match(section, /Set-Location -LiteralPath/);
+  assert.match(section, /Remove-Item -LiteralPath/);
+  assert.match(section, /rm -rf -- "\.\/\$3"/);
+  assert.doesNotMatch(section, /fs\.rmSync/);
+});
+
 test("direct rsync rejects remote root escape", () => {
   assert.throws(() => __test.directSyncRelativePath("../other"));
   assert.throws(() => __test.directSyncTarget({ host: "nwpu2;true", user: "u", remotePath: "/project" }, "来源"));

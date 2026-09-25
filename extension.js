@@ -768,6 +768,21 @@ function guardedRemoteDeleteCommand(target, relativePath) {
   return `root=$(realpath -e -- ${shellQuote(target.remotePath)}) || { echo PARENT_CD_FAILED >&2; exit 75; }; parent=$(realpath -e -- ${shellQuote(parent)}) || { echo PARENT_CD_FAILED >&2; exit 75; }; case "$parent" in "$root"|"$root"/*) ;; *) exit 72;; esac; cd -- "$parent" || { echo PARENT_CD_FAILED >&2; exit 75; }; test "$(pwd -P)" = "$parent" || { echo PARENT_CD_FAILED >&2; exit 75; }; test ! -L ${shellQuote(leaf)} || exit 72; if test -d ${shellQuote(leaf)}; then command -v rsync >/dev/null 2>&1 || { echo RSYNC_UNAVAILABLE >&2; exit 76; }; empty=$(mktemp -d -- './.simple-sftp-empty.XXXXXXXX') || exit 76; trap 'rmdir -- "$empty" >/dev/null 2>&1 || true' EXIT; rsync -r --delete -- "$empty/" ${shellQuote(`${leaf}/`)} && rmdir -- ${shellQuote(leaf)}; else rm -f -- ${shellQuote(leaf)}; fi && test ! -e ${shellQuote(leaf)}`;
 }
 
+function removeLocalStagingDirectory(tempDir) {
+  const safetyRoot = fs.realpathSync(os.tmpdir());
+  const parent = fs.realpathSync(path.dirname(tempDir));
+  const leaf = path.basename(tempDir);
+  const info = fs.lstatSync(tempDir);
+  if (parent !== safetyRoot || !/^simple-sftp-(?:files|code-sync-state)-[A-Za-z0-9]+$/.test(leaf) || !info.isDirectory() || info.isSymbolicLink())
+    throw new Error("临时目录不在已验证的暂存根目录内；禁止清理。");
+  const psQuote = (value) => `'${value.replace(/'/g, "''")}'`;
+  const command = process.platform === "win32" ? "pwsh.exe" : "sh";
+  const args = process.platform === "win32"
+    ? ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference='Stop'; Set-Location -LiteralPath ${psQuote(parent)}; if ((Get-Location).ProviderPath -ne ${psQuote(parent)}) { throw 'PARENT_CD_FAILED' }; Remove-Item -LiteralPath ${psQuote(`./${leaf}`)} -Recurse -Force -ErrorAction Stop`]
+    : ["-c", 'cd -- "$1" || exit 75; test "$(pwd -P)" = "$2" || exit 75; rm -rf -- "./$3"', "sh", parent, safetyRoot, leaf];
+  return new Promise((resolve, reject) => execFile(command, args, { cwd: parent, windowsHide: true, timeout: 120000 }, (error) => error ? reject(error) : resolve()));
+}
+
 async function deleteProjectPath(options = {}) {
   const target = directSyncTarget(options.target, "删除目标");
   const relativePath = directSyncRelativePath(options.relativePath);
@@ -1524,7 +1539,7 @@ async function uploadFilesCore(options = {}) {
     return { ok: false, error: message };
   } finally {
     setUploadOperationStage(options.transferId, "cleaning-staging-files");
-    if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+    if (tempDir) await removeLocalStagingDirectory(tempDir);
   }
 }
 
@@ -1702,7 +1717,7 @@ async function pruneRemoteMissingManagedFiles(sftp, missing) {
       "        continue",
       "    parent=os.path.realpath(os.path.dirname(target))",
       "    if os.path.commonpath((os.path.realpath(base),parent))!=os.path.realpath(base): continue",
-      "    if os.path.isfile(target) or os.path.islink(target):",
+      "    if os.path.isfile(target) and not os.path.islink(target):",
       "        try: os.chdir(parent)",
       "        except OSError as error: raise RuntimeError('PARENT_CD_FAILED: '+str(error))",
       "        if os.path.realpath(os.getcwd())!=parent: raise RuntimeError('PARENT_CD_FAILED')",
@@ -1859,7 +1874,7 @@ async function writeRemoteCodeSyncState(sftp, state, manifest) {
       operation: "上传代码同步 manifest",
     });
   } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    await removeLocalStagingDirectory(tempDir);
   }
 }
 
@@ -4228,6 +4243,7 @@ module.exports = {
     directSyncRelativePath,
     directSyncCommand,
     guardedRemoteDeleteCommand,
+    removeLocalStagingDirectory,
     batchDestinationGuardCommand,
     planLogPathsFromState,
     projectInventoryScript,
