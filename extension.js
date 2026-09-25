@@ -765,7 +765,7 @@ function guardedRemoteDeleteCommand(target, relativePath) {
   const absolute = path.posix.join(target.remotePath, relativePath);
   const parent = path.posix.dirname(absolute);
   const leaf = `./${path.posix.basename(absolute)}`;
-  return `root=$(realpath -e -- ${shellQuote(target.remotePath)}) || { echo PARENT_CD_FAILED >&2; exit 75; }; parent=$(realpath -e -- ${shellQuote(parent)}) || { echo PARENT_CD_FAILED >&2; exit 75; }; case "$parent" in "$root"|"$root"/*) ;; *) exit 72;; esac; cd -- "$parent" || { echo PARENT_CD_FAILED >&2; exit 75; }; test "$(pwd -P)" = "$parent" || { echo PARENT_CD_FAILED >&2; exit 75; }; test ! -L ${shellQuote(leaf)} || exit 72; rm -rf -- ${shellQuote(leaf)} && test ! -e ${shellQuote(leaf)}`;
+  return `root=$(realpath -e -- ${shellQuote(target.remotePath)}) || { echo PARENT_CD_FAILED >&2; exit 75; }; parent=$(realpath -e -- ${shellQuote(parent)}) || { echo PARENT_CD_FAILED >&2; exit 75; }; case "$parent" in "$root"|"$root"/*) ;; *) exit 72;; esac; cd -- "$parent" || { echo PARENT_CD_FAILED >&2; exit 75; }; test "$(pwd -P)" = "$parent" || { echo PARENT_CD_FAILED >&2; exit 75; }; test ! -L ${shellQuote(leaf)} || exit 72; if test -d ${shellQuote(leaf)}; then command -v rsync >/dev/null 2>&1 || { echo RSYNC_UNAVAILABLE >&2; exit 76; }; empty=$(mktemp -d -- './.simple-sftp-empty.XXXXXXXX') || exit 76; trap 'rmdir -- "$empty" >/dev/null 2>&1 || true' EXIT; rsync -r --delete -- "$empty/" ${shellQuote(`${leaf}/`)} && rmdir -- ${shellQuote(leaf)}; else rm -f -- ${shellQuote(leaf)}; fi && test ! -e ${shellQuote(leaf)}`;
 }
 
 async function deleteProjectPath(options = {}) {
@@ -797,8 +797,11 @@ function directSyncCommand(source, destination, relativePath, directory, deleteO
   const parentGuard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && parent=$(realpath -m -- ${shellQuote(destinationParent)}) && case "$parent" in "$root"|"$root"/*) ;; *) exit 72;; esac`;
   const prepare = `${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(`${parentGuard} && mkdir -p -- ${shellQuote(destinationParent)} && ${destinationGuard}`)}`;
   const sourceArg = directory ? `${sourcePath}/` : sourcePath;
-  const destinationArg = `${destinationHost}:${directory ? `${destinationPath}/` : destinationPath}`;
-  const rsyncArgs = `-a -c -s --delete-missing-args ${directory ? "--delete " : ""}-e ${shellQuote(sshOptions)} -- ${shellQuote(sourceArg)} ${shellQuote(destinationArg)}`;
+  const destinationParentForRsync = path.posix.dirname(destinationPath);
+  const destinationLeaf = `./${path.posix.basename(destinationPath)}`;
+  const guardedRsync = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) || exit 75; parent=$(realpath -e -- ${shellQuote(destinationParentForRsync)}) || exit 75; case "$parent" in "$root"|"$root"/*) ;; *) exit 72;; esac; cd -- "$parent" || exit 75; test "$(pwd -P)" = "$parent" || exit 75; test ! -L ${shellQuote(destinationLeaf)} || exit 72; rsync`;
+  const destinationArg = `${destinationHost}:${directory ? `${destinationLeaf}/` : destinationLeaf}`;
+  const rsyncArgs = `-a -c -s --delete-missing-args ${directory ? "--delete " : ""}--rsync-path=${shellQuote(guardedRsync)} -e ${shellQuote(sshOptions)} -- ${shellQuote(sourceArg)} ${shellQuote(destinationArg)}`;
   const sync = `rsync ${rsyncArgs}`;
   const verify = `remaining=$(rsync -n -i ${rsyncArgs}) || exit 74; if [ -n "$remaining" ]; then printf '内容校验不一致: %s\\n' "$remaining"; exit 73; fi`;
   const sourceGuard = `root=$(realpath -e -- ${shellQuote(source.remotePath)}) && target=$(realpath -m -- ${shellQuote(sourcePath)}) && case "$target" in "$root"/*) ;; *) exit 72;; esac`;
@@ -1010,7 +1013,7 @@ function projectInventoryScript() {
     "if any(os.path.islink(os.path.join(root,*parts[:i])) for i in range(1,len(parts)+1)): raise ValueError('symlink inventory path')",
     "target=os.path.join(root,*parts)",
     "if os.path.commonpath((root,os.path.realpath(target)))!=root: raise ValueError('inventory path outside project')",
-    "if not os.path.isdir(target): print(json.dumps({'files':{}})); sys.exit(0)",
+    "if not os.path.isdir(target) and not os.path.isfile(target): print(json.dumps({'files':{}})); sys.exit(0)",
     "cache={}; db=None; cache_root=hashlib.sha256(root.encode('utf-8')).hexdigest()",
     "try:",
     " cache_dir=os.path.join(os.path.expanduser('~'),'.cache','simple-sftp')",
@@ -1021,7 +1024,7 @@ function projectInventoryScript() {
     "except (OSError,sqlite3.Error):",
     " if db is not None: db.close()",
     " db=None; cache={}",
-    "walk=os.walk(target,followlinks=False) if recursive else ((target,[],[name for name in os.listdir(target) if not os.path.isdir(os.path.join(target,name))]),)",
+    "walk=((os.path.dirname(target),[],[os.path.basename(target)]),) if os.path.isfile(target) else os.walk(target,followlinks=False) if recursive else ((target,[],[name for name in os.listdir(target) if not os.path.isdir(os.path.join(target,name))]),)",
     "for current,dirs,files in walk:",
     " if recursive: dirs[:]=[d for d in dirs if not os.path.islink(os.path.join(current,d)) and allowed(os.path.relpath(os.path.join(current,d),root),True)]",
     " for name in files:",

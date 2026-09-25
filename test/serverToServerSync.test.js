@@ -20,15 +20,21 @@ test("direct rsync scopes delete to one Plan directory", () => {
   assert.match(command, /rsync -n -i -a -c -s --delete-missing-args --delete/);
   assert.match(command, /内容校验不一致/);
   assert.match(command, /'\/projects\/demo\/work_dirs\/corim\/'/);
-  assert.match(command, /'research@nwpu3:\/projects\/demo\/work_dirs\/corim\/'/);
+  assert.match(command, /'research@nwpu3:\.\/corim\/'/);
+  assert.match(command, /--rsync-path=.*cd -- "\$parent"/);
   assert.doesNotMatch(command, /simple_cluster\/worker_mirrors/);
   assert.match(command, /realpath -m/);
   assert.match(command, /StrictHostKeyChecking=accept-new/);
-  const deleteCommand = __test.directSyncCommand(source, destination, "work_dirs/old_run", true, true);
-  assert.match(deleteCommand, /rm -rf --/);
+  const deleteCommand = __test.guardedRemoteDeleteCommand(destination, "work_dirs/old_run");
+  assert.match(deleteCommand, /rsync -r --delete -- "\$empty\/" '\.\/old_run\/'/);
+  assert.match(deleteCommand, /rmdir -- '\.\/old_run'/);
+  assert.match(deleteCommand, /rm -f -- '\.\/old_run'/);
+  assert.match(deleteCommand, /mktemp -d -- '\.\/\.simple-sftp-empty\.XXXXXXXX'/);
+  assert.match(deleteCommand, /trap 'rmdir -- "\$empty"/);
   assert.match(deleteCommand, /cd --/);
   assert.match(deleteCommand, /\.\/old_run/);
-  assert.doesNotMatch(deleteCommand, /rm -rf -- '\/projects\/demo\/work_dirs\/old_run'/);
+  assert.doesNotMatch(deleteCommand, /rm -rf --/);
+  assert.doesNotMatch(deleteCommand, /(?:rm|rmdir) -[rf]+ -- '\/projects\//);
   assert.match(deleteCommand, /test ! -e/);
   assert.doesNotMatch(deleteCommand, /rsync -a/);
 });
@@ -44,7 +50,8 @@ test("single-endpoint delete is confined, requires two confirmations and exact p
   const command = __test.guardedRemoteDeleteCommand(__test.directSyncTarget(target, "目标"), "results/a.bin");
   assert.match(command, /cd -- "\$parent"/);
   assert.match(command, /PARENT_CD_FAILED/);
-  assert.match(command, /rm -rf -- '\.\/a\.bin'/);
+  assert.match(command, /rsync -r --delete/);
+  assert.match(command, /rm -f -- '\.\/a\.bin'/);
   assert.throws(() => __test.guardedRemoteDeleteCommand(__test.directSyncTarget(target, "目标"), "simple_cluster"), /机器状态/);
 });
 
@@ -149,6 +156,9 @@ test("inventory keeps stable hashes when another file changes during hashing", (
     assert.equal(shallowResult.files["steady.bin"].sha256.length, 64);
     assert.equal(shallowResult.files["code"], undefined);
     assert.equal(shallowResult.unverifiedFiles["code"], undefined);
+    const exact = spawnSync(python, [script, root, "steady.bin", "0"], { encoding: "utf8", timeout: 10000, windowsHide: true });
+    assert.equal(exact.status, 0, exact.stderr);
+    assert.deepEqual(Object.keys(JSON.parse(exact.stdout).files), ["steady.bin"]);
   } finally {
     fs.rmSync(parent, { recursive: true, force: true });
   }
