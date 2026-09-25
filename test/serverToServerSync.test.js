@@ -7,7 +7,11 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const originalLoad = Module._load;
 Module._load = function (request, ...args) {
-  return request === "vscode" ? { TreeItem: class {} } : originalLoad.call(this, request, ...args);
+  return request === "vscode" ? {
+    TreeItem: class {},
+    ProgressLocation: { Notification: 1 },
+    window: { withProgress: (_options, operation) => operation({ report: () => undefined }) },
+  } : originalLoad.call(this, request, ...args);
 };
 const { __test } = require("../extension.js");
 Module._load = originalLoad;
@@ -130,6 +134,29 @@ test("partitioned packed transfer groups small files and blocks unconfirmed writ
   assert.equal(typeof method, "function");
   await assert.rejects(method(params), (error) => error.apiCode === 2001);
   await assert.rejects(method({ ...params, relativePaths: ["../outside"] }), /不安全/);
+});
+
+test("Worker sync notification names the task and falls back to exact file context", () => {
+  const title = __test.fpsyncProgressTitle({
+    taskLabel: "Plan 产物同步 · plans/drf.yaml · nwpu2 → nwpu3 · 批次 2/3",
+  });
+  assert.match(title, /plans\/drf\.yaml/);
+  assert.match(title, /nwpu2 → nwpu3/);
+  assert.match(title, /批次 2\/3/);
+  assert.equal(title.includes("Worker 间分批打包同步"), false);
+  const fallback = __test.fpsyncProgressTitle({
+    source: { id: "nwpu2" }, destination: { id: "nwpu3" }, relativePaths: ["results/drf.csv"],
+  });
+  assert.match(fallback, /nwpu2 → nwpu3/);
+  assert.match(fallback, /results\/drf\.csv/);
+  const hidden = __test.fpsyncProgressTitle({ taskLabel: "token=abc Bearer secret" });
+  assert.doesNotMatch(hidden, /abc|secret$/);
+  const source = fs.readFileSync(path.join(__dirname, "../extension.js"), "utf8");
+  const body = source.slice(source.indexOf("async function syncServerToServerFpsyncCore("), source.indexOf("async function syncFromRemoteCore("));
+  assert.match(body, /比对.*哈希/);
+  assert.match(body, /传输.*文件.*分包/);
+  assert.match(body, /校验目标 Worker/);
+  assert.match(body, /SHA256 校验通过/);
 });
 
 test("Worker scope tree lists every file type while excluding machine state", () => {

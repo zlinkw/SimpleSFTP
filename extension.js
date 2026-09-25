@@ -1212,6 +1212,7 @@ async function transferPartitionedTar(source, destination, paths, timeoutMs, onP
   const groups = partitionTransferPaths(paths);
   let next = 0;
   let completed = 0;
+  let completedFiles = 0;
   const directCommand = directTarBatchCommand(source, destination);
   const workers = Array.from({ length: Math.min(4, groups.length) }, async () => {
     while (next < groups.length) {
@@ -1223,17 +1224,31 @@ async function transferPartitionedTar(source, destination, paths, timeoutMs, onP
         await relayTarFiles(source, destination, group, timeoutMs);
       }
       completed += 1;
-      if (onPartition) onPartition(completed, groups.length);
+      completedFiles += group.length;
+      if (onPartition) onPartition(completed, groups.length, completedFiles, paths.length);
     }
   });
   await Promise.all(workers);
   return groups.length;
 }
 
+function fpsyncProgressTitle(options = {}) {
+  const raw = String(options.taskLabel || "").replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
+  const safe = raw
+    .replace(/(password|passwd|token|secret|privateKey|private_key|agentToken)\s*[:=]\s*\S+/gi, "$1=<已遮蔽>")
+    .replace(/Bearer\s+\S+/gi, "Bearer <已遮蔽>");
+  if (safe) return `Worker 同步 · ${safe.slice(0, 180)}`;
+  const source = String(options.source?.id || options.source?.host || "来源 Worker").slice(0, 40);
+  const destination = String(options.destination?.id || options.destination?.host || "目标 Worker").slice(0, 40);
+  const relative = options.directory ? String(options.relativePath || "")
+    : Array.isArray(options.relativePaths) ? `${options.relativePaths.length} 个文件${options.relativePaths.length === 1 ? ` · ${options.relativePaths[0]}` : ""}` : "文件";
+  return `Worker 同步 · ${source} → ${destination} · ${String(relative).slice(0, 80)}`;
+}
+
 async function syncServerToServerFpsync(options = {}) {
   return vscode.window.withProgress({
     location: vscode.ProgressLocation.Notification,
-    title: "Worker 间分批打包同步",
+    title: fpsyncProgressTitle(options),
     cancellable: false,
   }, (progress) => syncServerToServerFpsyncCore(options, progress));
 }
@@ -1252,6 +1267,7 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
     source, destination, relativePath, relativePaths: requested, directory,
   });
   const timeoutMs = transferTimeoutMs(source, options);
+  progress.report({ message: directory ? `比对目录 ${relativePath} 的来源和目标哈希…` : `比对 ${requested.length} 个文件的来源和目标哈希…` });
   let sourceHashes;
   let destinationHashes;
   if (directory) {
@@ -1272,16 +1288,18 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   const digest = (entry) => typeof entry === "string" ? entry : entry && entry.sha256;
   const changed = paths.filter((name) => digest(sourceHashes[name]) !== digest(destinationHashes[name]));
   let reportedPercent = 0;
-  const partitions = await transferPartitionedTar(source, destination, changed, timeoutMs, (completed, total) => {
-    const percent = Math.min(99, Math.floor(completed * 100 / total));
-    progress.report({ increment: percent - reportedPercent, message: `${completed}/${total} 个分包已传输` });
+  progress.report({ message: changed.length ? `哈希比对完成；需传输 ${changed.length}/${paths.length} 个文件，准备打包…` : `哈希比对完成；${paths.length} 个文件均无需传输，准备校验…` });
+  const partitions = await transferPartitionedTar(source, destination, changed, timeoutMs, (completed, total, completedFiles, totalFiles) => {
+    const percent = Math.min(95, Math.floor(completedFiles * 95 / totalFiles));
+    progress.report({ increment: percent - reportedPercent, message: `传输 ${completedFiles}/${totalFiles} 个文件 · 分包 ${completed}/${total} · ${percent}%` });
     reportedPercent = percent;
   });
+  progress.report({ message: `传输完成；校验目标 Worker 的 ${paths.length} 个文件…` });
   const verified = directory
     ? await inspectRemoteScope(destination, relativePath, true, timeoutMs)
     : await inspectRemoteBatchFiles(destination, requested, timeoutMs);
   if (paths.some((name) => digest(sourceHashes[name]) !== digest(verified[name]))) throw new Error("分批打包同步后 SHA256 不一致；同步保持待处理。");
-  progress.report({ increment: 100 - reportedPercent, message: "传输与哈希校验完成" });
+  progress.report({ increment: 100 - reportedPercent, message: `完成：传输 ${changed.length}/${paths.length} 个文件，SHA256 校验通过` });
   return { ok: true, paths: paths.length, transferredFiles: changed.length, partitions,
     verification: "sha256", transport: "partitioned-tar", directory, relativePath };
 }
@@ -4350,6 +4368,7 @@ module.exports = {
     batchDestinationGuardCommand,
     directTarBatchCommand,
     partitionTransferPaths,
+    fpsyncProgressTitle,
     planLogPathsFromState,
     projectInventoryScript,
     projectTreePathAllowed,
