@@ -764,7 +764,7 @@ function directSyncCommand(source, destination, relativePath, directory, deleteO
   const sourcePath = path.posix.join(source.remotePath, relativePath);
   const destinationPath = path.posix.join(destination.remotePath, relativePath);
   const destinationHost = `${destination.username}@${destination.host}`;
-  const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -p ${destination.port}`;
+  const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p ${destination.port}`;
   const destinationGuard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && target=$(realpath -m -- ${shellQuote(destinationPath)}) && case "$target" in "$root"/*) ;; *) exit 72;; esac`;
   if (deleteOnly) return `${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(`${destinationGuard} && rm -rf -- ${shellQuote(destinationPath)} && test ! -e ${shellQuote(destinationPath)}`)}`;
   const destinationParent = directory ? destinationPath : path.posix.dirname(destinationPath);
@@ -800,7 +800,7 @@ async function syncServerToServer(options = {}) {
   const timeoutMs = transferTimeoutMs(source, options);
   try {
     return await new Promise((resolve, reject) => {
-    const child = spawn("ssh", ["-o", "BatchMode=yes", ...getSshArgs(source, command)], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("ssh", ["-A", "-o", "BatchMode=yes", ...getSshArgs(source, command)], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
     let stdout = "";
     const timer = timeoutMs > 0 ? setTimeout(() => { child.kill(); reject(new Error("Worker 间 rsync 超时；同步状态保持待处理。")); }, timeoutMs) : undefined;
@@ -815,7 +815,8 @@ async function syncServerToServer(options = {}) {
     });
   } catch (error) {
     if (!/host key verification failed|no .* host key|permission denied|connection timed out|connect to host|network is unreachable|could not resolve hostname|connection refused/i.test(formatError(error))) throw error;
-    return relayServerToServer(source, destination, relativePath, options.directory === true, timeoutMs);
+    const relayed = await relayServerToServer(source, destination, relativePath, options.directory === true, timeoutMs);
+    return { ...relayed, directFailure: formatError(error).slice(0, 1000) };
   }
 }
 
@@ -946,13 +947,16 @@ function planLogPathsFromState(state, planFile) {
 
 async function projectInventory(options = {}) {
   const source = directSyncTarget(options.source, "来源");
+  const relativePath = options.relativePath === undefined ? "." : String(options.relativePath) === "." ? "." : directSyncRelativePath(options.relativePath);
+  const recursive = options.recursive !== false;
+  if (relativePath !== "." && !projectTreePathAllowed(relativePath)) throw new Error("清单目录属于机器状态。");
   const script = [
-    "import hashlib,json,os,sys",
-    "root=os.path.realpath(sys.argv[1]); found={}",
-    "blocked={'.git','.vscode','.codex','zlk_cluster','.venv','venv','env','node_modules','__pycache__','.cache','.pytest_cache','.mypy_cache','.ruff_cache','.tox'}",
+    "import hashlib,json,os,sqlite3,sys",
+    "root=os.path.realpath(sys.argv[1]); relroot=sys.argv[2]; recursive=sys.argv[3]=='1'; found={}; updates=[]; hashed=0; reused=0",
+    "blocked={'.git','.vscode','.codex','.agents','.coding-tools','.local-gpt','.runtime','clean_dir','zlk_cluster','.venv','venv','env','node_modules','__pycache__','.cache','.pytest_cache','.mypy_cache','.ruff_cache','.tox'}",
     "def allowed(rel,isdir=False):",
     " parts=rel.replace(os.sep,'/').lower().split('/')",
-    " if any(p in blocked for p in parts): return False",
+    " if parts[0]=='tmp' or any(p in blocked for p in parts): return False",
     " if parts[-1].startswith('.env') or parts[-1] in ('plan_sync_ledger.json','project_mirror_state.json'): return False",
     " if parts[0]!='simple_cluster': return True",
     " if len(parts)<2: return True",
@@ -961,28 +965,57 @@ async function projectInventory(options = {}) {
     " if parts[1]=='tmp' and len(parts)>2 and parts[2]=='tmux_logs': return True",
     " if parts[1]=='tmp' and len(parts)>2 and parts[2]=='cluster_scheduler': return (len(parts)==3 and isdir) or (len(parts)>3 and parts[3]=='logs') or (len(parts)==4 and parts[-1].endswith('.log'))",
     " return False",
-    "for current,dirs,files in os.walk(root,followlinks=False):",
-    " dirs[:]=[d for d in dirs if not os.path.islink(os.path.join(current,d)) and allowed(os.path.relpath(os.path.join(current,d),root),True)]",
+    "parts=[] if relroot=='.' else relroot.split('/')",
+    "if any(p in ('','.','..') for p in parts): raise ValueError('unsafe inventory path')",
+    "if any(os.path.islink(os.path.join(root,*parts[:i])) for i in range(1,len(parts)+1)): raise ValueError('symlink inventory path')",
+    "target=os.path.join(root,*parts)",
+    "if os.path.commonpath((root,os.path.realpath(target)))!=root: raise ValueError('inventory path outside project')",
+    "if not os.path.isdir(target): print(json.dumps({'files':{}})); sys.exit(0)",
+    "cache={}; db=None; cache_root=hashlib.sha256(root.encode('utf-8')).hexdigest()",
+    "try:",
+    " cache_dir=os.path.join(os.path.expanduser('~'),'.cache','simple-sftp')",
+    " os.makedirs(cache_dir,mode=0o700,exist_ok=True)",
+    " db=sqlite3.connect(os.path.join(cache_dir,'project-inventory.sqlite3'),timeout=5)",
+    " db.execute('CREATE TABLE IF NOT EXISTS hashes (root TEXT NOT NULL, path TEXT NOT NULL, dev INTEGER NOT NULL, ino INTEGER NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY(root,path))')",
+    " cache={row[0]:row[1:] for row in db.execute('SELECT path,dev,ino,size,mtime_ns,ctime_ns,sha256 FROM hashes WHERE root=?',(cache_root,))}",
+    "except (OSError,sqlite3.Error):",
+    " if db is not None: db.close()",
+    " db=None; cache={}",
+    "walk=os.walk(target,followlinks=False) if recursive else ((target,[],os.listdir(target)),)",
+    "for current,dirs,files in walk:",
+    " if recursive: dirs[:]=[d for d in dirs if not os.path.islink(os.path.join(current,d)) and allowed(os.path.relpath(os.path.join(current,d),root),True)]",
     " for name in files:",
     "  full=os.path.join(current,name); rel=os.path.relpath(full,root).replace(os.sep,'/')",
     "  if not allowed(rel) or os.path.islink(full) or not os.path.isfile(full): continue",
+    "  stat=os.stat(full,follow_symlinks=False); identity=(stat.st_dev,stat.st_ino,stat.st_size,stat.st_mtime_ns,stat.st_ctime_ns)",
+    "  cached=cache.get(rel)",
+    "  if cached is not None and cached[:5]==identity:",
+    "   found[rel]={'sha256':cached[5],'size':stat.st_size}; reused+=1; continue",
     "  with open(full,'rb') as stream:",
     "   before=os.fstat(stream.fileno()); h=hashlib.sha256()",
     "   for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk)",
     "   after=os.fstat(stream.fileno())",
-    "  if before.st_size!=after.st_size or before.st_mtime_ns!=after.st_mtime_ns: raise RuntimeError('file changed during inventory: '+rel)",
-    "  found[rel]={'sha256':h.hexdigest(),'size':after.st_size}",
-    "print(json.dumps({'files':found},separators=(',',':')))",
+    "  if identity!=(before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns) or identity!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns): raise RuntimeError('file changed during inventory: '+rel)",
+    "  digest=h.hexdigest(); found[rel]={'sha256':digest,'size':after.st_size}; hashed+=1",
+    "  if db is not None: updates.append((cache_root,rel,*identity,digest))",
+    "if db is not None:",
+    " try:",
+    "  if updates:",
+    "   db.executemany('INSERT INTO hashes (root,path,dev,ino,size,mtime_ns,ctime_ns,sha256) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(root,path) DO UPDATE SET dev=excluded.dev,ino=excluded.ino,size=excluded.size,mtime_ns=excluded.mtime_ns,ctime_ns=excluded.ctime_ns,sha256=excluded.sha256',updates)",
+    "   db.commit()",
+    " except (OSError,sqlite3.Error): pass",
+    " finally: db.close()",
+    "print(json.dumps({'files':found,'hashedFiles':hashed,'reusedFiles':reused},separators=(',',':')))",
   ].join("\n");
-  const output = await runSsh(source, `python3 -c ${shellQuote(script)} ${shellQuote(source.remotePath)}`, transferTimeoutMs(source, options));
+  const output = await runSsh(source, `python3 -c ${shellQuote(script)} ${shellQuote(source.remotePath)} ${shellQuote(relativePath)} ${recursive ? "1" : "0"}`, transferTimeoutMs(source, options));
   const result = JSON.parse(output);
   if (!result.files || typeof result.files !== "object" || Array.isArray(result.files)) throw new Error("远端项目清单无效。");
-  return { ok: true, files: result.files };
+  return { ok: true, files: result.files, hashedFiles: result.hashedFiles, reusedFiles: result.reusedFiles };
 }
 
 function projectTreePathAllowed(relative) {
   const parts = String(relative || "").toLowerCase().split("/");
-  if (parts.some((part) => [".git", ".vscode", ".codex", "zlk_cluster", ".venv", "venv", "env", "node_modules", "__pycache__", ".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"].includes(part))) return false;
+  if (parts[0] === "tmp" || parts.some((part) => [".git", ".vscode", ".codex", ".agents", ".coding-tools", ".local-gpt", ".runtime", "clean_dir", "zlk_cluster", ".venv", "venv", "env", "node_modules", "__pycache__", ".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"].includes(part))) return false;
   if (parts.at(-1).startsWith(".env")) return false;
   if (["plan_sync_ledger.json", "project_mirror_state.json"].includes(parts.at(-1))) return false;
   if (parts[0] !== "simple_cluster" || parts.length < 2) return true;
@@ -1023,7 +1056,7 @@ async function projectTree(options = {}) {
 
 function runRemoteBatchSsh(source, command, paths, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const child = spawn("ssh", ["-o", "BatchMode=yes", ...getSshArgs(source, command)], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn("ssh", ["-A", "-o", "BatchMode=yes", ...getSshArgs(source, command)], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -1087,7 +1120,7 @@ async function syncServerToServerBatch(options = {}) {
     source, destination, relativePaths: paths,
   });
   const destinationHost = `${destination.username}@${destination.host}`;
-  const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -p ${destination.port}`;
+  const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${destination.port}`;
   const destinationGuard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && test "$root" = ${shellQuote(destination.remotePath)}`;
   const sourceGuard = `root=$(realpath -e -- ${shellQuote(source.remotePath)}) && test "$root" = ${shellQuote(source.remotePath)}`;
   const prepare = `${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(destinationGuard)}`;
@@ -1108,7 +1141,7 @@ async function syncServerToServerBatch(options = {}) {
     await relayTarFiles(source, destination, changed, timeout);
     const verified = await inspectRemoteBatchFiles(destination, paths, timeout);
     if (paths.some((name) => sourceHashes[name] !== verified[name])) throw new Error("批量内存转发后 SHA256 不一致；同步保持待处理。");
-    return { ok: true, paths: paths.length, transferredFiles: changed.length, verification: "sha256", transport: "memory-relay" };
+    return { ok: true, paths: paths.length, transferredFiles: changed.length, verification: "sha256", transport: "memory-relay", directFailure: formatError(error).slice(0, 1000) };
   }
 }
 

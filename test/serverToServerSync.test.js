@@ -19,6 +19,7 @@ test("direct rsync scopes delete to one Plan directory", () => {
   assert.match(command, /'research@nwpu3:\/projects\/demo\/work_dirs\/corim\/'/);
   assert.doesNotMatch(command, /simple_cluster\/worker_mirrors/);
   assert.match(command, /realpath -m/);
+  assert.match(command, /StrictHostKeyChecking=accept-new/);
   const deleteCommand = __test.directSyncCommand(source, destination, "work_dirs/old_run", true, true);
   assert.match(deleteCommand, /rm -rf --/);
   assert.match(deleteCommand, /test ! -e/);
@@ -77,4 +78,7 @@ test("Worker scope tree lists every file type while excluding machine state", ()
   assert.equal(__test.projectTreePathAllowed("simple_cluster/tmp/cluster_scheduler/queue_state.json"), false);
   assert.equal(__test.projectTreePathAllowed("simple_cluster/results/project_mirror_state.json"), false);
   assert.equal(__test.projectTreePathAllowed(".venv/lib/module.py"), false);
+  assert.equal(__test.projectTreePathAllowed(".runtime/state.json"), false);
+  assert.equal(__test.projectTreePathAllowed("clean_dir/archive.bin"), false);
+  assert.equal(__test.projectTreePathAllowed("tmp/live.log"), false);
 });
