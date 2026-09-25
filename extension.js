@@ -980,9 +980,17 @@ async function projectInventory(options = {}) {
   const relativePath = options.relativePath === undefined ? "." : String(options.relativePath) === "." ? "." : directSyncRelativePath(options.relativePath);
   const recursive = options.recursive !== false;
   if (relativePath !== "." && !projectTreePathAllowed(relativePath)) throw new Error("清单目录属于机器状态。");
-  const script = [
+  const script = projectInventoryScript();
+  const output = await runSsh(source, `python3 -c ${shellQuote(script)} ${shellQuote(source.remotePath)} ${shellQuote(relativePath)} ${recursive ? "1" : "0"}`, transferTimeoutMs(source, options));
+  const result = JSON.parse(output);
+  if (!result.files || typeof result.files !== "object" || Array.isArray(result.files)) throw new Error("远端项目清单无效。");
+  return { ok: true, files: result.files, unverifiedFiles: result.unverifiedFiles || {}, hashedFiles: result.hashedFiles, reusedFiles: result.reusedFiles };
+}
+
+function projectInventoryScript() {
+  return [
     "import hashlib,json,os,sqlite3,sys",
-    "root=os.path.realpath(sys.argv[1]); relroot=sys.argv[2]; recursive=sys.argv[3]=='1'; found={}; updates=[]; hashed=0; reused=0",
+    "root=os.path.realpath(sys.argv[1]); relroot=sys.argv[2]; recursive=sys.argv[3]=='1'; found={}; unverified={}; updates=[]; hashed=0; reused=0",
     "blocked={'.git','.vscode','.codex','.agents','.coding-tools','.local-gpt','.runtime','clean_dir','zlk_cluster','.venv','venv','env','node_modules','__pycache__','.cache','.pytest_cache','.mypy_cache','.ruff_cache','.tox'}",
     "def allowed(rel,isdir=False):",
     " parts=rel.replace(os.sep,'/').lower().split('/')",
@@ -1018,18 +1026,23 @@ async function projectInventory(options = {}) {
     " if recursive: dirs[:]=[d for d in dirs if not os.path.islink(os.path.join(current,d)) and allowed(os.path.relpath(os.path.join(current,d),root),True)]",
     " for name in files:",
     "  full=os.path.join(current,name); rel=os.path.relpath(full,root).replace(os.sep,'/')",
-    "  if not allowed(rel) or os.path.islink(full) or not os.path.isfile(full): continue",
-    "  stat=os.stat(full,follow_symlinks=False); identity=(stat.st_dev,stat.st_ino,stat.st_size,stat.st_mtime_ns,stat.st_ctime_ns)",
-    "  cached=cache.get(rel)",
-    "  if cached is not None and cached[:5]==identity:",
-    "   found[rel]={'sha256':cached[5],'size':stat.st_size,'modifiedAtMs':stat.st_mtime_ns//1000000}; reused+=1; continue",
-    "  with open(full,'rb') as stream:",
-    "   before=os.fstat(stream.fileno()); h=hashlib.sha256()",
-    "   for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk)",
-    "   after=os.fstat(stream.fileno())",
-    "  if identity!=(before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns) or identity!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns): raise RuntimeError('file changed during inventory: '+rel)",
-    "  digest=h.hexdigest(); found[rel]={'sha256':digest,'size':after.st_size,'modifiedAtMs':after.st_mtime_ns//1000000}; hashed+=1",
-    "  if db is not None: updates.append((cache_root,rel,*identity,digest))",
+    "  if not allowed(rel) or os.path.islink(full): continue",
+    "  try:",
+    "   if not os.path.isfile(full): unverified[rel]='文件读取期间消失或不是普通文件'; continue",
+    "   stat=os.stat(full,follow_symlinks=False); identity=(stat.st_dev,stat.st_ino,stat.st_size,stat.st_mtime_ns,stat.st_ctime_ns)",
+    "   cached=cache.get(rel)",
+    "   if cached is not None and cached[:5]==identity:",
+    "    found[rel]={'sha256':cached[5],'size':stat.st_size,'modifiedAtMs':stat.st_mtime_ns//1000000}; reused+=1; continue",
+    "   with open(full,'rb') as stream:",
+    "    before=os.fstat(stream.fileno()); h=hashlib.sha256()",
+    "    for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk)",
+    "    after=os.fstat(stream.fileno())",
+    "   if identity!=(before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns) or identity!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns):",
+    "    unverified[rel]='文件校验期间发生变化'; continue",
+    "   digest=h.hexdigest(); found[rel]={'sha256':digest,'size':after.st_size,'modifiedAtMs':after.st_mtime_ns//1000000}; hashed+=1",
+    "   if db is not None: updates.append((cache_root,rel,*identity,digest))",
+    "  except (FileNotFoundError,PermissionError,OSError) as exc:",
+    "   unverified[rel]=type(exc).__name__",
     "if db is not None:",
     " try:",
     "  if updates:",
@@ -1037,12 +1050,8 @@ async function projectInventory(options = {}) {
     "   db.commit()",
     " except (OSError,sqlite3.Error): pass",
     " finally: db.close()",
-    "print(json.dumps({'files':found,'hashedFiles':hashed,'reusedFiles':reused},separators=(',',':')))",
+    "print(json.dumps({'files':found,'unverifiedFiles':unverified,'hashedFiles':hashed,'reusedFiles':reused},separators=(',',':')))",
   ].join("\n");
-  const output = await runSsh(source, `python3 -c ${shellQuote(script)} ${shellQuote(source.remotePath)} ${shellQuote(relativePath)} ${recursive ? "1" : "0"}`, transferTimeoutMs(source, options));
-  const result = JSON.parse(output);
-  if (!result.files || typeof result.files !== "object" || Array.isArray(result.files)) throw new Error("远端项目清单无效。");
-  return { ok: true, files: result.files, hashedFiles: result.hashedFiles, reusedFiles: result.reusedFiles };
 }
 
 function projectTreePathAllowed(relative) {
@@ -3949,7 +3958,6 @@ function classifyTransportFailure(error, context = {}) {
     source.stderr || "",
     String(context.sshStderr || ""),
     String(context.tarStderr || ""),
-    String(context.command || ""),
   ].join("\n").toLowerCase();
   const classified = new Error(source.message || "SimpleSFTP 传输失败。");
   classified.cause = source;
@@ -4167,6 +4175,7 @@ module.exports = {
     guardedRemoteDeleteCommand,
     batchDestinationGuardCommand,
     planLogPathsFromState,
+    projectInventoryScript,
     projectTreePathAllowed,
     normalizeDownloadScope,
     normalizeDownloadScopePath,

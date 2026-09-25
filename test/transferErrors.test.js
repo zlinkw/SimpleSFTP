@@ -25,6 +25,14 @@ const sandbox = { Error, normalizeSshPort: (port) => Number(port) || 22 };
 vm.createContext(sandbox);
 vm.runInContext(`${extractFunction("classifyTransportFailure")}\n${extractFunction("classifySftpFailure")}\n${extractFunction("formatProcessFailure")}\nthis.classify = classifyTransportFailure; this.withTarget = classifySftpFailure; this.formatProcess = formatProcessFailure;`, sandbox);
 
+test("command text cannot turn a remote Python error into a false timeout", () => {
+  const result = sandbox.classify(new Error("RuntimeError: file changed during inventory"), {
+    command: "python3 -c 'db=sqlite3.connect(path,timeout=5)'",
+    sshStderr: "RuntimeError: file changed during inventory",
+  });
+  assert.notEqual(result.category, "transfer_timeout");
+});
+
 test("transport failures expose the required diagnostic categories", () => {
   const cases = [
     ["SimpleSFTP 传输超过 600 秒未完成，已停止。", "transfer_timeout"],

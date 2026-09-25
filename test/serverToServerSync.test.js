@@ -1,6 +1,10 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const Module = require("node:module");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
 const originalLoad = Module._load;
 Module._load = function (request, ...args) {
   return request === "vscode" ? { TreeItem: class {} } : originalLoad.call(this, request, ...args);
@@ -104,4 +108,40 @@ test("Worker scope tree lists every file type while excluding machine state", ()
   assert.equal(__test.projectTreePathAllowed("experiments/results/formal/final.csv.lock"), false);
   assert.equal(__test.projectTreePathAllowed("work_dirs/corim/.tb_mean.lock"), false);
   assert.equal(__test.projectTreePathAllowed("poetry.lock"), true);
+});
+
+test("inventory keeps stable hashes when another file changes during hashing", () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-inventory-"));
+  try {
+    const root = path.join(parent, "project");
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, "steady.bin"), "stable");
+    fs.writeFileSync(path.join(root, "volatile.bin"), "changing");
+    const prefix = [
+      "import os,sqlite3",
+      "real_stat=os.stat",
+      "class ChangedStat:",
+      " def __init__(self,value): self.value=value",
+      " def __getattr__(self,name):",
+      "  if name=='st_ctime_ns': return self.value.st_ctime_ns+1",
+      "  return getattr(self.value,name)",
+      "def changing_stat(file,*args,**kwargs):",
+      " value=real_stat(file,*args,**kwargs)",
+      " return ChangedStat(value) if str(file).endswith('volatile.bin') and kwargs.get('follow_symlinks') is False else value",
+      "os.stat=changing_stat",
+      "def no_cache(*args,**kwargs): raise sqlite3.OperationalError('test cache disabled')",
+      "sqlite3.connect=no_cache",
+    ].join("\n");
+    const script = path.join(parent, "inventory.py");
+    fs.writeFileSync(script, prefix + "\n" + __test.projectInventoryScript(), "utf8");
+    const python = process.platform === "win32" ? "python" : "python3";
+    const run = spawnSync(python, [script, root, ".", "1"], { encoding: "utf8", timeout: 10000, windowsHide: true });
+    assert.equal(run.status, 0, run.stderr);
+    const result = JSON.parse(run.stdout);
+    assert.equal(result.files["steady.bin"].sha256.length, 64);
+    assert.equal(result.files["volatile.bin"], undefined);
+    assert.match(result.unverifiedFiles["volatile.bin"], /变化/);
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
 });
