@@ -1206,9 +1206,10 @@ async function syncFromRemoteCore(options = {}) {
     }
 
     const localPath = String(options.localPath || getWorkspaceRoot()).trim();
-    const sftp = readSftpConfig(localPath);
+    const hasTargetOptions = Boolean(options.server || options.remotePath || options.host);
+    const sftp = hasTargetOptions ? resolveUploadSftp(localPath, options) : readSftpConfig(localPath);
     if (!sftp) {
-      const message = "当前工作区未找到 .vscode/sftp.json。";
+      const message = hasTargetOptions ? "未提供可用的远端来源。" : "当前工作区未找到 .vscode/sftp.json。";
       if (options.apiMode) throw new Error(message);
       vscode.window.showErrorMessage(message);
       return { ok: false, error: message };
@@ -1229,25 +1230,30 @@ async function syncFromRemoteCore(options = {}) {
     }
 
     const syncStartedAt = new Date();
-    const downloadScope = readTargetDownloadScope(localPath, options, sftp);
+    const scopedPaths = Array.isArray(options.paths) ? options.paths : null;
+    const downloadScope = scopedPaths ? explicitDownloadScope(options) : readTargetDownloadScope(localPath, options, sftp);
+    if (scopedPaths) assertSafeScopedLocalPaths(localPath, downloadScope.paths);
     await downloadRemoteToLocal({ localPath, sftp, downloadScope });
-    writeLocalSessionRecord(localPath, {
-      action: "remoteToLocal",
-      device: getDeviceName(),
-      remotePath: sftp.remotePath,
-      at: new Date().toISOString(),
-    });
-    writeUploadState(localPath, {
-      lastUploadedAt: syncStartedAt.toISOString(),
-      mode: "remoteToLocal",
-      remotePath: sftp.remotePath,
-    });
+    if (!scopedPaths) {
+      writeLocalSessionRecord(localPath, {
+        action: "remoteToLocal",
+        device: getDeviceName(),
+        remotePath: sftp.remotePath,
+        at: new Date().toISOString(),
+      });
+      writeUploadState(localPath, {
+        lastUploadedAt: syncStartedAt.toISOString(),
+        mode: "remoteToLocal",
+        remotePath: sftp.remotePath,
+      });
+    }
     if (options.apiMode) {
       return {
         ok: true,
         localPath,
         remotePath: sftp.remotePath,
         downloadedAt: syncStartedAt.toISOString(),
+        ...(scopedPaths ? { paths: downloadScope.paths } : {}),
       };
     }
     vscode.window.showInformationMessage("SimpleSFTP 已完成远端到本地同步。");
@@ -1934,8 +1940,37 @@ function normalizeDownloadScope(value = {}) {
   return {
     paths: [...new Set((Array.isArray(value.paths) ? value.paths : []).map(normalizeDownloadScopePath))].sort((a, b) => a.localeCompare(b)),
     extensions: normalizeDownloadExtensions(value.extensions),
-    maxFileSizeMB: normalizeDownloadMaxFileSizeMB(value.maxFileSizeMB ?? DEFAULT_DOWNLOAD_MAX_FILE_SIZE_MB),
+    maxFileSizeMB: value.noSizeLimit === true ? null : normalizeDownloadMaxFileSizeMB(value.maxFileSizeMB ?? DEFAULT_DOWNLOAD_MAX_FILE_SIZE_MB),
+    ...(value.noSizeLimit === true ? { noSizeLimit: true } : {}),
   };
+}
+
+function explicitDownloadScope(options = {}) {
+  if (!Array.isArray(options.paths) || !options.paths.length || options.paths.some((item) => item === "."))
+    throw new Error("显式下载路径必须是一个或多个项目内文件或目录，禁止选择整个项目根目录。");
+  return normalizeDownloadScope({ paths: options.paths, extensions: ["*"], noSizeLimit: true });
+}
+
+function assertSafeScopedLocalPaths(localPath, paths) {
+  const root = path.resolve(localPath);
+  try { if (fs.lstatSync(root).isSymbolicLink()) throw new Error(`本机项目目录是符号链接：${root}`); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+  for (const relative of paths) {
+    const full = path.resolve(root, ...relative.split("/"));
+    const within = path.relative(root, full);
+    if (!within || within === ".." || within.startsWith(`..${path.sep}`) || path.isAbsolute(within))
+      throw new Error(`本机下载路径超出项目根目录：${relative}`);
+    let cursor = root;
+    const parts = relative.split("/");
+    for (const [index, part] of parts.entries()) {
+      cursor = path.join(cursor, part);
+      let stat;
+      try { stat = fs.lstatSync(cursor); }
+      catch (error) { if (error.code === "ENOENT") break; throw error; }
+      if (stat.isSymbolicLink() || index < parts.length - 1 && !stat.isDirectory())
+        throw new Error(`本机下载路径包含符号链接或非目录：${cursor}`);
+    }
+  }
 }
 
 function readTargetDownloadScope(localPath, options, sftp) {
@@ -2775,6 +2810,23 @@ function createLocalApiMethods() {
         localPath,
         remotePath: result && result.remotePath,
       });
+      return result;
+    },
+    "sync.downloadPaths": async (params = {}) => {
+      const localPath = String(params.localPath || "").trim();
+      if (!localPath) throw new Error("缺少本地项目目录 localPath。");
+      if (!params.server || typeof params.server !== "object") throw new Error("必须明确指定来源 Worker。");
+      const scope = explicitDownloadScope(params);
+      const sftp = apiTransferSftp({ ...params, localPath });
+      requireApiConfirmation(params, {
+        method: "sync.downloadPaths",
+        operation: `仅下载 ${scope.paths.length} 条指定路径到本机`,
+        sftp,
+        localPath,
+        pathRequired: true,
+      });
+      const result = await syncFromRemote({ ...params, apiMode: true, localPath, paths: scope.paths });
+      publishLocalApiEvent("sync.downloadPaths", { localPath, remotePath: result.remotePath, paths: scope.paths });
       return result;
     },
     "sync.planLogPaths": async (params = {}) => listPlanLogPaths(params),
@@ -3841,7 +3893,7 @@ function createRemoteDownloadScript(remotePath, downloadScope) {
       "paths=scope.get('paths') or []",
       "extensions=[str(v).lower() for v in (scope.get('extensions') or ['*'])]",
       "allow_any='*' in extensions",
-      "max_bytes=int(float(scope.get('maxFileSizeMB') or 1024)*1024*1024)",
+      "max_bytes=None if scope.get('noSizeLimit') else int(float(scope.get('maxFileSizeMB') or 1024)*1024*1024)",
       "blocked={'.git','.vscode','.codex','zlk_cluster'}",
       "def blocked_path(rel):",
       "    parts=rel.replace('\\\\','/').lower().split('/')",
@@ -3861,7 +3913,7 @@ function createRemoteDownloadScript(remotePath, downloadScope) {
       "def allowed(rel, full):",
       "    if not rel or rel in seen or os.path.islink(full) or not os.path.isfile(full): return False",
       "    if blocked_path(rel): return False",
-      "    if os.path.getsize(full) > max_bytes: return False",
+      "    if max_bytes is not None and os.path.getsize(full) > max_bytes: return False",
       "    lower=rel.lower()",
       "    return allow_any or any(lower.endswith(ext) for ext in extensions)",
       "for rel_root in paths:",

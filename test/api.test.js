@@ -281,7 +281,7 @@ test("SimpleSFTP gates direct rsync behind explicit path confirmation", () => {
   assert.match(extensionSource, /confirmationRequired\(/);
   assert.doesNotMatch(extensionSource, /\bscp\b/);
   assert.match(extensionSource, /"sync\.serverToServer": async/);
-  assert.match(extensionSource, /rsync -a -s --delete-missing-args/);
+  assert.match(extensionSource, /const rsyncArgs = `-a -c -s --delete-missing-args/);
 });
 
 test("SimpleSFTP uploads have connect timeout, transfer timeout, cancellation and API control", () => {
@@ -311,6 +311,7 @@ test("SimpleSFTP exposes the planned public API methods", () => {
     "target.update",
     "project.create",
     "sync.fromRemote",
+    "sync.downloadPaths",
     "transfers.list",
     "transfers.cancel",
     "upload.workspace",
