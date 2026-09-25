@@ -2,7 +2,7 @@
 
 SimpleSFTP 是一个 Windows VS Code 扩展，用于在本地项目和远端 Linux 项目目录之间同步代码、轻量结果和 Agent runtime。本地与远端之间使用系统 `ssh` 和 `tar` 流传输，Worker 之间支持分区并行的 tar 流同步，也不会保存云凭据。
 
-`sync.serverToServerFpsync` 按 fpsync 的分区并行思路处理 Worker 间同步：先对指定文件计算两端 SHA256，仅将变化文件分成最多 1000 文件一组，最多四组并行打包、转发和解包，随后逐文件校验 SHA256。此模式使用内置 tar 传输，无需在 Worker 安装 fpsync。目录中若有目标端独有的旧文件，会停止并要求单独进行双重确认清理。
+`sync.serverToServerFpsync` 按 fpsync 的分区并行思路处理 Worker 间同步：先对指定文件计算两端 SHA256，仅将变化文件分成最多 1000 文件一组，最多四组并行打包、转发和解包，随后逐文件校验 SHA256。`sync.serverToServerBatch` 与 `sync.serverToServer` 的非删除传输也复用此路径。此模式使用内置 tar 传输，无需在 Worker 安装 fpsync。目录中若有目标端独有的旧文件，会停止并要求单独进行双重确认清理。
 
 SimpleSFTP 与 [SimpleExperiment](https://github.com/zlinkw/SimpleExperiment) 配套使用。SimpleExperiment 负责服务器状态和实验调度；SimpleSFTP 只负责真实文件传输。
 

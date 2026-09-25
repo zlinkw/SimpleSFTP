@@ -839,28 +839,10 @@ async function syncServerToServer(options = {}) {
     await runSsh(destination, guardedRemoteDeleteCommand(destination, relativePath), transferTimeoutMs(destination, options));
     return { ok: true, source, destination, relativePath, directory: options.directory === true, deletedStale: true };
   }
-  const command = directSyncCommand(source, destination, relativePath, options.directory === true, false);
-  const timeoutMs = transferTimeoutMs(source, options);
-  try {
-    return await new Promise((resolve, reject) => {
-    const child = spawn("ssh", ["-A", "-o", "BatchMode=yes", ...getSshArgs(source, command)], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-    let stderr = "";
-    let stdout = "";
-    const timer = timeoutMs > 0 ? setTimeout(() => { child.kill(); reject(new Error("Worker 间 rsync 超时；同步状态保持待处理。")); }, timeoutMs) : undefined;
-    child.stdout.on("data", (chunk) => { stdout = (stdout + chunk.toString("utf8")).slice(-16384); });
-    child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
-    child.on("error", (error) => { if (timer) clearTimeout(timer); reject(error); });
-    child.on("close", (code) => {
-      if (timer) clearTimeout(timer);
-      if (code === 0) resolve({ ok: true, source, destination, relativePath, directory: options.directory === true, deletedStale: true, output: stdout.trim() });
-      else reject(new Error(`Worker 间 rsync 失败（退出码 ${code}）：${stderr.trim() || stdout.trim() || "SSH 或 rsync 不可用"}`));
-    });
-    });
-  } catch (error) {
-    if (!/host key verification failed|no .* host key|permission denied|connection timed out|connect to host|network is unreachable|could not resolve hostname|connection refused/i.test(formatError(error))) throw error;
-    const relayed = await relayServerToServer(source, destination, relativePath, options.directory === true, timeoutMs);
-    return { ...relayed, directFailure: formatError(error).slice(0, 1000) };
-  }
+  const packed = await syncServerToServerFpsync({ ...options, source, destination,
+    ...(options.directory === true ? { relativePath, directory: true } : { relativePaths: [relativePath], directory: false }),
+    confirm: true, pathConfirmed: true });
+  return { ...packed, source, destination, relativePath, directory: options.directory === true, deletedStale: false };
 }
 
 async function inspectRemoteScope(target, relativePath, directory, timeoutMs, required = false) {
@@ -1205,29 +1187,7 @@ async function syncServerToServerBatch(options = {}) {
     method: "sync.serverToServerBatch", operation: "Worker 间批量补齐项目文件", requires: ["confirm", "pathConfirmed"],
     source, destination, relativePaths: paths,
   });
-  const destinationHost = `${destination.username}@${destination.host}`;
-  const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${destination.port}`;
-  const sourceGuard = `root=$(realpath -e -- ${shellQuote(source.remotePath)}) && test "$root" = ${shellQuote(source.remotePath)}`;
-  const prepare = batchDestinationGuardCommand(destination);
-  const args = `-a -c -s --from0 --files-from=- -e ${shellQuote(sshOptions)} -- ${shellQuote(source.remotePath + "/")} ${shellQuote(destinationHost + ":" + destination.remotePath + "/")}`;
-  const prefix = `${sourceGuard} && ${prepare} && `;
-  const timeout = transferTimeoutMs(source, options);
-  try {
-    await runRemoteBatchSsh(source, `${prefix}rsync ${args}`, paths, timeout);
-    const remaining = await runRemoteBatchSsh(source, `${prefix}rsync -n -i ${args}`, paths, timeout);
-    if (remaining) throw new Error(`跨 Worker 批量内容校验不一致：${remaining.slice(0, 2000)}`);
-    return { ok: true, paths: paths.length, verification: "rsync-checksum", transport: "direct-rsync" };
-  } catch (error) {
-    if (!/host key verification failed|no .* host key|permission denied|connection timed out|connect to host|network is unreachable|could not resolve hostname|connection refused/i.test(formatError(error))) throw error;
-    const sourceHashes = await inspectRemoteBatchFiles(source, paths, timeout);
-    if (paths.some((name) => !sourceHashes[name])) throw new Error("来源 Worker 缺少批量同步文件；同步保持待处理。");
-    const destinationHashes = await inspectRemoteBatchFiles(destination, paths, timeout);
-    const changed = paths.filter((name) => sourceHashes[name] !== destinationHashes[name]);
-    await relayTarFiles(source, destination, changed, timeout);
-    const verified = await inspectRemoteBatchFiles(destination, paths, timeout);
-    if (paths.some((name) => sourceHashes[name] !== verified[name])) throw new Error("批量内存转发后 SHA256 不一致；同步保持待处理。");
-    return { ok: true, paths: paths.length, transferredFiles: changed.length, verification: "sha256", transport: "memory-relay", directFailure: formatError(error).slice(0, 1000) };
-  }
+  return syncServerToServerFpsync({ ...options, source, destination, relativePaths: paths, confirm: true, pathConfirmed: true });
 }
 
 function partitionTransferPaths(paths, maxFiles = 1000) {
