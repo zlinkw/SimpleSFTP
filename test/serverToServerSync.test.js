@@ -117,6 +117,8 @@ test("inventory keeps stable hashes when another file changes during hashing", (
     fs.mkdirSync(root);
     fs.writeFileSync(path.join(root, "steady.bin"), "stable");
     fs.writeFileSync(path.join(root, "volatile.bin"), "changing");
+    fs.mkdirSync(path.join(root, "code"));
+    fs.writeFileSync(path.join(root, "code", "nested.py"), "nested");
     const prefix = [
       "import os,sqlite3",
       "real_stat=os.stat",
@@ -141,6 +143,12 @@ test("inventory keeps stable hashes when another file changes during hashing", (
     assert.equal(result.files["steady.bin"].sha256.length, 64);
     assert.equal(result.files["volatile.bin"], undefined);
     assert.match(result.unverifiedFiles["volatile.bin"], /变化/);
+    const shallow = spawnSync(python, [script, root, ".", "0"], { encoding: "utf8", timeout: 10000, windowsHide: true });
+    assert.equal(shallow.status, 0, shallow.stderr);
+    const shallowResult = JSON.parse(shallow.stdout);
+    assert.equal(shallowResult.files["steady.bin"].sha256.length, 64);
+    assert.equal(shallowResult.files["code"], undefined);
+    assert.equal(shallowResult.unverifiedFiles["code"], undefined);
   } finally {
     fs.rmSync(parent, { recursive: true, force: true });
   }

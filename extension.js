@@ -1021,7 +1021,7 @@ function projectInventoryScript() {
     "except (OSError,sqlite3.Error):",
     " if db is not None: db.close()",
     " db=None; cache={}",
-    "walk=os.walk(target,followlinks=False) if recursive else ((target,[],os.listdir(target)),)",
+    "walk=os.walk(target,followlinks=False) if recursive else ((target,[],[name for name in os.listdir(target) if not os.path.isdir(os.path.join(target,name))]),)",
     "for current,dirs,files in walk:",
     " if recursive: dirs[:]=[d for d in dirs if not os.path.islink(os.path.join(current,d)) and allowed(os.path.relpath(os.path.join(current,d),root),True)]",
     " for name in files:",
