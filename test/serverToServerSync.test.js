@@ -101,4 +101,7 @@ test("Worker scope tree lists every file type while excluding machine state", ()
   assert.equal(__test.projectTreePathAllowed(".runtime/state.json"), false);
   assert.equal(__test.projectTreePathAllowed("clean_dir/archive.bin"), false);
   assert.equal(__test.projectTreePathAllowed("tmp/live.log"), false);
+  assert.equal(__test.projectTreePathAllowed("experiments/results/formal/final.csv.lock"), false);
+  assert.equal(__test.projectTreePathAllowed("work_dirs/corim/.tb_mean.lock"), false);
+  assert.equal(__test.projectTreePathAllowed("poetry.lock"), true);
 });

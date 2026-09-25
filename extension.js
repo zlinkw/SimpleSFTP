@@ -987,6 +987,8 @@ async function projectInventory(options = {}) {
     "def allowed(rel,isdir=False):",
     " parts=rel.replace(os.sep,'/').lower().split('/')",
     " if parts[0]=='tmp' or any(p in blocked for p in parts): return False",
+    " if len(parts)>2 and parts[:2]==['experiments','results'] and parts[-1].endswith('.csv.lock'): return False",
+    " if parts[0]=='work_dirs' and parts[-1]=='.tb_mean.lock': return False",
     " if parts[-1].startswith('.env') or parts[-1] in ('plan_sync_ledger.json','project_mirror_state.json'): return False",
     " if parts[0]!='simple_cluster': return True",
     " if len(parts)<2: return True",
@@ -1046,6 +1048,8 @@ async function projectInventory(options = {}) {
 function projectTreePathAllowed(relative) {
   const parts = String(relative || "").toLowerCase().split("/");
   if (parts[0] === "tmp" || parts.some((part) => [".git", ".vscode", ".codex", ".agents", ".coding-tools", ".local-gpt", ".runtime", "clean_dir", "zlk_cluster", ".venv", "venv", "env", "node_modules", "__pycache__", ".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"].includes(part))) return false;
+  if (parts[0] === "experiments" && parts[1] === "results" && parts.at(-1).endsWith(".csv.lock")) return false;
+  if (parts[0] === "work_dirs" && parts.at(-1) === ".tb_mean.lock") return false;
   if (parts.at(-1).startsWith(".env")) return false;
   if (["plan_sync_ledger.json", "project_mirror_state.json"].includes(parts.at(-1))) return false;
   if (parts[0] !== "simple_cluster" || parts.length < 2) return true;
