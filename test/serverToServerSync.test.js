@@ -59,6 +59,8 @@ test("Plan log inventory includes scheduler and every job log without unrelated 
 
 test("project batch transfer validates exact paths and requires confirmation", async () => {
   const methods = __test.createLocalApiMethods();
+  const destination = __test.directSyncTarget({ host: "nwpu3", user: "research", remotePath: "/projects/demo" }, "目标");
+  assert.match(__test.batchDestinationGuardCommand(destination), /^ssh -n /);
   const params = {
     source: { host: "source", user: "research", remotePath: "/projects/demo" },
     destination: { host: "target", user: "research", remotePath: "/projects/demo" },

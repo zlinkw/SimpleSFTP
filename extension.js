@@ -1109,6 +1109,13 @@ async function inspectRemoteBatchFiles(target, paths, timeoutMs) {
   return found;
 }
 
+function batchDestinationGuardCommand(destination) {
+  const destinationHost = `${destination.username}@${destination.host}`;
+  const destinationGuard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && test "$root" = ${shellQuote(destination.remotePath)}`;
+  // The guard runs before rsync and must not consume its --files-from stdin.
+  return `ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${destination.port} ${shellQuote(destinationHost)} ${shellQuote(destinationGuard)}`;
+}
+
 async function syncServerToServerBatch(options = {}) {
   const source = directSyncTarget(options.source, "来源");
   const destination = directSyncTarget(options.destination, "目标");
@@ -1121,9 +1128,8 @@ async function syncServerToServerBatch(options = {}) {
   });
   const destinationHost = `${destination.username}@${destination.host}`;
   const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${destination.port}`;
-  const destinationGuard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && test "$root" = ${shellQuote(destination.remotePath)}`;
   const sourceGuard = `root=$(realpath -e -- ${shellQuote(source.remotePath)}) && test "$root" = ${shellQuote(source.remotePath)}`;
-  const prepare = `${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(destinationGuard)}`;
+  const prepare = batchDestinationGuardCommand(destination);
   const args = `-a -c -s --from0 --files-from=- -e ${shellQuote(sshOptions)} -- ${shellQuote(source.remotePath + "/")} ${shellQuote(destinationHost + ":" + destination.remotePath + "/")}`;
   const prefix = `${sourceGuard} && ${prepare} && `;
   const timeout = transferTimeoutMs(source, options);
@@ -4122,6 +4128,7 @@ module.exports = {
     directSyncTarget,
     directSyncRelativePath,
     directSyncCommand,
+    batchDestinationGuardCommand,
     planLogPathsFromState,
     projectTreePathAllowed,
     normalizeDownloadScope,
