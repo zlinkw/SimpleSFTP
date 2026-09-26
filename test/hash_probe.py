@@ -14,8 +14,8 @@ def install(mode):
             self.delta = delta
 
         def __getattr__(self, name):
-            if name == "st_mtime_ns":
-                return self.value.st_mtime_ns + self.delta
+            if name in ("st_mtime_ns", "st_ctime_ns"):
+                return getattr(self.value, name) + self.delta
             return getattr(self.value, name)
 
     def stat(path, *args, **kwargs):
@@ -35,6 +35,7 @@ def install(mode):
         return value
 
     os.stat = stat
+    os.lstat = stat
     os.fstat = fstat
 
 

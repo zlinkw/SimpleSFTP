@@ -851,9 +851,7 @@ const BATCH_HASH_POLL_SECONDS = 0.25;
 async function inspectRemoteScope(target, relativePath, directory, timeoutMs, required = false) {
   const script = scopeInventoryScript();
   const stdout = await runSsh(target, `python3 -c ${shellQuote(script)} ${shellQuote(target.remotePath)} ${shellQuote(relativePath)} ${directory ? "1" : "0"} ${required ? "1" : "0"} ${BATCH_HASH_QUIET_SECONDS} ${BATCH_HASH_POLL_SECONDS}`, timeoutMs);
-  const result = JSON.parse(stdout);
-  if (!result.files || typeof result.files !== "object" || Array.isArray(result.files)) throw new Error("Plan 内容清单无效。");
-  return result.files;
+  return scopeHashPayload(JSON.parse(stdout));
 }
 
 function relayTarFiles(source, destination, paths, timeoutMs) {
@@ -908,8 +906,8 @@ async function removeStaleRemoteFiles(destination, scope, paths, timeoutMs) {
 }
 
 async function relayServerToServer(source, destination, relativePath, directory, timeoutMs) {
-  const sourceFiles = await inspectRemoteScope(source, relativePath, directory, timeoutMs, directory);
-  const destinationFiles = await inspectRemoteScope(destination, relativePath, directory, timeoutMs);
+  const sourceFiles = (await inspectRemoteScope(source, relativePath, directory, timeoutMs, directory)).files;
+  const destinationFiles = (await inspectRemoteScope(destination, relativePath, directory, timeoutMs)).files;
   if (directory) {
     const target = path.posix.join(destination.remotePath, relativePath);
     const guard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && target=$(realpath -m -- ${shellQuote(target)}) && case "$target" in "$root"/*) ;; *) exit 72;; esac`;
@@ -919,7 +917,7 @@ async function relayServerToServer(source, destination, relativePath, directory,
   const stale = Object.keys(destinationFiles).filter((name) => !sourceFiles[name]).sort();
   await relayTarFiles(source, destination, changed, timeoutMs);
   if (stale.length) await removeStaleRemoteFiles(destination, relativePath, stale, timeoutMs);
-  const verified = await inspectRemoteScope(destination, relativePath, directory, timeoutMs);
+  const verified = (await inspectRemoteScope(destination, relativePath, directory, timeoutMs)).files;
   if (JSON.stringify(Object.entries(sourceFiles).sort()) !== JSON.stringify(Object.entries(verified).sort()))
     throw new Error("本机内存转发后内容 SHA256 不一致；同步保持待处理。");
   return { ok: true, source, destination, relativePath, directory, deletedStale: stale.length > 0, transferredFiles: changed.length, verification: "sha256", transport: "memory-relay" };
@@ -970,6 +968,13 @@ async function projectInventory(options = {}) {
 function projectInventoryScript() {
   return [
     "import hashlib,json,os,sqlite3,stat as statmod,sys",
+    "SQLITE_INT64_SPAN=1<<64",
+    "def sql_int(value):",
+    " value=int(value)",
+    " if value>=1<<63: value-=SQLITE_INT64_SPAN",
+    " return value",
+    "def content_identity(st): return (int(st.st_size),int(st.st_mtime_ns))",
+    "def cache_identity(st): return (sql_int(st.st_dev),sql_int(st.st_ino),int(st.st_size),int(st.st_mtime_ns),sql_int(st.st_ctime_ns))",
     "from concurrent.futures import ThreadPoolExecutor",
     "root=os.path.realpath(sys.argv[1]); relroot=sys.argv[2]; recursive=sys.argv[3]=='1'; scopes=json.loads(sys.argv[4]) if len(sys.argv)>4 else None; found={}; unverified={}; updates=[]; hashed=0; reused=0",
     "blocked={'.git','.vscode','.codex','.agents','.coding-tools','.local-gpt','.runtime','clean_dir','zlk_cluster','.venv','venv','env','node_modules','__pycache__','.cache','.pytest_cache','.mypy_cache','.ruff_cache','.tox'}",
@@ -996,11 +1001,11 @@ function projectInventoryScript() {
     "if not os.path.isdir(target) and not os.path.isfile(target): print(json.dumps({'files':{}})); sys.exit(0)",
     "cache={}; db=None; cache_root=hashlib.sha256(root.encode('utf-8')).hexdigest()",
     "try:",
-    " cache_dir=os.path.join(os.path.expanduser('~'),'.cache','simple-sftp')",
+    " cache_dir=os.environ.get('SIMPLE_SFTP_HASH_CACHE_DIR') or os.path.join(os.path.expanduser('~'),'.cache','simple-sftp')",
     " os.makedirs(cache_dir,mode=0o700,exist_ok=True)",
     " db=sqlite3.connect(os.path.join(cache_dir,'project-inventory.sqlite3'),timeout=5)",
     " db.execute('CREATE TABLE IF NOT EXISTS hashes (root TEXT NOT NULL, path TEXT NOT NULL, dev INTEGER NOT NULL, ino INTEGER NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY(root,path))')",
-    " cache={row[0]:row[1:] for row in db.execute('SELECT path,dev,ino,size,mtime_ns,ctime_ns,sha256 FROM hashes WHERE root=?',(cache_root,))}",
+    " cache={row[0]:tuple(int(part) if isinstance(part,int) else part for part in row[1:]) for row in db.execute('SELECT path,dev,ino,size,mtime_ns,ctime_ns,sha256 FROM hashes WHERE root=?',(cache_root,))}",
     "except (OSError,sqlite3.Error):",
     " if db is not None: db.close()",
     " db=None; cache={}",
@@ -1014,10 +1019,10 @@ function projectInventoryScript() {
     "def inspect(item):",
     " rel,full=item",
     " try:",
-    "  stat=os.stat(full,follow_symlinks=False)",
+    "  stat=os.lstat(full)",
     "  if statmod.S_ISLNK(stat.st_mode): return (rel,None,None,None)",
     "  if not statmod.S_ISREG(stat.st_mode): return (rel,None,None,'文件读取期间消失或不是普通文件')",
-    "  identity=(stat.st_dev,stat.st_ino,stat.st_size,stat.st_mtime_ns,stat.st_ctime_ns)",
+    "  identity=cache_identity(stat)",
     "  cached=cache.get(rel)",
     "  if cached is not None and cached[:5]==identity:",
     "   return (rel,{'sha256':cached[5],'size':stat.st_size,'modifiedAtMs':stat.st_mtime_ns//1000000},None,None)",
@@ -1025,10 +1030,11 @@ function projectInventoryScript() {
     "   before=os.fstat(stream.fileno()); h=hashlib.sha256()",
     "   for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk)",
     "   after=os.fstat(stream.fileno())",
-    "  if identity!=(before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns) or identity!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns):",
+    "  closed=os.lstat(full)",
+    "  if content_identity(stat)!=content_identity(before) or content_identity(before)!=content_identity(after) or content_identity(after)!=content_identity(closed) or cache_identity(stat)[:2]!=cache_identity(before)[:2] or cache_identity(before)[:2]!=cache_identity(after)[:2] or cache_identity(after)[:2]!=cache_identity(closed)[:2] or cache_identity(stat)!=cache_identity(closed):",
     "   return (rel,None,None,'文件校验期间发生变化')",
     "  digest=h.hexdigest()",
-    "  return (rel,{'sha256':digest,'size':after.st_size,'modifiedAtMs':after.st_mtime_ns//1000000},(cache_root,rel,*identity,digest),None)",
+    "  return (rel,{'sha256':digest,'size':closed.st_size,'modifiedAtMs':closed.st_mtime_ns//1000000},(cache_root,rel,*cache_identity(closed),digest),None)",
     " except (FileNotFoundError,PermissionError,OSError) as exc:",
     "  return (rel,None,None,type(exc).__name__)",
     "with ThreadPoolExecutor(max_workers=8) as pool:",
@@ -1136,15 +1142,32 @@ function runRemoteBatchSsh(source, command, paths, timeoutMs) {
 
 function hashQuiescenceHelpers() {
   return [
-    "def identity(st): return (st.st_size,st.st_mtime_ns)",
+    "SQLITE_INT64_SPAN=1<<64",
+    "def sql_int(value):",
+    " value=int(value)",
+    " if value>=1<<63: value-=SQLITE_INT64_SPAN",
+    " return value",
+    "def content_identity(st): return (int(st.st_size),int(st.st_mtime_ns))",
+    "def cache_identity(st): return (sql_int(st.st_dev),sql_int(st.st_ino),int(st.st_size),int(st.st_mtime_ns),sql_int(st.st_ctime_ns))",
     "def hash_current(full):",
-    " before=os.stat(full,follow_symlinks=False)",
-    " with open(full,'rb') as stream:",
-    "  opened=os.fstat(stream.fileno()); h=hashlib.sha256()",
-    "  for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk)",
-    "  closed=os.fstat(stream.fileno())",
-    " if identity(before)!=identity(opened) or identity(opened)!=identity(closed): return None",
-    " return h.hexdigest(),closed.st_size",
+    " global hash_stats",
+    " hash_stats['digestReads']+=1",
+    " before=os.lstat(full)",
+    " if statmod.S_ISLNK(before.st_mode) or not statmod.S_ISREG(before.st_mode): return None",
+    " descriptor=open_nofollow(full)",
+    " try:",
+    "  opened=os.fstat(descriptor); h=hashlib.sha256()",
+    "  if not statmod.S_ISREG(opened.st_mode) or content_identity(opened)!=content_identity(before) or cache_identity(opened)[:2]!=cache_identity(before)[:2]: return None",
+    "  while True:",
+    "   chunk=os.read(descriptor,1048576)",
+    "   if not chunk: break",
+    "   h.update(chunk)",
+    "  closed=os.fstat(descriptor)",
+    " finally:",
+    "  os.close(descriptor)",
+    " after=os.lstat(full)",
+    " if content_identity(before)!=content_identity(opened) or content_identity(opened)!=content_identity(closed) or content_identity(closed)!=content_identity(after) or cache_identity(before)[:2]!=cache_identity(opened)[:2] or cache_identity(opened)[:2]!=cache_identity(closed)[:2] or cache_identity(closed)[:2]!=cache_identity(after)[:2] or cache_identity(before)!=cache_identity(after): return None",
+    " return h.hexdigest(),after.st_size,cache_identity(after)",
     "def stable_digest(full,deadline,poll):",
     " delay=0",
     " while True:",
@@ -1157,10 +1180,71 @@ function hashQuiescenceHelpers() {
   ];
 }
 
+function batchHashCacheHelpers() {
+  return [
+    "import sqlite3,stat as statmod",
+    "cache_hits=0; cache_rehash=0; hash_stats={'digestReads':0}; cache_updates=[]; cache_queries=0",
+    "cache_root=hashlib.sha256(root.encode('utf-8')).hexdigest(); db=None; cache_ready=False",
+    "try:",
+    " cache_dir=os.environ.get('SIMPLE_SFTP_HASH_CACHE_DIR') or os.path.join(os.path.expanduser('~'),'.cache','simple-sftp')",
+    " os.makedirs(cache_dir,mode=0o700,exist_ok=True)",
+    " db=sqlite3.connect(os.path.join(cache_dir,'project-inventory.sqlite3'),timeout=5)",
+    " db.execute('CREATE TABLE IF NOT EXISTS hashes (root TEXT NOT NULL, path TEXT NOT NULL, dev INTEGER NOT NULL, ino INTEGER NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY(root,path))')",
+    " cache_ready=True",
+    "except (OSError,sqlite3.Error):",
+    " if db is not None:",
+    "  try: db.close()",
+    "  except sqlite3.Error: pass",
+    " db=None; cache_ready=False",
+    "def open_nofollow(full):",
+    " flags=os.O_RDONLY",
+    " if hasattr(os,'O_NOFOLLOW'): flags|=os.O_NOFOLLOW",
+    " if hasattr(os,'O_BINARY'): flags|=os.O_BINARY",
+    " return os.open(full,flags)",
+    "def lookup_cached(rel,full,stat):",
+    " global cache_hits,cache_queries",
+    " if not cache_ready or statmod.S_ISLNK(stat.st_mode) or not statmod.S_ISREG(stat.st_mode): return None",
+    " cache_queries+=1",
+    " try:",
+    "  row=db.execute('SELECT dev,ino,size,mtime_ns,ctime_ns,sha256 FROM hashes WHERE root=? AND path=?',(cache_root,rel)).fetchone()",
+    " except sqlite3.Error: return None",
+    " if row is None: return None",
+    " current=cache_identity(stat)",
+    " if tuple(int(part) for part in row[:5])!=current: return None",
+    " try:",
+    "  descriptor=open_nofollow(full)",
+    " except OSError: return None",
+    " try:",
+    "  opened=os.fstat(descriptor)",
+    "  if not statmod.S_ISREG(opened.st_mode) or content_identity(opened)!=content_identity(stat) or cache_identity(opened)[:2]!=current[:2]: return None",
+    " finally:",
+    "  os.close(descriptor)",
+    " again=os.lstat(full)",
+    " if statmod.S_ISLNK(again.st_mode) or not statmod.S_ISREG(again.st_mode) or cache_identity(again)!=current: return None",
+    " cache_hits+=1",
+    " return row[5],again.st_size",
+    "def remember_hash(rel,file_identity,digest):",
+    " global cache_rehash",
+    " cache_rehash+=1",
+    " if cache_ready: cache_updates.append((cache_root,rel,*file_identity,digest))",
+    "def flush_hash_cache():",
+    " if db is None: return",
+    " try:",
+    "  if cache_updates:",
+    "   db.executemany('INSERT INTO hashes (root,path,dev,ino,size,mtime_ns,ctime_ns,sha256) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(root,path) DO UPDATE SET dev=excluded.dev,ino=excluded.ino,size=excluded.size,mtime_ns=excluded.mtime_ns,ctime_ns=excluded.ctime_ns,sha256=excluded.sha256',cache_updates)",
+    "   db.commit()",
+    " except (OSError,sqlite3.Error): pass",
+    " finally:",
+    "  try: db.close()",
+    "  except sqlite3.Error: pass",
+  ];
+}
+
 function batchFileHashScript() {
   return [
     "import hashlib,json,os,sys,time",
     "root=os.path.realpath(sys.argv[1]); quiet_s=float(sys.argv[2]); poll_s=float(sys.argv[3]); found={}; unstable=[]",
+    ...batchHashCacheHelpers(),
     ...hashQuiescenceHelpers(),
     "for raw in sys.stdin.buffer.read().split(b'\\0'):",
     " if not raw: continue",
@@ -1169,13 +1253,19 @@ function batchFileHashScript() {
     " if any(os.path.islink(os.path.join(root,*parts[:i])) for i in range(1,len(parts)+1)): raise ValueError('symlink batch path: '+rel)",
     " full=os.path.join(root,*parts)",
     " if os.path.commonpath((root,os.path.realpath(full)))!=root: raise ValueError('batch path outside project')",
-    " if not os.path.exists(full): found[rel]=None; continue",
-    " if not os.path.isfile(full): raise ValueError('batch path is not a file: '+rel)",
+    " if not os.path.lexists(full): found[rel]=None; continue",
+    " if os.path.islink(full) or not os.path.isfile(full): raise ValueError('batch path is not a file: '+rel)",
+    " stat=os.lstat(full)",
+    " cached=lookup_cached(rel,full,stat)",
+    " if cached is not None: found[rel]=cached[0]; continue",
     " hashed=stable_digest(full,time.monotonic()+quiet_s,poll_s)",
     " if hashed is None: unstable.append(rel)",
-    " else: found[rel]=hashed[0]",
+    " else:",
+    "  remember_hash(rel,hashed[2],hashed[0])",
+    "  found[rel]=hashed[0]",
+    "flush_hash_cache()",
     "if unstable: raise ValueError('file changed during batch sync: '+', '.join(unstable))",
-    "print(json.dumps(found,separators=(',',':')))",
+    "print(json.dumps({'files':found,'cacheHits':cache_hits,'cacheRehash':cache_rehash,'digestReads':hash_stats['digestReads'],'cacheQueries':cache_queries},separators=(',',':')))",
   ].join("\n");
 }
 
@@ -1195,25 +1285,52 @@ function scopeInventoryScript() {
     "  paths.extend(os.path.join(current,name) for name in files)",
     "elif os.path.isfile(target): paths=[target]",
     "found={}; unstable=[]",
+    ...batchHashCacheHelpers(),
     ...hashQuiescenceHelpers(),
     "for full in paths:",
     " relpath=os.path.relpath(full,root).replace(os.sep,'/')",
     " if os.path.islink(full) or not os.path.isfile(full): raise ValueError('unsafe file in Plan scope')",
+    " stat=os.lstat(full)",
+    " cached=lookup_cached(relpath,full,stat)",
+    " if cached is not None: found[relpath]={'sha256':cached[0],'size':cached[1]}; continue",
     " hashed=stable_digest(full,time.monotonic()+quiet_s,poll_s)",
     " if hashed is None: unstable.append(relpath)",
-    " else: found[relpath]={'sha256':hashed[0],'size':hashed[1]}",
+    " else:",
+    "  remember_hash(relpath,hashed[2],hashed[0])",
+    "  found[relpath]={'sha256':hashed[0],'size':hashed[1]}",
+    "flush_hash_cache()",
     "if unstable: raise ValueError('file changed during Plan sync: '+', '.join(unstable))",
-    "print(json.dumps({'files':found},separators=(',',':')))",
+    "print(json.dumps({'files':found,'cacheHits':cache_hits,'cacheRehash':cache_rehash,'digestReads':hash_stats['digestReads'],'cacheQueries':cache_queries},separators=(',',':')))",
   ].join("\n");
+}
+
+function batchHashPayload(parsed, expectedCount) {
+  const files = parsed && parsed.files && typeof parsed.files === "object" && !Array.isArray(parsed.files) ? parsed.files : null;
+  if (!files || Object.keys(files).length !== expectedCount) throw new Error("远端批量内容清单不完整。");
+  return {
+    files,
+    cacheHits: Number(parsed.cacheHits) || 0,
+    cacheRehash: Number(parsed.cacheRehash) || 0,
+    digestReads: Number(parsed.digestReads) || 0,
+    cacheQueries: Number(parsed.cacheQueries) || 0,
+  };
+}
+
+function scopeHashPayload(parsed) {
+  if (!parsed || !parsed.files || typeof parsed.files !== "object" || Array.isArray(parsed.files)) throw new Error("Plan 内容清单无效。");
+  return {
+    files: parsed.files,
+    cacheHits: Number(parsed.cacheHits) || 0,
+    cacheRehash: Number(parsed.cacheRehash) || 0,
+    digestReads: Number(parsed.digestReads) || 0,
+    cacheQueries: Number(parsed.cacheQueries) || 0,
+  };
 }
 
 async function inspectRemoteBatchFiles(target, paths, timeoutMs) {
   const script = batchFileHashScript();
   const stdout = await runRemoteBatchSsh(target, `python3 -c ${shellQuote(script)} ${shellQuote(target.remotePath)} ${BATCH_HASH_QUIET_SECONDS} ${BATCH_HASH_POLL_SECONDS}`, paths, timeoutMs);
-  const found = JSON.parse(stdout);
-  if (!found || typeof found !== "object" || Array.isArray(found) || Object.keys(found).length !== paths.length)
-    throw new Error("远端批量内容清单不完整。");
-  return found;
+  return batchHashPayload(JSON.parse(stdout), paths.length);
 }
 
 function batchDestinationGuardCommand(destination) {
@@ -1358,46 +1475,69 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
     progress.report({ increment: next - reportedPercent, message });
     reportedPercent = next;
   };
-  progress.report({ message: directory ? `比对目录 ${relativePath} 的来源和目标哈希…` : `比对 ${requested.length} 个文件的来源和目标哈希…` });
-  let sourceHashes;
-  let destinationHashes;
+  progress.report({ message: directory ? `清单：比对目录 ${relativePath} 的来源和目标哈希…` : `清单：比对 ${requested.length} 个文件的来源和目标哈希…` });
+  const inventoryStartedAt = Date.now();
+  let sourcePayload;
+  let destinationPayload;
   if (directory) {
-    [sourceHashes, destinationHashes] = await Promise.all([
+    [sourcePayload, destinationPayload] = await Promise.all([
       inspectRemoteScope(source, relativePath, true, timeoutMs, true),
       inspectRemoteScope(destination, relativePath, true, timeoutMs),
     ]);
-    const stale = Object.keys(destinationHashes).filter((name) => !sourceHashes[name]);
+    const stale = Object.keys(destinationPayload.files).filter((name) => !sourcePayload.files[name]);
     if (stale.length) throw new Error(`目标目录有 ${stale.length} 个旧文件，需要先通过双重确认清理：${stale.slice(0, 3).join("、")}`);
   } else {
-    [sourceHashes, destinationHashes] = await Promise.all([
+    [sourcePayload, destinationPayload] = await Promise.all([
       inspectRemoteBatchFiles(source, requested, timeoutMs),
       inspectRemoteBatchFiles(destination, requested, timeoutMs),
     ]);
-    if (requested.some((name) => !sourceHashes[name])) throw new Error("来源 Worker 缺少批量同步文件；同步保持待处理。");
+    if (requested.some((name) => !sourcePayload.files[name])) throw new Error("来源 Worker 缺少批量同步文件；同步保持待处理。");
   }
+  const sourceHashes = sourcePayload.files;
+  const destinationHashes = destinationPayload.files;
+  const inventoryMs = Math.max(0, Date.now() - inventoryStartedAt);
   const paths = directory ? Object.keys(sourceHashes).sort() : requested;
   const digest = (entry) => typeof entry === "string" ? entry : entry && entry.sha256;
   const changed = paths.filter((name) => digest(sourceHashes[name]) !== digest(destinationHashes[name]));
   const planned = partitionTransferPaths(changed);
   progress.report({ message: changed.length
-    ? `哈希比对完成；需无压缩打包传输 ${changed.length}/${paths.length} 个文件，共 ${planned.length} 组`
-    : `哈希比对完成；${paths.length} 个文件均无需传输，准备校验…` });
+    ? `清单完成（${inventoryMs} ms）；需无压缩流处理 ${changed.length}/${paths.length} 个文件，共 ${planned.length} 组`
+    : `清单完成（${inventoryMs} ms）；${paths.length} 个文件均无需传输，准备校验…` });
+  const streamStartedAt = Date.now();
   const partitions = await transferPartitionedTar(source, destination, changed, timeoutMs, (event) => {
     if (event.phase === "start") {
-      progress.report({ message: `正在无压缩打包并传输 第 ${event.index}/${event.total} 组（${event.groupFiles} 个文件）· 已完成 ${event.completed}/${event.total} 组` });
+      progress.report({ message: `正在流处理（打包、传输与解包）第 ${event.index}/${event.total} 组（${event.groupFiles} 个文件）· 已完成 ${event.completed}/${event.total} 组` });
       return;
     }
     const percent = event.totalFiles ? Math.floor(event.completedFiles * 90 / event.totalFiles) : 90;
-    advance(percent, `第 ${event.index}/${event.total} 组传输结束 · 已完成 ${event.completedFiles}/${event.totalFiles} 个文件`);
+    advance(percent, `第 ${event.index}/${event.total} 组流处理结束 · 已完成 ${event.completedFiles}/${event.totalFiles} 个文件`);
   });
-  advance(95, `打包传输阶段结束；正在校验目标 Worker 的 ${paths.length} 个文件…`);
-  const verified = directory
+  const streamMs = Math.max(0, Date.now() - streamStartedAt);
+  advance(95, `流处理结束（${streamMs} ms，含打包、传输与解包）；正在校验目标 Worker 的 ${paths.length} 个文件…`);
+  const verifyStartedAt = Date.now();
+  const verifiedPayload = directory
     ? await inspectRemoteScope(destination, relativePath, true, timeoutMs)
     : await inspectRemoteBatchFiles(destination, requested, timeoutMs);
+  const verified = verifiedPayload.files;
+  const verifyMs = Math.max(0, Date.now() - verifyStartedAt);
   if (paths.some((name) => digest(sourceHashes[name]) !== digest(verified[name]))) throw new Error("分批打包同步后 SHA256 不一致；同步保持待处理。");
-  advance(100, `完成：传输 ${changed.length}/${paths.length} 个文件，SHA256 校验通过`);
+  const hashCache = {
+    hits: sourcePayload.cacheHits + destinationPayload.cacheHits + verifiedPayload.cacheHits,
+    rehash: sourcePayload.cacheRehash + destinationPayload.cacheRehash + verifiedPayload.cacheRehash,
+    digestReads: sourcePayload.digestReads + destinationPayload.digestReads + verifiedPayload.digestReads,
+    cacheQueries: sourcePayload.cacheQueries + destinationPayload.cacheQueries + verifiedPayload.cacheQueries,
+  };
+  const timing = {
+    inventoryMs,
+    streamMs,
+    verifyMs,
+    totalMs: Math.max(0, Date.now() - inventoryStartedAt),
+    streamPhase: "pack+network+unpack",
+    hashCache,
+  };
+  advance(100, `完成：传输 ${changed.length}/${paths.length} 个文件，SHA256 校验通过 · 清单 ${timing.inventoryMs} ms · 流处理 ${timing.streamMs} ms · 校验 ${timing.verifyMs} ms`);
   return { ok: true, paths: paths.length, transferredFiles: changed.length, partitions,
-    verification: "sha256", transport: "partitioned-tar", directory, relativePath };
+    verification: "sha256", transport: "partitioned-tar", directory, relativePath, timing, hashCache };
 }
 
 async function syncFromRemoteCore(options = {}) {

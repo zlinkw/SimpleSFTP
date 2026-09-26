@@ -161,10 +161,13 @@ test("Worker sync notification names the task and falls back to exact file conte
   assert.doesNotMatch(hidden, /abc|secret$/);
   const source = fs.readFileSync(path.join(__dirname, "../extension.js"), "utf8");
   const body = source.slice(source.indexOf("async function syncServerToServerFpsyncCore("), source.indexOf("async function syncFromRemoteCore("));
-  assert.match(body, /比对.*哈希/);
-  assert.match(body, /正在无压缩打包并传输/);
+  assert.match(body, /清单：比对.*哈希/);
+  assert.match(body, /正在流处理（打包、传输与解包）/);
   assert.match(body, /校验目标 Worker/);
   assert.match(body, /SHA256 校验通过/);
+  assert.match(body, /清单 \$\{timing\.inventoryMs\} ms/);
+  assert.match(body, /流处理 \$\{timing\.streamMs\} ms/);
+  assert.match(body, /校验 \$\{timing\.verifyMs\} ms/);
   assert.doesNotMatch(body, /准备打包/);
 });
 
@@ -202,10 +205,16 @@ test("inventory keeps stable hashes when another file changes during hashing", (
       " def __getattr__(self,name):",
       "  if name=='st_ctime_ns': return self.value.st_ctime_ns+1",
       "  return getattr(self.value,name)",
+      "seen={}",
       "def changing_stat(file,*args,**kwargs):",
       " value=real_stat(file,*args,**kwargs)",
-      " return ChangedStat(value) if str(file).endswith('volatile.bin') and kwargs.get('follow_symlinks') is False else value",
+      " key=str(file)",
+      " if key.endswith('volatile.bin') and kwargs.get('follow_symlinks') is False:",
+      "  seen[key]=seen.get(key,0)+1",
+      "  if seen[key]==1: return ChangedStat(value)",
+      " return value",
       "os.stat=changing_stat",
+      "os.lstat=lambda file,*args,**kwargs: changing_stat(file,follow_symlinks=False)",
       "def no_cache(*args,**kwargs): raise sqlite3.OperationalError('test cache disabled')",
       "sqlite3.connect=no_cache",
     ].join("\n");
@@ -215,7 +224,7 @@ test("inventory keeps stable hashes when another file changes during hashing", (
     const run = spawnSync(python, [script, root, ".", "1"], { encoding: "utf8", timeout: 10000, windowsHide: true });
     assert.equal(run.status, 0, run.stderr);
     const result = JSON.parse(run.stdout);
-    assert.equal(result.files["steady.bin"].sha256.length, 64);
+    assert.equal(result.files["steady.bin"] && result.files["steady.bin"].sha256.length, 64, JSON.stringify(result));
     assert.equal(result.files["volatile.bin"], undefined);
     assert.match(result.unverifiedFiles["volatile.bin"], /变化/);
     const shallow = spawnSync(python, [script, root, ".", "0"], { encoding: "utf8", timeout: 10000, windowsHide: true });

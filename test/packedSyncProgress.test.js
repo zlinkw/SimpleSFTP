@@ -49,15 +49,15 @@ test("first packed group reports before the batch finishes and completion waits 
   installTransport(async (source, command, paths) => {
     if (/tar --null -T - -cf -/.test(command)) {
       tarCalls += 1;
-      if (!sawStartBeforeRelease) sawStartBeforeRelease = messages.some((message) => message.includes("正在无压缩打包并传输"));
+      if (!sawStartBeforeRelease) sawStartBeforeRelease = messages.some((message) => message.includes("正在流处理（打包、传输与解包）"));
       await tarGate;
       return "";
     }
     const requested = paths.filter(Boolean);
     if (source.host === "target-b" && !messages.some((message) => message.includes("正在校验目标 Worker"))) {
-      return JSON.stringify(Object.fromEntries(requested.map((name) => [name, sha256(`old-${name}`)])));
+      return JSON.stringify({ files: Object.fromEntries(requested.map((name) => [name, sha256(`old-${name}`)])), cacheHits: 0, cacheRehash: requested.length, digestReads: requested.length, cacheQueries: requested.length });
     }
-    return JSON.stringify(hashesFor(requested));
+    return JSON.stringify({ files: hashesFor(requested), cacheHits: 0, cacheRehash: requested.length, digestReads: requested.length, cacheQueries: requested.length });
   });
   const pending = __test.syncServerToServerFpsyncCore({
     source: endpoint("source-a"),
@@ -77,11 +77,15 @@ test("first packed group reports before the batch finishes and completion waits 
   assert.equal(result.ok, true);
   assert.equal(result.transferredFiles, 3);
   assert.equal(result.verification, "sha256");
-  assert.equal(messages.at(-1), "完成：传输 3/3 个文件，SHA256 校验通过");
+  assert.match(messages.at(-1), /^完成：传输 3\/3 个文件，SHA256 校验通过 · 清单 \d+ ms · 流处理 \d+ ms · 校验 \d+ ms$/);
+  assert.equal(result.timing.streamPhase, "pack+network+unpack");
+  assert.ok(result.timing.inventoryMs >= 0 && result.timing.streamMs >= 0 && result.timing.verifyMs >= 0);
+  assert.equal(messages.some((message) => message.includes("正在流处理（打包、传输与解包）")), true);
+  assert.equal(messages.some((message) => /流处理结束（\d+ ms，含打包、传输与解包）/.test(message)), true);
   const increments = reports.map((event) => event.increment || 0);
   assert.equal(increments.every((value) => value >= 0), true);
   assert.equal(increments.reduce((sum, value) => sum + value, 0), 100);
-  const startAt = messages.findIndex((message) => message.includes("正在无压缩打包并传输"));
+  const startAt = messages.findIndex((message) => message.includes("正在流处理（打包、传输与解包）"));
   const verifyAt = messages.findIndex((message) => message.includes("正在校验目标 Worker"));
   const doneAt = messages.findIndex((message) => message.startsWith("完成："));
   assert.ok(startAt >= 0 && startAt < verifyAt && verifyAt < doneAt);
@@ -156,7 +160,7 @@ test("verification mismatch and persistent checkpoint change do not report succe
     if (/tar --null/.test(command)) return "";
     const found = hashesFor(paths);
     if (messages.some((message) => message.includes("正在校验目标 Worker"))) found[names[0]] = sha256("other-version");
-    return JSON.stringify(found);
+    return JSON.stringify({ files: found, cacheHits: 0, cacheRehash: paths.length, digestReads: paths.length, cacheQueries: paths.length });
   });
   await assert.rejects(__test.syncServerToServerFpsyncCore({
     source: endpoint("source-a"),
@@ -187,7 +191,7 @@ test("verification mismatch and persistent checkpoint change do not report succe
     timeoutMs: 1000,
   }, { report: (event) => messages.push(event.message) }), (error) => error.exitCode === 1 && /file changed during batch sync/.test(error.message) && /内容清单/.test(error.message));
   assert.equal(messages.some((message) => message.startsWith("完成：")), false);
-  assert.equal(messages.some((message) => message.includes("正在无压缩打包并传输")), false);
+  assert.equal(messages.some((message) => message.includes("正在流处理（打包、传输与解包）")), false);
 });
 
 test("nonzero pack exit keeps the stage, stderr, and exit code", async () => {
@@ -225,14 +229,18 @@ test("nonzero pack exit keeps the stage, stderr, and exit code", async () => {
   }
 });
 
-function probeHash(mode, script, args, stdin = "") {
+function probeHash(mode, script, args, stdin = "", cacheDir) {
   const python = process.platform === "win32" ? "python" : "python3";
   const run = spawnSync(python, [path.join(__dirname, "hash_probe.py"), mode, ...args], {
     input: script,
     encoding: "utf8",
     timeout: 10000,
     windowsHide: true,
-    env: { ...process.env, SIMPLE_SFTP_HASH_STDIN: stdin },
+    env: {
+      ...process.env,
+      SIMPLE_SFTP_HASH_STDIN: stdin,
+      SIMPLE_SFTP_HASH_CACHE_DIR: cacheDir || path.join(fs.mkdtempSync(path.join(require("node:os").tmpdir(), "simple-sftp-probe-")), "empty-cache"),
+    },
   });
   assert.equal(run.status, 0, `${run.stderr}\n${run.stdout}`);
   return run;
@@ -243,10 +251,10 @@ test("stable files hash without a per-file sleep and a changing file stays bound
   const names = ["package.json", "readme.md"];
   const expected = Object.fromEntries(names.map((name) => [name, sha256(fs.readFileSync(path.join(root, name)))]));
   const stable = probeHash("stable", __test.batchFileHashScript(), [root, "2", "0.01"], `${names.join("\n")}\n`);
-  assert.deepEqual(JSON.parse(stable.stdout), expected);
+  assert.deepEqual(JSON.parse(stable.stdout).files, expected);
   assert.match(stable.stderr, /sleeps=0/);
   const raced = probeHash("race-read", __test.batchFileHashScript(), [root, "2", "0.01"], "package.json\n");
-  assert.equal(JSON.parse(raced.stdout)["package.json"], expected["package.json"]);
+  assert.equal(JSON.parse(raced.stdout).files["package.json"], expected["package.json"]);
   assert.match(raced.stderr, /sleeps=[1-9]/);
   const changing = probeHash("changing-stat", __test.batchFileHashScript(), [root, "0.05", "0.01"], "package.json\n");
   assert.match(changing.stdout, /rejected ValueError: file changed during batch sync: package\.json/);
