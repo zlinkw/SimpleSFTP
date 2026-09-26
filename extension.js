@@ -845,34 +845,12 @@ async function syncServerToServer(options = {}) {
   return { ...packed, source, destination, relativePath, directory: options.directory === true, deletedStale: false };
 }
 
+const BATCH_HASH_QUIET_SECONDS = 15;
+const BATCH_HASH_POLL_SECONDS = 0.25;
+
 async function inspectRemoteScope(target, relativePath, directory, timeoutMs, required = false) {
-  const script = [
-    "import hashlib,json,os,sys",
-    "root=os.path.realpath(sys.argv[1]); rel=sys.argv[2]; directory=sys.argv[3]=='1'; required=sys.argv[4]=='1'",
-    "parts=rel.split('/'); target=os.path.join(root,*parts)",
-    "if any(p in ('','.','..') for p in parts): raise ValueError('unsafe scope')",
-    "if any(os.path.islink(os.path.join(root,*parts[:i])) for i in range(1,len(parts)+1)): raise ValueError('symlink scope')",
-    "if os.path.commonpath((root,os.path.realpath(target)))!=root: raise ValueError('scope outside project')",
-    "if directory and required and not os.path.isdir(target): raise ValueError('Plan directory missing: '+rel)",
-    "paths=[]",
-    "if directory and os.path.isdir(target):",
-    " for current,dirs,files in os.walk(target,followlinks=False):",
-    "  if any(os.path.islink(os.path.join(current,d)) for d in dirs): raise ValueError('symlink directory in Plan scope')",
-    "  paths.extend(os.path.join(current,name) for name in files)",
-    "elif os.path.isfile(target): paths=[target]",
-    "found={}",
-    "for full in paths:",
-    " if os.path.islink(full) or not os.path.isfile(full): raise ValueError('unsafe file in Plan scope')",
-    " h=hashlib.sha256()",
-    " with open(full,'rb') as stream:",
-    "  before=os.fstat(stream.fileno())",
-    "  for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk)",
-    "  after=os.fstat(stream.fileno())",
-    " if before.st_size!=after.st_size or before.st_mtime_ns!=after.st_mtime_ns: raise ValueError('file changed during Plan sync')",
-    " found[os.path.relpath(full,root).replace(os.sep,'/')]={'sha256':h.hexdigest(),'size':after.st_size}",
-    "print(json.dumps({'files':found},separators=(',',':')))",
-  ].join("\n");
-  const stdout = await runSsh(target, `python3 -c ${shellQuote(script)} ${shellQuote(target.remotePath)} ${shellQuote(relativePath)} ${directory ? "1" : "0"} ${required ? "1" : "0"}`, timeoutMs);
+  const script = scopeInventoryScript();
+  const stdout = await runSsh(target, `python3 -c ${shellQuote(script)} ${shellQuote(target.remotePath)} ${shellQuote(relativePath)} ${directory ? "1" : "0"} ${required ? "1" : "0"} ${BATCH_HASH_QUIET_SECONDS} ${BATCH_HASH_POLL_SECONDS}`, timeoutMs);
   const result = JSON.parse(stdout);
   if (!result.files || typeof result.files !== "object" || Array.isArray(result.files)) throw new Error("Plan 内容清单无效。");
   return result.files;
@@ -1115,7 +1093,21 @@ async function projectTree(options = {}) {
   return { ok: true, relativePath, entries: entries.filter((entry) => projectTreePathAllowed(entry.path)).sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name)) };
 }
 
+function remoteBatchStage(command) {
+  const text = String(command || "");
+  if (/tar --null -T - -cf -/.test(text)) return "无压缩打包传输";
+  if (/hashlib|sha256|inspect/.test(text) || /python3 -c/.test(text)) return "内容清单";
+  return "远端命令";
+}
+
+let remoteBatchTransport = null;
+function setRemoteBatchTransport(fn) {
+  remoteBatchTransport = typeof fn === "function" ? fn : null;
+}
+
 function runRemoteBatchSsh(source, command, paths, timeoutMs) {
+  if (remoteBatchTransport) return Promise.resolve().then(() => remoteBatchTransport(source, command, paths, timeoutMs));
+  const stage = remoteBatchStage(command);
   return new Promise((resolve, reject) => {
     const child = spawn("ssh", ["-A", "-o", "BatchMode=yes", ...getSshArgs(source, command)], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
@@ -1127,7 +1119,7 @@ function runRemoteBatchSsh(source, command, paths, timeoutMs) {
       clearTimeout(timer);
       if (error) reject(error); else resolve(value);
     };
-    const timer = timeoutMs > 0 ? setTimeout(() => { child.kill(); finish(new Error("跨 Worker 批量同步超时。")); }, timeoutMs) : null;
+    const timer = timeoutMs > 0 ? setTimeout(() => { child.kill(); finish(new Error(`跨 Worker ${stage}超时。`)); }, timeoutMs) : null;
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
       if (stdout.length > 4 * 1024 * 1024) { child.kill(); finish(new Error("远端批量清单超过 4 MB。")); }
@@ -1136,16 +1128,40 @@ function runRemoteBatchSsh(source, command, paths, timeoutMs) {
     child.on("error", (error) => finish(error));
     child.on("close", (code) => code === 0
       ? finish(null, stdout.trim())
-      : finish(new Error(`跨 Worker rsync 失败（${code}）：${stderr.trim() || stdout.trim() || "SSH 或 rsync 不可用"}`)));
+      : finish(Object.assign(new Error(`跨 Worker ${stage}失败（退出码 ${code}）：${stderr.trim() || stdout.trim() || "SSH 不可用"}`), { exitCode: code, stage, stderr: stderr.trim() })));
     child.stdin.on("error", () => {});
     child.stdin.end(Buffer.from(paths.map((name) => `${name}\0`).join(""), "utf8"));
   });
 }
 
-async function inspectRemoteBatchFiles(target, paths, timeoutMs) {
-  const script = [
-    "import hashlib,json,os,sys",
-    "root=os.path.realpath(sys.argv[1]); found={}",
+function hashQuiescenceHelpers() {
+  return [
+    "def identity(st): return (st.st_size,st.st_mtime_ns)",
+    "def hash_current(full):",
+    " before=os.stat(full,follow_symlinks=False)",
+    " with open(full,'rb') as stream:",
+    "  opened=os.fstat(stream.fileno()); h=hashlib.sha256()",
+    "  for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk)",
+    "  closed=os.fstat(stream.fileno())",
+    " if identity(before)!=identity(opened) or identity(opened)!=identity(closed): return None",
+    " return h.hexdigest(),closed.st_size",
+    "def stable_digest(full,deadline,poll):",
+    " delay=0",
+    " while True:",
+    "  hashed=hash_current(full)",
+    "  if hashed is not None: return hashed",
+    "  now=time.monotonic()",
+    "  if now>=deadline: return None",
+    "  delay=poll if delay==0 else min(delay*2,1)",
+    "  time.sleep(min(delay,max(0,deadline-now)))",
+  ];
+}
+
+function batchFileHashScript() {
+  return [
+    "import hashlib,json,os,sys,time",
+    "root=os.path.realpath(sys.argv[1]); quiet_s=float(sys.argv[2]); poll_s=float(sys.argv[3]); found={}; unstable=[]",
+    ...hashQuiescenceHelpers(),
     "for raw in sys.stdin.buffer.read().split(b'\\0'):",
     " if not raw: continue",
     " rel=raw.decode('utf-8'); parts=rel.split('/')",
@@ -1155,15 +1171,45 @@ async function inspectRemoteBatchFiles(target, paths, timeoutMs) {
     " if os.path.commonpath((root,os.path.realpath(full)))!=root: raise ValueError('batch path outside project')",
     " if not os.path.exists(full): found[rel]=None; continue",
     " if not os.path.isfile(full): raise ValueError('batch path is not a file: '+rel)",
-    " with open(full,'rb') as stream:",
-    "  before=os.fstat(stream.fileno()); h=hashlib.sha256()",
-    "  for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk)",
-    "  after=os.fstat(stream.fileno())",
-    " if before.st_size!=after.st_size or before.st_mtime_ns!=after.st_mtime_ns: raise ValueError('file changed during batch sync: '+rel)",
-    " found[rel]=h.hexdigest()",
+    " hashed=stable_digest(full,time.monotonic()+quiet_s,poll_s)",
+    " if hashed is None: unstable.append(rel)",
+    " else: found[rel]=hashed[0]",
+    "if unstable: raise ValueError('file changed during batch sync: '+', '.join(unstable))",
     "print(json.dumps(found,separators=(',',':')))",
   ].join("\n");
-  const stdout = await runRemoteBatchSsh(target, `python3 -c ${shellQuote(script)} ${shellQuote(target.remotePath)}`, paths, timeoutMs);
+}
+
+function scopeInventoryScript() {
+  return [
+    "import hashlib,json,os,sys,time",
+    "root=os.path.realpath(sys.argv[1]); rel=sys.argv[2]; directory=sys.argv[3]=='1'; required=sys.argv[4]=='1'; quiet_s=float(sys.argv[5]); poll_s=float(sys.argv[6])",
+    "parts=rel.split('/'); target=os.path.join(root,*parts)",
+    "if any(p in ('','.','..') for p in parts): raise ValueError('unsafe scope')",
+    "if any(os.path.islink(os.path.join(root,*parts[:i])) for i in range(1,len(parts)+1)): raise ValueError('symlink scope')",
+    "if os.path.commonpath((root,os.path.realpath(target)))!=root: raise ValueError('scope outside project')",
+    "if directory and required and not os.path.isdir(target): raise ValueError('Plan directory missing: '+rel)",
+    "paths=[]",
+    "if directory and os.path.isdir(target):",
+    " for current,dirs,files in os.walk(target,followlinks=False):",
+    "  if any(os.path.islink(os.path.join(current,d)) for d in dirs): raise ValueError('symlink directory in Plan scope')",
+    "  paths.extend(os.path.join(current,name) for name in files)",
+    "elif os.path.isfile(target): paths=[target]",
+    "found={}; unstable=[]",
+    ...hashQuiescenceHelpers(),
+    "for full in paths:",
+    " relpath=os.path.relpath(full,root).replace(os.sep,'/')",
+    " if os.path.islink(full) or not os.path.isfile(full): raise ValueError('unsafe file in Plan scope')",
+    " hashed=stable_digest(full,time.monotonic()+quiet_s,poll_s)",
+    " if hashed is None: unstable.append(relpath)",
+    " else: found[relpath]={'sha256':hashed[0],'size':hashed[1]}",
+    "if unstable: raise ValueError('file changed during Plan sync: '+', '.join(unstable))",
+    "print(json.dumps({'files':found},separators=(',',':')))",
+  ].join("\n");
+}
+
+async function inspectRemoteBatchFiles(target, paths, timeoutMs) {
+  const script = batchFileHashScript();
+  const stdout = await runRemoteBatchSsh(target, `python3 -c ${shellQuote(script)} ${shellQuote(target.remotePath)} ${BATCH_HASH_QUIET_SECONDS} ${BATCH_HASH_POLL_SECONDS}`, paths, timeoutMs);
   const found = JSON.parse(stdout);
   if (!found || typeof found !== "object" || Array.isArray(found) || Object.keys(found).length !== paths.length)
     throw new Error("远端批量内容清单不完整。");
@@ -1190,11 +1236,16 @@ async function syncServerToServerBatch(options = {}) {
   return syncServerToServerFpsync({ ...options, source, destination, relativePaths: paths, confirm: true, pathConfirmed: true });
 }
 
-function partitionTransferPaths(paths, maxFiles = 1000) {
+function partitionTransferPaths(paths, singleStreamFiles = 80, parallelSlots = 4) {
+  const list = Array.isArray(paths) ? paths : [];
+  const cap = Math.max(1, singleStreamFiles);
+  const slots = Math.max(1, parallelSlots);
+  if (!list.length) return [];
+  if (list.length <= cap) return [list.slice()];
+  const width = Math.min(slots, list.length);
+  const span = Math.ceil(list.length / width);
   const groups = [];
-  for (let offset = 0; offset < paths.length; offset += maxFiles) {
-    groups.push(paths.slice(offset, offset + maxFiles));
-  }
+  for (let offset = 0; offset < list.length; offset += span) groups.push(list.slice(offset, offset + span));
   return groups;
 }
 
@@ -1207,28 +1258,62 @@ function directTarBatchCommand(source, destination) {
 }
 
 async function transferPartitionedTar(source, destination, paths, timeoutMs, onPartition) {
-  // fpsync-style bounded partitions, with tar as the copy tool. No remote
-  // installation or staging directory is needed for an explicit hash delta.
+  // One uncompressed tar stream for a small batch. Larger batches use at most
+  // four live streams. A failure stops new groups and waits for live ones.
   const groups = partitionTransferPaths(paths);
   let next = 0;
   let completed = 0;
   let completedFiles = 0;
+  let failed = false;
+  let failure = null;
   const directCommand = directTarBatchCommand(source, destination);
+  const report = (phase, index, group) => {
+    if (failed || !onPartition) return;
+    onPartition({ phase, index, groupFiles: group.length, completed, total: groups.length, completedFiles, totalFiles: paths.length });
+  };
+  const noteFailure = (error) => {
+    failed = true;
+    if (!failure) failure = error;
+  };
   const workers = Array.from({ length: Math.min(4, groups.length) }, async () => {
-    while (next < groups.length) {
-      const group = groups[next++];
-      try {
-        await runRemoteBatchSsh(source, directCommand, group, timeoutMs);
-      } catch (error) {
-        if (!/host key verification failed|no .* host key|permission denied|connection timed out|connect to host|network is unreachable|could not resolve hostname|connection refused/i.test(formatError(error))) throw error;
-        await relayTarFiles(source, destination, group, timeoutMs);
+    try {
+      while (next < groups.length) {
+        if (failed) return;
+        const index = next;
+        const group = groups[next++];
+        if (!group || failed) return;
+        report("start", index + 1, group);
+        await Promise.resolve();
+        if (failed) return;
+        try {
+          await runRemoteBatchSsh(source, directCommand, group, timeoutMs);
+        } catch (error) {
+          const retryable = /host key verification failed|no .* host key|permission denied|connection timed out|connect to host|network is unreachable|could not resolve hostname|connection refused/i.test(formatError(error));
+          if (!retryable) {
+            noteFailure(error);
+            return;
+          }
+          try {
+            await relayTarFiles(source, destination, group, timeoutMs);
+          } catch (relayError) {
+            noteFailure(relayError);
+            return;
+          }
+        }
+        if (failed) return;
+        completed += 1;
+        completedFiles += group.length;
+        report("done", index + 1, group);
       }
-      completed += 1;
-      completedFiles += group.length;
-      if (onPartition) onPartition(completed, groups.length, completedFiles, paths.length);
+    } catch (error) {
+      noteFailure(error);
+      throw error;
     }
   });
-  await Promise.all(workers);
+  const settled = await Promise.allSettled(workers);
+  const rejected = settled.find((item) => item.status === "rejected");
+  if (failure) throw failure;
+  if (rejected) throw rejected.reason;
   return groups.length;
 }
 
@@ -1267,6 +1352,12 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
     source, destination, relativePath, relativePaths: requested, directory,
   });
   const timeoutMs = transferTimeoutMs(source, options);
+  let reportedPercent = 0;
+  const advance = (percent, message) => {
+    const next = Math.max(reportedPercent, Math.min(100, percent));
+    progress.report({ increment: next - reportedPercent, message });
+    reportedPercent = next;
+  };
   progress.report({ message: directory ? `比对目录 ${relativePath} 的来源和目标哈希…` : `比对 ${requested.length} 个文件的来源和目标哈希…` });
   let sourceHashes;
   let destinationHashes;
@@ -1287,19 +1378,24 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   const paths = directory ? Object.keys(sourceHashes).sort() : requested;
   const digest = (entry) => typeof entry === "string" ? entry : entry && entry.sha256;
   const changed = paths.filter((name) => digest(sourceHashes[name]) !== digest(destinationHashes[name]));
-  let reportedPercent = 0;
-  progress.report({ message: changed.length ? `哈希比对完成；需传输 ${changed.length}/${paths.length} 个文件，准备打包…` : `哈希比对完成；${paths.length} 个文件均无需传输，准备校验…` });
-  const partitions = await transferPartitionedTar(source, destination, changed, timeoutMs, (completed, total, completedFiles, totalFiles) => {
-    const percent = Math.min(95, Math.floor(completedFiles * 95 / totalFiles));
-    progress.report({ increment: percent - reportedPercent, message: `传输 ${completedFiles}/${totalFiles} 个文件 · 分包 ${completed}/${total} · ${percent}%` });
-    reportedPercent = percent;
+  const planned = partitionTransferPaths(changed);
+  progress.report({ message: changed.length
+    ? `哈希比对完成；需无压缩打包传输 ${changed.length}/${paths.length} 个文件，共 ${planned.length} 组`
+    : `哈希比对完成；${paths.length} 个文件均无需传输，准备校验…` });
+  const partitions = await transferPartitionedTar(source, destination, changed, timeoutMs, (event) => {
+    if (event.phase === "start") {
+      progress.report({ message: `正在无压缩打包并传输 第 ${event.index}/${event.total} 组（${event.groupFiles} 个文件）· 已完成 ${event.completed}/${event.total} 组` });
+      return;
+    }
+    const percent = event.totalFiles ? Math.floor(event.completedFiles * 90 / event.totalFiles) : 90;
+    advance(percent, `第 ${event.index}/${event.total} 组传输结束 · 已完成 ${event.completedFiles}/${event.totalFiles} 个文件`);
   });
-  progress.report({ message: `传输完成；校验目标 Worker 的 ${paths.length} 个文件…` });
+  advance(95, `打包传输阶段结束；正在校验目标 Worker 的 ${paths.length} 个文件…`);
   const verified = directory
     ? await inspectRemoteScope(destination, relativePath, true, timeoutMs)
     : await inspectRemoteBatchFiles(destination, requested, timeoutMs);
   if (paths.some((name) => digest(sourceHashes[name]) !== digest(verified[name]))) throw new Error("分批打包同步后 SHA256 不一致；同步保持待处理。");
-  progress.report({ increment: 100 - reportedPercent, message: `完成：传输 ${changed.length}/${paths.length} 个文件，SHA256 校验通过` });
+  advance(100, `完成：传输 ${changed.length}/${paths.length} 个文件，SHA256 校验通过`);
   return { ok: true, paths: paths.length, transferredFiles: changed.length, partitions,
     verification: "sha256", transport: "partitioned-tar", directory, relativePath };
 }
@@ -4368,6 +4464,12 @@ module.exports = {
     batchDestinationGuardCommand,
     directTarBatchCommand,
     partitionTransferPaths,
+    transferPartitionedTar,
+    syncServerToServerFpsyncCore,
+    setRemoteBatchTransport,
+    batchFileHashScript,
+    scopeInventoryScript,
+    remoteBatchStage,
     fpsyncProgressTitle,
     planLogPathsFromState,
     projectInventoryScript,

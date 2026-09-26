@@ -115,8 +115,16 @@ test("project batch transfer validates exact paths and requires confirmation", a
 });
 
 test("partitioned packed transfer groups small files and blocks unconfirmed writes", async () => {
-  const groups = __test.partitionTransferPaths(Array.from({ length: 2001 }, (_, i) => `runs/${i}.log`));
-  assert.deepEqual(groups.map((group) => group.length), [1000, 1000, 1]);
+  const one = __test.partitionTransferPaths(["runs/1.log"]);
+  const thirtyThree = __test.partitionTransferPaths(Array.from({ length: 33 }, (_, i) => `runs/${i}.log`));
+  const threeFiftyFive = __test.partitionTransferPaths(Array.from({ length: 355 }, (_, i) => `runs/${i}.log`));
+  const twoThousand = __test.partitionTransferPaths(Array.from({ length: 2001 }, (_, i) => `runs/${i}.log`));
+  assert.deepEqual(one.map((group) => group.length), [1]);
+  assert.deepEqual(thirtyThree.map((group) => group.length), [33]);
+  assert.deepEqual(threeFiftyFive.map((group) => group.length), [89, 89, 89, 88]);
+  assert.deepEqual(twoThousand.map((group) => group.length), [501, 501, 501, 498]);
+  assert.equal(twoThousand.reduce((sum, group) => sum + group.length, 0), 2001);
+  assert.equal(twoThousand.some((group) => !group.length), false);
   const direct = __test.directTarBatchCommand(
     __test.directSyncTarget({ host: "source", user: "research", remotePath: "/projects/demo" }, "来源"),
     __test.directSyncTarget({ host: "target", user: "research", remotePath: "/projects/demo" }, "目标"),
@@ -154,9 +162,10 @@ test("Worker sync notification names the task and falls back to exact file conte
   const source = fs.readFileSync(path.join(__dirname, "../extension.js"), "utf8");
   const body = source.slice(source.indexOf("async function syncServerToServerFpsyncCore("), source.indexOf("async function syncFromRemoteCore("));
   assert.match(body, /比对.*哈希/);
-  assert.match(body, /传输.*文件.*分包/);
+  assert.match(body, /正在无压缩打包并传输/);
   assert.match(body, /校验目标 Worker/);
   assert.match(body, /SHA256 校验通过/);
+  assert.doesNotMatch(body, /准备打包/);
 });
 
 test("Worker scope tree lists every file type while excluding machine state", () => {
