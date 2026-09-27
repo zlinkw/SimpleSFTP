@@ -1,0 +1,474 @@
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const Module = require("node:module");
+const os = require("node:os");
+const path = require("node:path");
+const test = require("node:test");
+const { Readable } = require("node:stream");
+
+const originalLoad = Module._load;
+Module._load = function (request, ...args) {
+  return request === "vscode" ? {
+    TreeItem: class {},
+    ProgressLocation: { Notification: 1 },
+    window: {
+      withProgress: (_options, operation) => operation({ report: () => undefined }),
+      showErrorMessage: () => undefined,
+    },
+    workspace: {
+      workspaceFolders: [],
+      getConfiguration: () => ({ get: (_key, fallback) => fallback }),
+    },
+  } : originalLoad.call(this, request, ...args);
+};
+const { __test } = require("../extension.js");
+Module._load = originalLoad;
+
+const BLOCK = 512;
+
+function keep(dir) {
+  fs.writeFileSync(path.join(dir, "KEEP.txt"), "mapped-batch-download fixture; left in place\n");
+}
+
+function tarHeader(name, size) {
+  const header = Buffer.alloc(BLOCK, 0);
+  header.write(name, 0, "utf8");
+  header.write(size.toString(8).padStart(11, "0") + "\0", 124, "ascii");
+  header.write("        ", 148, "ascii");
+  header.write("0", 156, "ascii");
+  header.write("ustar\0", 257, "ascii");
+  header.write("00", 263, "ascii");
+  const sum = header.reduce((total, value) => total + value, 0);
+  header.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, "ascii");
+  return header;
+}
+
+function fakeSsh(chunks, exitCode, { holdClose = false, stderr = "", onSpawn } = {}) {
+  const { PassThrough } = require("node:stream");
+  const stdout = new PassThrough();
+  const stderrStream = new PassThrough();
+  const handlers = {};
+  const proc = {
+    stdout,
+    stderr: stderrStream,
+    killed: false,
+    kill() { this.killed = true; },
+    on(event, listener) { handlers[event] = listener; return this; },
+  };
+  queueMicrotask(() => {
+    if (onSpawn) onSpawn(proc);
+    for (const chunk of chunks) stdout.write(chunk);
+    stdout.end();
+    if (stderr) stderrStream.write(stderr);
+    const close = () => { if (handlers.close) handlers.close(exitCode, null); };
+    if (!holdClose) setImmediate(close);
+  });
+  proc.emitClose = (code) => { if (handlers.close) handlers.close(code, null); };
+  return proc;
+}
+
+function tarStream(files) {
+  const parts = [];
+  for (const file of files) {
+    const body = Buffer.from(file.body);
+    parts.push(tarHeader(file.name, body.length));
+    parts.push(body);
+    const padding = (BLOCK - (body.length % BLOCK)) % BLOCK;
+    if (padding) parts.push(Buffer.alloc(padding));
+  }
+  parts.push(Buffer.alloc(BLOCK * 2));
+  return Readable.from(parts);
+}
+
+function server() {
+  return { id: "worker-a", host: "worker-a", user: "research", remotePath: "/projects/demo", port: 22 };
+}
+
+function baseParams(root, entries, extra = {}) {
+  return {
+    localPath: root,
+    server: server(),
+    entries,
+    confirm: true,
+    pathConfirmed: true,
+    timeoutMs: 1000,
+    ...extra,
+  };
+}
+
+test.afterEach(() => {
+  __test.setMappedDownloadTransport(null);
+});
+
+test("mapped download writes distinct local paths from one tar stream", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-"));
+  keep(root);
+  let calls = 0;
+  __test.setMappedDownloadTransport((request) => {
+    calls += 1;
+    assert.equal(request.entries.length, 3);
+    assert.deepEqual(request.entries.map((entry) => entry.archiveName), ["mapped/0", "mapped/1", "mapped/2"]);
+    assert.match(request.remoteCommand, /python3 -c/);
+    assert.match(request.remoteCommand, /tarfile\.open/);
+    assert.match(request.remoteCommand, /GNU_FORMAT/);
+    assert.doesNotMatch(request.remoteCommand, /-czf|mode='w:gz'/);
+    return tarStream([
+      { name: "mapped/0", body: "alpha" },
+      { name: "mapped/1", body: "beta-file" },
+      { name: "mapped/2", body: "gamma" },
+    ]);
+  });
+  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  const result = await method(baseParams(root, [
+    { remotePath: "simple_cluster/results/run-a/metrics.csv", localRelativePath: "experiments/results/formal/run-a.csv" },
+    { remotePath: "simple_cluster/results/run-b/summary.json", localRelativePath: "experiments/results/formal/nested/run-b.json" },
+    { remotePath: "work_dirs/other/log.txt", localRelativePath: "notes/other.txt" },
+  ]));
+  assert.equal(calls, 1);
+  assert.equal(result.ok, true);
+  assert.equal(result.fileCount, 3);
+  assert.equal(result.streamCount, 1);
+  assert.equal(result.sshCount, 1);
+  assert.equal(result.byteCount, "alpha".length + "beta-file".length + "gamma".length);
+  assert.equal(fs.readFileSync(path.join(root, "experiments", "results", "formal", "run-a.csv"), "utf8"), "alpha");
+  assert.equal(fs.readFileSync(path.join(root, "experiments", "results", "formal", "nested", "run-b.json"), "utf8"), "beta-file");
+  assert.equal(fs.readFileSync(path.join(root, "notes", "other.txt"), "utf8"), "gamma");
+  assert.equal(result.entries[0].remotePath.includes("run-a"), true);
+  assert.equal(result.entries[0].localRelativePath.includes("run-a.csv"), true);
+});
+
+test("mapped download rejects unsafe entries before opening a stream", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-reject-"));
+  keep(root);
+  let calls = 0;
+  __test.setMappedDownloadTransport(() => { calls += 1; return tarStream([]); });
+  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  const good = { remotePath: "results/a.csv", localRelativePath: "out/a.csv" };
+  await assert.rejects(method(baseParams(root, [{ remotePath: "/etc/passwd", localRelativePath: "out/a.csv" }])), /相对文件路径/);
+  await assert.rejects(method(baseParams(root, [{ remotePath: "results/../secret.csv", localRelativePath: "out/a.csv" }])), /越界/);
+  await assert.rejects(method(baseParams(root, [good, { remotePath: "results/b.csv", localRelativePath: "out/A.csv" }])), /本机路径重复/);
+  await assert.rejects(method(baseParams(root, [{ remotePath: "weights/model.pt", localRelativePath: "out/model.pt" }], { metricsOnly: true })), /权重/);
+  await assert.rejects(method(baseParams(root, [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv", bytes: 999 }], { maxFileBytes: 10 })), /单文件上限/);
+  await assert.rejects(method({ ...baseParams(root, [good]), confirm: false }), (error) => error.apiCode === 2001);
+  assert.equal(calls, 0);
+});
+
+test("mapped download blocks an existing symlink before any write", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-link-"));
+  keep(root);
+  const outside = path.join(path.dirname(root), `outside-dir-${path.basename(root)}`);
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(outside, "a.csv"), "untouched");
+  fs.symlinkSync(outside, path.join(root, "out"), "junction");
+  let calls = 0;
+  __test.setMappedDownloadTransport(() => { calls += 1; return tarStream([{ name: "mapped/0", body: "nope" }]); });
+  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  await assert.rejects(method(baseParams(root, [
+    { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
+  ], { overwrite: true })), /符号链接/);
+  assert.equal(calls, 0);
+  assert.equal(fs.readFileSync(path.join(outside, "a.csv"), "utf8"), "untouched");
+});
+
+test("mapped download refuses an untrusted tar path and does not create it", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-tar-"));
+  keep(root);
+  __test.setMappedDownloadTransport(() => tarStream([
+    { name: "results/a.csv", body: "escaped" },
+  ]));
+  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  await assert.rejects(method(baseParams(root, [
+    { remotePath: "results/a.csv", localRelativePath: "safe/a.csv" },
+  ])), /映射校验/);
+  assert.equal(fs.existsSync(path.join(root, "results", "a.csv")), false);
+  assert.equal(fs.existsSync(path.join(root, "safe", "a.csv")), false);
+});
+
+test("mapped download reports a truncated stream without claiming completion", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-fail-"));
+  keep(root);
+  __test.setMappedDownloadTransport(() => tarStream([
+    { name: "mapped/0", body: "only-one" },
+  ]));
+  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  const error = await method(baseParams(root, [
+    { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
+    { remotePath: "results/b.csv", localRelativePath: "out/b.csv" },
+  ])).then(() => { throw new Error("expected rejection"); }, (value) => value);
+  assert.match(String(error.message), /阶段：解包/);
+  assert.equal(error.ok, undefined);
+  assert.equal(fs.readFileSync(path.join(root, "out", "a.csv"), "utf8"), "only-one");
+  assert.equal(fs.existsSync(path.join(root, "out", "b.csv")), false);
+});
+
+test("mapped download cancel stops before claiming the batch finished", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-cancel-"));
+  keep(root);
+  const token = {
+    isCancellationRequested: false,
+    onCancellationRequested(listener) { this.listener = listener; },
+  };
+  __test.setMappedDownloadTransport(() => {
+    token.isCancellationRequested = true;
+    if (token.listener) token.listener();
+    return tarStream([
+      { name: "mapped/0", body: "first" },
+      { name: "mapped/1", body: "second" },
+    ]);
+  });
+  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  await assert.rejects(method(baseParams(root, [
+    { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
+    { remotePath: "results/b.csv", localRelativePath: "out/b.csv" },
+  ], { token })), /取消/);
+});
+
+test("mapped download overwrites an existing regular file only after overwrite is set", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-overwrite-"));
+  keep(root);
+  fs.mkdirSync(path.join(root, "out"));
+  fs.writeFileSync(path.join(root, "out", "a.csv"), "old");
+  __test.setMappedDownloadTransport(() => tarStream([{ name: "mapped/0", body: "new" }]));
+  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  const entries = [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv" }];
+  await assert.rejects(method(baseParams(root, entries)), /未确认覆盖/);
+  assert.equal(fs.readFileSync(path.join(root, "out", "a.csv"), "utf8"), "old");
+  const result = await method(baseParams(root, entries, { overwrite: true }));
+  assert.equal(result.fileCount, 1);
+  assert.equal(fs.readFileSync(path.join(root, "out", "a.csv"), "utf8"), "new");
+});
+
+test("interrupted SSH stream settles while the reader is waiting for bytes", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-hang-"));
+  keep(root);
+  fs.mkdirSync(path.join(root, "out"));
+  fs.writeFileSync(path.join(root, "out", "a.csv"), "last-good");
+  const header = tarHeader("mapped/0", 8);
+  const { PassThrough } = require("node:stream");
+  const stdout = new PassThrough();
+  const plan = __test.normalizeMappedDownloadEntries({
+    entries: [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv" }],
+  });
+  const sftp = { host: "worker-a", username: "research", remotePath: "/projects/demo", port: 22 };
+  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  __test.setMappedDownloadTransport(() => __test.openMappedDownloadStream({
+    sftp,
+    plan,
+    localPath: root,
+    timeoutMs: 5000,
+    spawnImpl: () => {
+      const handlers = {};
+      queueMicrotask(() => {
+        stdout.write(header);
+        setTimeout(() => { if (handlers.close) handlers.close(73, null); }, 30);
+      });
+      return {
+        stdout,
+        stderr: new PassThrough(),
+        kill() {},
+        on(event, listener) { handlers[event] = listener; return this; },
+      };
+    },
+  }));
+  const started = Date.now();
+  const error = await method(baseParams(root, [
+    { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
+  ], { overwrite: true })).then(() => { throw new Error("expected rejection"); }, (value) => value);
+  assert.ok(Date.now() - started < 3000);
+  assert.equal(error.stage, "transfer");
+  assert.match(String(error.message), /73/);
+  assert.equal(fs.readFileSync(path.join(root, "out", "a.csv"), "utf8"), "last-good");
+  assert.ok(Array.isArray(error.partialResiduals) && error.partialResiduals.length === 1);
+  assert.equal(fs.existsSync(error.partialResiduals[0]), true);
+});
+
+test("nonzero SSH exit after a valid tar rejects with transfer stage", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-ssh-"));
+  keep(root);
+  const payload = tarStream([{ name: "mapped/0", body: "kept-out" }]);
+  const chunks = [];
+  for await (const chunk of payload) chunks.push(chunk);
+  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  let sshCalls = 0;
+  const started = Date.now();
+  const plan = __test.normalizeMappedDownloadEntries({
+    entries: [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv" }],
+  });
+  const sftp = { host: "worker-a", username: "research", remotePath: "/projects/demo", port: 22 };
+  __test.setMappedDownloadTransport(() => __test.openMappedDownloadStream({
+    sftp,
+    plan,
+    localPath: root,
+    timeoutMs: 1000,
+    spawnImpl: () => {
+      sshCalls += 1;
+      return fakeSsh(chunks, 73, { stderr: "remote file missing\n" });
+    },
+  }));
+  await assert.rejects(method(baseParams(root, [
+    { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
+  ])), (error) => error.stage === "transfer" && /73/.test(String(error.message)));
+  assert.equal(sshCalls, 1);
+  assert.ok(Date.now() - started < 5000);
+  assert.equal(fs.existsSync(path.join(root, "out", "a.csv")), false);
+});
+
+test("success waits for SSH exit after the tar trailer", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-wait-"));
+  keep(root);
+  const payload = tarStream([{ name: "mapped/0", body: "ready" }]);
+  const chunks = [];
+  for await (const chunk of payload) chunks.push(chunk);
+  let proc;
+  __test.setMappedDownloadTransport(() => {
+    throw new Error("use spawn");
+  });
+  const plan = __test.normalizeMappedDownloadEntries({
+    entries: [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv" }],
+  });
+  const sftp = { host: "worker-a", username: "research", remotePath: "/projects/demo", port: 22 };
+  __test.setMappedDownloadTransport(() => __test.openMappedDownloadStream({
+    sftp,
+    plan,
+    localPath: root,
+    timeoutMs: 5000,
+    spawnImpl: () => {
+      proc = fakeSsh(chunks, 0, { holdClose: true });
+      return proc;
+    },
+  }));
+  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  let settled = false;
+  const pending = method(baseParams(root, [
+    { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
+  ])).then((result) => { settled = true; return result; });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(settled, false);
+  assert.equal(fs.existsSync(path.join(root, "out", "a.csv")), false);
+  const staged = fs.readdirSync(path.join(root, "out")).filter((name) => name.includes(".simple-sftp-partial-"));
+  assert.equal(staged.length, 1);
+  assert.equal(fs.readFileSync(path.join(root, "out", staged[0]), "utf8"), "ready");
+  proc.emitClose(0);
+  const result = await pending;
+  assert.equal(result.ok, true);
+  assert.equal(result.fileCount, 1);
+});
+
+test("API cancel during the real SSH stream kills that one child", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-live-cancel-"));
+  keep(root);
+  const { PassThrough } = require("node:stream");
+  const stdout = new PassThrough();
+  let killed = 0;
+  let sshCalls = 0;
+  const token = {
+    isCancellationRequested: false,
+    onCancellationRequested(listener) {
+      this.listener = listener;
+      if (this.ready) this.ready();
+    },
+  };
+  const plan = __test.normalizeMappedDownloadEntries({
+    entries: [
+      { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
+      { remotePath: "results/b.csv", localRelativePath: "out/b.csv" },
+    ],
+  });
+  const sftp = { host: "worker-a", username: "research", remotePath: "/projects/demo", port: 22 };
+  __test.setMappedDownloadTransport(() => __test.openMappedDownloadStream({
+    sftp,
+    plan,
+    localPath: root,
+    timeoutMs: 5000,
+    token,
+    spawnImpl: () => {
+      sshCalls += 1;
+      return {
+        stdout,
+        stderr: new PassThrough(),
+        kill() { killed += 1; },
+        on(event, listener) {
+          if (event === "error") this.onError = listener;
+          return this;
+        },
+      };
+    },
+  }));
+  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  const pending = method(baseParams(root, [
+    { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
+    { remotePath: "results/b.csv", localRelativePath: "out/b.csv" },
+  ], { token }));
+  await new Promise((resolve) => { token.ready = resolve; });
+  token.isCancellationRequested = true;
+  token.listener();
+  await assert.rejects(pending, /取消|阶段：transfer/);
+  assert.equal(sshCalls, 1);
+  assert.equal(killed, 1);
+});
+
+test("ancestor junction swapped after the first file is rejected before the second write", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-swap-"));
+  keep(root);
+  const outside = path.join(path.dirname(root), `outside-${path.basename(root)}`);
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(outside, "b.csv"), "outside-original");
+  const payload = tarStream([
+    { name: "mapped/0", body: "first" },
+    { name: "mapped/1", body: "second" },
+  ]);
+  payload.sshExit = Promise.resolve({ sshCode: 0 });
+  __test.setMappedDownloadTransport(() => payload);
+  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  const originalRename = fs.renameSync;
+  fs.renameSync = function patched(from, to) {
+    const result = originalRename.call(fs, from, to);
+    if (String(to).endsWith(`${path.sep}a.csv`)) {
+      const nested = path.join(root, "nested");
+      originalRename(nested, `${nested}-moved`);
+      fs.symlinkSync(outside, nested, "junction");
+    }
+    return result;
+  };
+  try {
+    await assert.rejects(method(baseParams(root, [
+      { remotePath: "results/a.csv", localRelativePath: "nested/a.csv" },
+      { remotePath: "results/b.csv", localRelativePath: "nested/b.csv" },
+    ])), /符号链接|越出项目根目录/);
+  } finally {
+    fs.renameSync = originalRename;
+  }
+  assert.equal(fs.readFileSync(path.join(outside, "b.csv"), "utf8"), "outside-original");
+  assert.equal(fs.existsSync(path.join(outside, "a.csv")), false);
+});
+
+test("truncated stream keeps the previous destination and reports the partial sibling", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-preserve-"));
+  keep(root);
+  fs.mkdirSync(path.join(root, "out"));
+  fs.writeFileSync(path.join(root, "out", "a.csv"), "last-good");
+  const header = tarHeader("mapped/0", 4);
+  const { Readable } = require("node:stream");
+  __test.setMappedDownloadTransport(() => Readable.from([header, Buffer.from("no")]));
+  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  const error = await method(baseParams(root, [
+    { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
+  ], { overwrite: true })).then(() => { throw new Error("expected rejection"); }, (value) => value);
+  assert.match(String(error.message), /阶段：解包/);
+  assert.equal(fs.readFileSync(path.join(root, "out", "a.csv"), "utf8"), "last-good");
+  assert.ok(Array.isArray(error.partialResiduals) && error.partialResiduals.length === 1);
+  assert.equal(fs.existsSync(error.partialResiduals[0]), true);
+  assert.equal(fs.existsSync(error.partialResiduals[0]), true);
+  assert.equal(path.basename(error.partialResiduals[0]).includes(".simple-sftp-partial-"), true);
+});
+
+test("remote mapped script checks the file list before writing a tar", () => {
+  const script = __test.createMappedDownloadScript("/projects/demo", __test.normalizeMappedDownloadEntries({
+    entries: [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv" }],
+  }));
+  assert.match(script, /os\.path\.islink/);
+  assert.match(script, /maxFileBytes/);
+  assert.match(script, /SystemExit\(73\)/);
+  assert.match(script, /mode='w\|'/);
+  assert.doesNotMatch(script, /os\.walk/);
+});

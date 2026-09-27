@@ -2299,6 +2299,143 @@ function explicitDownloadScope(options = {}) {
   return normalizeDownloadScope({ paths: options.paths, extensions: ["*"], noSizeLimit: true });
 }
 
+const MAPPED_DOWNLOAD_DEFAULT_MAX_FILE_BYTES = 128 * 1024 * 1024;
+const MAPPED_DOWNLOAD_MAX_ENTRIES = 256;
+const METRIC_DOWNLOAD_EXTENSIONS = new Set([".csv", ".json", ".md", ".txt", ".log"]);
+const WEIGHT_DOWNLOAD_EXTENSIONS = new Set([".pt", ".pth", ".ckpt", ".safetensors", ".bin", ".onnx", ".pkl", ".pickle"]);
+
+function normalizeMappedRelativePath(value, label) {
+  const raw = toPosixPath(String(value || "").trim());
+  if (!raw || raw === "." || raw.startsWith("/") || /^[A-Za-z]:/.test(raw) || path.win32.isAbsolute(String(value || "").trim())) {
+    throw new Error(`${label}必须是项目内相对文件路径：${value}`);
+  }
+  const normalized = raw.replace(/^\.\//, "").replace(/\/+$/g, "");
+  if (!normalized || normalized === "." || path.posix.isAbsolute(normalized) || /^[A-Za-z]:/.test(normalized)) {
+    throw new Error(`${label}必须是项目内相对文件路径：${value}`);
+  }
+  if (normalized.split("/").some((part) => !part || part === "." || part === "..")) {
+    throw new Error(`${label}包含越界或空路径段：${value}`);
+  }
+  if (/[\0\r\n]/.test(normalized)) throw new Error(`${label}包含非法字符：${value}`);
+  return normalized;
+}
+
+function mappedDownloadMaxFileBytes(value) {
+  if (value == null || value === "") return MAPPED_DOWNLOAD_DEFAULT_MAX_FILE_BYTES;
+  const size = Number(value);
+  if (!Number.isFinite(size) || size < 1 || size > 1024 * 1024 * 1024) {
+    throw new Error("映射下载单文件上限必须在 1 字节到 1 GiB 之间。");
+  }
+  return Math.floor(size);
+}
+
+function rejectMappedDownloadKind(remotePath, options) {
+  const lower = remotePath.toLowerCase();
+  const extension = path.posix.extname(lower);
+  const base = path.posix.basename(lower);
+  const metricsOnly = options.metricsOnly === true || options.kind === "metrics";
+  if (metricsOnly) {
+    if (WEIGHT_DOWNLOAD_EXTENSIONS.has(extension) || /(^|\/)(weights?|checkpoints?)(\/|$)/.test(lower)) {
+      throw new Error(`映射下载拒绝权重或检查点文件：${remotePath}`);
+    }
+    if (!METRIC_DOWNLOAD_EXTENSIONS.has(extension)) {
+      throw new Error(`指标批量下载只接受 csv/json/md/txt/log：${remotePath}`);
+    }
+    if (base.endsWith(".csv.lock") || base === ".tb_mean.lock") {
+      throw new Error(`映射下载拒绝锁文件：${remotePath}`);
+    }
+  }
+  if (downloadScopeBlockedPath(remotePath)) {
+    throw new Error(`映射下载路径包含插件或版本控制状态目录：${remotePath}`);
+  }
+}
+
+function normalizeMappedDownloadEntries(options = {}) {
+  const raw = Array.isArray(options.entries) ? options.entries : null;
+  if (!raw || !raw.length) throw new Error("映射下载必须提供 entries，且不能扫描整个项目。");
+  if (raw.length > MAPPED_DOWNLOAD_MAX_ENTRIES) {
+    throw new Error(`映射下载一次最多 ${MAPPED_DOWNLOAD_MAX_ENTRIES} 个文件，当前 ${raw.length} 个。`);
+  }
+  const maxFileBytes = mappedDownloadMaxFileBytes(options.maxFileBytes);
+  const overwrite = options.overwrite === true;
+  const seenRemote = new Map();
+  const seenLocal = new Map();
+  const entries = raw.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`映射下载第 ${index + 1} 项必须是对象。`);
+    }
+    const remotePath = normalizeMappedRelativePath(item.remotePath, "远端路径");
+    const localRelativePath = normalizeMappedRelativePath(item.localRelativePath, "本机相对路径");
+    rejectMappedDownloadKind(remotePath, options);
+    const remoteKey = remotePath.toLowerCase();
+    const localKey = localRelativePath.toLowerCase();
+    if (seenRemote.has(remoteKey)) throw new Error(`映射下载远端路径重复：${remotePath}`);
+    if (seenLocal.has(localKey)) throw new Error(`映射下载本机路径重复：${localRelativePath}`);
+    seenRemote.set(remoteKey, remotePath);
+    seenLocal.set(localKey, localRelativePath);
+    const declared = item.bytes == null || item.bytes === "" ? null : Number(item.bytes);
+    if (declared != null && (!Number.isFinite(declared) || declared < 0 || declared > maxFileBytes)) {
+      throw new Error(`映射下载条目超过单文件上限 ${maxFileBytes} 字节：${remotePath}`);
+    }
+    return { remotePath, localRelativePath, bytes: declared == null ? null : Math.floor(declared), index };
+  });
+  return {
+    entries,
+    maxFileBytes,
+    overwrite,
+    byteCount: entries.reduce((total, entry) => total + (entry.bytes || 0), 0),
+  };
+}
+
+function assertMappedLocalDestinations(localPath, plan) {
+  const root = path.resolve(localPath);
+  let rootStat;
+  try {
+    rootStat = fs.lstatSync(root);
+  } catch (error) {
+    if (error.code === "ENOENT") throw new Error(`本机项目目录不存在：${root}`);
+    throw error;
+  }
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error(`本机项目目录必须是真实目录：${root}`);
+  let rootReal;
+  try { rootReal = fs.realpathSync(root); }
+  catch { throw new Error(`无法解析本机项目目录：${root}`); }
+  for (const entry of plan.entries) {
+    const full = path.resolve(root, ...entry.localRelativePath.split("/"));
+    const within = path.relative(root, full);
+    if (!within || within === ".." || within.startsWith(`..${path.sep}`) || path.isAbsolute(within)) {
+      throw new Error(`本机映射路径超出项目根目录：${entry.localRelativePath}`);
+    }
+    let cursor = root;
+    const parts = entry.localRelativePath.split("/");
+    for (const [index, part] of parts.entries()) {
+      cursor = path.join(cursor, part);
+      let stat;
+      try { stat = fs.lstatSync(cursor); }
+      catch (error) {
+        if (error.code === "ENOENT") break;
+        throw error;
+      }
+      if (stat.isSymbolicLink()) throw new Error(`本机映射路径包含符号链接：${cursor}`);
+      const last = index === parts.length - 1;
+      if (!last && !stat.isDirectory()) throw new Error(`本机映射路径的父级不是目录：${cursor}`);
+      if (last && stat.isDirectory()) throw new Error(`本机映射目标是目录，不能当作文件：${cursor}`);
+      if (last && !stat.isFile()) throw new Error(`本机映射目标不是普通文件：${cursor}`);
+      if (last && stat.isFile()) {
+        let real;
+        try { real = fs.realpathSync(cursor); }
+        catch { throw new Error(`无法解析已有本机文件：${cursor}`); }
+        const realWithin = path.relative(rootReal, real);
+        if (realWithin === ".." || realWithin.startsWith(`..${path.sep}`) || path.isAbsolute(realWithin)) {
+          throw new Error(`已有本机文件解析后超出项目根目录：${entry.localRelativePath}`);
+        }
+        if (!plan.overwrite) throw new Error(`本机文件已存在，未确认覆盖：${entry.localRelativePath}`);
+      }
+    }
+    entry.localFullPath = full;
+  }
+}
+
 function assertSafeScopedLocalPaths(localPath, paths) {
   const root = path.resolve(localPath);
   try { if (fs.lstatSync(root).isSymbolicLink()) throw new Error(`本机项目目录是符号链接：${root}`); }
@@ -3179,6 +3316,44 @@ function createLocalApiMethods() {
       publishLocalApiEvent("sync.downloadPaths", { localPath, remotePath: result.remotePath, paths: scope.paths });
       return result;
     },
+    "sync.downloadMappedPaths": async (params = {}) => {
+      const localPath = String(params.localPath || "").trim();
+      if (!localPath) throw new Error("缺少本地项目目录 localPath。");
+      if (!params.server || typeof params.server !== "object") throw new Error("必须明确指定来源 Worker。");
+      const plan = normalizeMappedDownloadEntries(params);
+      const sftp = apiTransferSftp({ ...params, localPath });
+      if (!sftp.host || !sftp.remotePath) throw new Error("必须明确指定来源 Worker 的主机和远端项目目录。");
+      const previewEntries = plan.entries.map((entry) => ({
+        remotePath: entry.remotePath,
+        localRelativePath: entry.localRelativePath,
+        bytes: entry.bytes,
+      }));
+      requireApiConfirmation({
+        ...params,
+        mappedDownload: {
+          fileCount: plan.entries.length,
+          byteCount: plan.byteCount,
+          maxFileBytes: plan.maxFileBytes,
+          overwrite: plan.overwrite,
+          entries: previewEntries,
+        },
+      }, {
+        method: "sync.downloadMappedPaths",
+        operation: `一次打包下载 ${plan.entries.length} 个映射文件到本机不同路径`,
+        sftp,
+        localPath,
+        pathRequired: true,
+        detail: previewEntries.map((entry) => `${entry.remotePath} -> ${entry.localRelativePath}`).join("\n"),
+      });
+      const result = await downloadMappedPaths({ ...params, apiMode: true, localPath, sftp, plan });
+      publishLocalApiEvent("sync.downloadMappedPaths", {
+        localPath,
+        remotePath: sftp.remotePath,
+        fileCount: result.fileCount,
+        byteCount: result.byteCount,
+      });
+      return result;
+    },
     "sync.planLogPaths": async (params = {}) => listPlanLogPaths(params),
     "sync.projectInventory": async (params = {}) => projectInventory(params),
     "sync.projectTree": async (params = {}) => projectTree(params),
@@ -3301,8 +3476,8 @@ function createLocalApiMethods() {
   };
 }
 
-function requireApiConfirmation(params, { method, operation, sftp, localPath, pathRequired }) {
-  const preview = buildApiConfirmationPreview({ method, operation, sftp, localPath, pathRequired });
+function requireApiConfirmation(params, { method, operation, sftp, localPath, pathRequired, detail }) {
+  const preview = buildApiConfirmationPreview({ method, operation, sftp, localPath, pathRequired, detail, mappedDownload: params && params.mappedDownload });
   const requires = [];
   if (params.confirm !== true) requires.push("confirm");
   if (pathRequired && params.pathConfirmed !== true && !isRememberedTransferPath(localPath, sftp)) {
@@ -3312,7 +3487,7 @@ function requireApiConfirmation(params, { method, operation, sftp, localPath, pa
   return true;
 }
 
-function buildApiConfirmationPreview({ method, operation, sftp, localPath, pathRequired }) {
+function buildApiConfirmationPreview({ method, operation, sftp, localPath, pathRequired, detail, mappedDownload }) {
   return {
     method,
     operation,
@@ -3320,11 +3495,12 @@ function buildApiConfirmationPreview({ method, operation, sftp, localPath, pathR
       "confirm",
       ...(pathRequired ? ["pathConfirmed"] : []),
     ],
+    ...(mappedDownload ? { mappedDownload } : {}),
     target: createTransferPreview({
       localPath,
       sftp,
       operation,
-      detail: "",
+      detail: detail || "",
     }),
   };
 }
@@ -4094,6 +4270,563 @@ function createRemoteExtractCommand(remotePath) {
   return `mkdir -p ${shellQuote(safeRemotePath)} && tar -xf - -C ${shellQuote(safeRemotePath)}`;
 }
 
+let mappedDownloadTransport = null;
+function setMappedDownloadTransport(fn) {
+  mappedDownloadTransport = typeof fn === "function" ? fn : null;
+}
+
+async function downloadMappedPaths(options = {}) {
+  const localPath = resolveLocalWorkspacePath(options.localPath, "映射批量下载");
+  return withHostOperationLease("download-mapped-paths", "映射批量下载", localPath, () => downloadMappedPathsCore({ ...options, localPath }));
+}
+
+async function downloadMappedPathsCore(options = {}) {
+  const localPath = String(options.localPath || "").trim();
+  const plan = options.plan || normalizeMappedDownloadEntries(options);
+  const sftp = options.sftp || apiTransferSftp({ ...options, localPath });
+  if (!sftp || !sftp.host || !sftp.remotePath) throw new Error("未配置可用的 SFTP 远端路径。");
+  assertMappedLocalDestinations(localPath, plan);
+  const archiveNames = plan.entries.map((_, index) => `mapped/${index}`);
+  const byArchiveName = new Map(plan.entries.map((entry, index) => [archiveNames[index], entry]));
+  const stage = { name: "validate", sshCount: 0 };
+  const progressState = {
+    phase: "打包前校验",
+    transferredBytes: 0,
+    byteCount: plan.byteCount,
+    fileCount: plan.entries.length,
+    completedFiles: 0,
+  };
+  const report = (message) => {
+    progressState.message = message;
+    if (options.progress && typeof options.progress.report === "function") options.progress.report({ message });
+  };
+  report(`校验 ${plan.entries.length} 个映射，准备一次无压缩打包`);
+  let stream;
+  let sshExitSeen = null;
+  const watchSshExit = () => {
+    if (!stream || !stream.sshExit || typeof stream.sshExit.then !== "function" || sshExitSeen) return;
+    sshExitSeen = stream.sshExit.then((value) => ({ ok: true, value }), (error) => ({ ok: false, error }));
+  };
+  try {
+    stage.name = "transfer";
+    if (mappedDownloadTransport) {
+      stage.sshCount = 1;
+      const transportResult = await Promise.resolve().then(() => mappedDownloadTransport({
+        sftp,
+        entries: plan.entries.map((entry) => ({ remotePath: entry.remotePath, archiveName: `mapped/${entry.index}` })),
+        maxFileBytes: plan.maxFileBytes,
+        remoteCommand: createMappedDownloadCommand(sftp, plan),
+        timeoutMs: transferTimeoutMs(sftp, options),
+        transferId: options.transferId,
+        signal: {
+          cancelled: () => Boolean(options.token && options.token.isCancellationRequested),
+        },
+      }));
+      stream = transportResult;
+      watchSshExit();
+    } else {
+      stream = openMappedDownloadStream({
+        sftp,
+        plan,
+        localPath,
+        timeoutMs: transferTimeoutMs(sftp, options),
+        token: options.token,
+        transferId: options.transferId,
+        progress: options.progress,
+        onSpawn: () => { stage.sshCount += 1; },
+      });
+      watchSshExit();
+    }
+    stage.name = "extract";
+    const written = await extractMappedTarStream({
+      stream,
+      byArchiveName,
+      localPath,
+      maxFileBytes: plan.maxFileBytes,
+      overwrite: plan.overwrite,
+      shouldCancel: () => Boolean(options.token && options.token.isCancellationRequested),
+      onFileBytes: (bytes) => {
+        progressState.transferredBytes += bytes;
+        report(`已接收 ${progressState.transferredBytes} 字节，正在按映射写入`);
+      },
+      onFile: () => { progressState.completedFiles += 1; },
+    });
+    if (written.length !== plan.entries.length) {
+      const missing = plan.entries.filter((entry) => !written.some((item) => item.remotePath === entry.remotePath));
+      const error = new Error(`映射下载未完成：缺少 ${missing.map((entry) => entry.remotePath).join("、") || "未知条目"}。阶段：解包。下一步：核对远端文件是否仍是普通文件后重试这一批。`);
+      error.stage = "extract";
+      error.partial = written;
+      throw error;
+    }
+    if (sshExitSeen) {
+      stage.name = "transfer";
+      const exit = await sshExitSeen;
+      if (!exit.ok) throw exit.error;
+    }
+    return {
+      ok: true,
+      localPath,
+      remotePath: sftp.remotePath,
+      host: sftp.host,
+      fileCount: written.length,
+      byteCount: written.reduce((total, item) => total + item.bytes, 0),
+      transferredBytes: progressState.transferredBytes,
+      completedFiles: written.length,
+      streamCount: 1,
+      sshCount: stage.sshCount,
+      entries: written,
+      phase: "complete",
+    };
+  } catch (error) {
+    if (stream && typeof stream.destroy === "function") stream.destroy();
+    if (sshExitSeen) {
+      const exit = await sshExitSeen;
+      if (!exit.ok && error && error.stage === "extract" && exit.error && exit.error.stage === "transfer") {
+        if (error.partialResiduals) exit.error.partialResiduals = error.partialResiduals;
+        if (error.partial) exit.error.partial = error.partial;
+        throw exit.error;
+      }
+    }
+    if (error && error.stage) throw error;
+    const wrapped = error instanceof Error ? error : new Error(String(error || "映射下载失败"));
+    wrapped.stage = wrapped.stage || stage.name;
+    if (!wrapped.nextStep) {
+      wrapped.nextStep = stage.name === "transfer"
+        ? "传输未完成，已写入的文件保留；核对 SSH 后重试整批，不要逐文件下载。"
+        : "解包未完成，已写入的文件保留；核对映射和远端文件后重试整批。";
+    }
+    if (!/阶段：/.test(wrapped.message)) {
+      wrapped.message = `映射下载失败。阶段：${wrapped.stage}。${wrapped.message} 下一步：${wrapped.nextStep}`;
+    }
+    throw wrapped;
+  }
+}
+
+function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, transferId, onSpawn, progress, spawnImpl }) {
+  const remoteCommand = createMappedDownloadCommand(sftp, plan);
+  const { PassThrough } = require("stream");
+  const output = new PassThrough();
+  let resolveExit;
+  let rejectExit;
+  output.sshExit = new Promise((resolve, reject) => {
+    resolveExit = resolve;
+    rejectExit = reject;
+  });
+  output.sshExit.catch(() => undefined);
+  const controller = createTransferController({
+    id: transferId || nextTransferId("映射批量下载"),
+    operation: "映射批量下载",
+    localPath: String(localPath || ""),
+    remotePath: String(sftp.remotePath || ""),
+    host: String(sftp.host || ""),
+  });
+  controller.totalBytes = plan.byteCount || 0;
+  const launch = spawnImpl || spawn;
+  const sshProc = launch("ssh", getSshArgs(sftp, remoteCommand), {
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (onSpawn) onSpawn(sshProc);
+  let sshStderr = "";
+  let settled = false;
+  let timer;
+  let tokenDisposable;
+  let lastProgressAt = 0;
+  const finishFailure = (error) => {
+    const classified = classifySftpFailure(error, sftp, {
+      command: remoteCommand,
+      sshStderr,
+      sshCode: error && error.sshCode,
+    });
+    classified.stage = "transfer";
+    classified.sshCode = error && error.sshCode;
+    classified.nextStep = "SSH 打包流未完成；核对主机、超时和远端 python3 后重试整批。";
+    rejectExit(classified);
+    output.destroy();
+  };
+  const fail = (error) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    if (tokenDisposable && typeof tokenDisposable.dispose === "function") tokenDisposable.dispose();
+    controller.dispose();
+    try { sshProc.kill(); } catch {}
+    finishFailure(error);
+  };
+  controller.onCancel((reason) => fail(new Error(reason || "传输已取消")));
+  if (token) {
+    if (token.isCancellationRequested) fail(new Error("传输已取消"));
+    else if (typeof token.onCancellationRequested === "function") {
+      tokenDisposable = token.onCancellationRequested(() => fail(new Error("传输已取消")));
+    }
+  }
+  const timeout = Number(timeoutMs) || transferTimeoutMs(sftp);
+  if (timeout > 0) {
+    timer = setTimeout(() => fail(new Error(`SimpleSFTP 传输超过 ${Math.round(timeout / 1000)} 秒未完成，已停止。`)), timeout);
+  }
+  sshProc.on("error", fail);
+  sshProc.stderr.on("data", (chunk) => { sshStderr = appendProcessOutput(sshStderr, chunk); });
+  sshProc.stdout.on("data", (chunk) => {
+    controller.transferredBytes += chunk.length;
+    const now = Date.now();
+    if (progress && typeof progress.report === "function" && now - lastProgressAt >= 250) {
+      progress.report({ message: `已接收 ${controller.transferredBytes} 字节，正在解包映射` });
+      lastProgressAt = now;
+    }
+    if (!output.write(chunk)) sshProc.stdout.pause();
+  });
+  output.on("drain", () => {
+    if (sshProc.stdout && !sshProc.stdout.destroyed && typeof sshProc.stdout.resume === "function") sshProc.stdout.resume();
+  });
+  output.on("close", () => {
+    if (!settled) fail(new Error("传输已取消"));
+  });
+  sshProc.on("close", (code, signal) => {
+    clearTimeout(timer);
+    if (tokenDisposable && typeof tokenDisposable.dispose === "function") tokenDisposable.dispose();
+    controller.dispose();
+    const sshCode = code === null ? `signal ${signal || "unknown"}` : code;
+    if (code !== 0) {
+      const failure = new Error(formatProcessFailure({
+        operation: "映射批量下载",
+        sshCode,
+        sshStderr,
+      }));
+      failure.sshCode = sshCode;
+      failure.stage = "transfer";
+      if (!settled) {
+        settled = true;
+        finishFailure(failure);
+      }
+      return;
+    }
+    if (settled) return;
+    settled = true;
+    output.end();
+    resolveExit({ sshCode: 0 });
+  });
+  return output;
+}
+
+function createMappedDownloadCommand(sftp, plan) {
+  const remotePath = String(sftp.remotePath).replace(/\/+$/, "");
+  return `python3 -c ${shellQuote(createMappedDownloadScript(remotePath, plan))}`;
+}
+
+function createMappedDownloadScript(remotePath, plan) {
+  const payload = Buffer.from(JSON.stringify({
+    files: plan.entries.map((entry) => ({ remotePath: entry.remotePath, archiveName: `mapped/${entry.index}`, bytes: entry.bytes })),
+    maxFileBytes: plan.maxFileBytes,
+  }), "utf8").toString("base64");
+  return [
+    "import base64,json,os,sys,tarfile",
+    `root=os.path.realpath(${JSON.stringify(remotePath)})`,
+    `request=json.loads(base64.b64decode(${JSON.stringify(payload)}).decode('utf-8'))`,
+    "files=request.get('files') or []",
+    "limit=int(request.get('maxFileBytes') or 0)",
+    "def fail(message):",
+    "    sys.stderr.write(message+'\\n')",
+    "    raise SystemExit(73)",
+    "def inside(value):",
+    "    try: return os.path.commonpath([root, value]) == root",
+    "    except ValueError: return False",
+    "selected=[]",
+    "seen=set()",
+    "for item in files:",
+    "    rel=str(item.get('remotePath') or '').replace('\\\\','/').strip('/')",
+    "    archive=str(item.get('archiveName') or '')",
+    "    parts=[part for part in rel.split('/') if part]",
+    "    if not rel or rel != '/'.join(parts) or any(part in ('.','..') for part in parts): fail('unsafe remote path: '+rel)",
+    "    if not archive.startswith('mapped/') or '/' in archive[7:] or not archive[7:].isdigit(): fail('unsafe archive name')",
+    "    if rel.lower() in seen: fail('duplicate remote path: '+rel)",
+    "    seen.add(rel.lower())",
+    "    cursor=root",
+    "    for part in parts:",
+    "        cursor=os.path.join(cursor, part)",
+    "        if os.path.islink(cursor): fail('remote symlink: '+rel)",
+    "    full=os.path.realpath(cursor)",
+    "    if not inside(full) or os.path.islink(full) or not os.path.isfile(full): fail('remote file missing or unsafe: '+rel)",
+    "    size=os.path.getsize(full)",
+    "    declared=item.get('bytes')",
+    "    if size > limit: fail('remote file exceeds limit: '+rel)",
+    "    if declared is not None and int(declared) != size: fail('remote size changed: '+rel)",
+    "    selected.append((archive, full, size))",
+    "with tarfile.open(fileobj=sys.stdout.buffer, mode='w|', format=tarfile.GNU_FORMAT) as archive:",
+    "    for name, full, size in selected:",
+    "        info=tarfile.TarInfo(name)",
+    "        info.size=size",
+    "        info.mode=0o644",
+    "        info.type=tarfile.REGTYPE",
+    "        with open(full, 'rb') as handle: archive.addfile(info, handle)",
+  ].join("\n");
+}
+
+const MAPPED_TAR_BLOCK = 512;
+
+async function extractMappedTarStream({ stream, byArchiveName, localPath, maxFileBytes, overwrite, onFileBytes, onFile, shouldCancel }) {
+  const pending = new Map(byArchiveName);
+  const written = [];
+  const staged = [];
+  const residuals = [];
+  const reader = createTarByteReader(stream);
+  const root = path.resolve(localPath);
+  let zeroBlocks = 0;
+  const failExtract = (message, extra = {}) => {
+    const error = new Error(`${message}。阶段：解包。下一步：已完成文件保留，未完成目标保持原内容；残留临时文件见 partialResiduals。`);
+    error.stage = "extract";
+    error.partial = written.slice();
+    error.partialResiduals = residuals.slice();
+    Object.assign(error, extra);
+    return error;
+  };
+  try {
+    for (;;) {
+      if (shouldCancel && shouldCancel()) {
+        if (stream && typeof stream.destroy === "function") stream.destroy();
+        throw failExtract("传输已取消");
+      }
+      const block = await reader.take(MAPPED_TAR_BLOCK);
+      if (!block) break;
+      if (block.every((byte) => byte === 0)) {
+        zeroBlocks += 1;
+        if (zeroBlocks >= 2) break;
+        continue;
+      }
+      zeroBlocks = 0;
+      const parsed = parseMappedTarHeader(block);
+      const padding = (MAPPED_TAR_BLOCK - (parsed.size % MAPPED_TAR_BLOCK)) % MAPPED_TAR_BLOCK;
+      if (parsed.pax || parsed.typeflag === "5") {
+        await reader.discard(parsed.size + padding);
+        continue;
+      }
+      const target = pending.get(parsed.name);
+      if (!target || parsed.typeflag !== "0" && parsed.typeflag !== "\0" || parsed.size > maxFileBytes) {
+        throw failExtract(`tar 条目未通过映射校验：${parsed.name || "(empty)"}`);
+      }
+      const destination = target.localFullPath;
+      const parent = path.dirname(destination);
+      fs.mkdirSync(parent, { recursive: true });
+      assertMappedAncestorChain(root, target.localRelativePath);
+      let existing = null;
+      try { existing = fs.lstatSync(destination); }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+      if (existing) {
+        if (existing.isSymbolicLink() || !existing.isFile()) throw failExtract(`写入前本机目标不再是普通文件：${target.localRelativePath}`);
+        if (!overwrite) throw failExtract(`本机文件已存在，未确认覆盖：${target.localRelativePath}`);
+      }
+      const staging = mappedStagingPath(destination);
+      residuals.push(staging);
+      const handle = fs.createWriteStream(staging, { flags: "wx" });
+      let received = 0;
+      try {
+        while (received < parsed.size) {
+          if (shouldCancel && shouldCancel()) throw failExtract("传输已取消");
+          const piece = await reader.take(Math.min(64 * 1024, parsed.size - received));
+          if (!piece) throw failExtract("tar 流在文件结束前中断");
+          await writeStreamChunk(handle, piece);
+          received += piece.length;
+          if (onFileBytes) onFileBytes(piece.length);
+        }
+        await closeWriteStream(handle);
+        if (padding) await reader.discard(padding);
+        assertMappedAncestorChain(root, target.localRelativePath);
+        if (existing && !overwrite) throw failExtract(`本机文件已存在，未确认覆盖：${target.localRelativePath}`);
+        staged.push({ staging, destination, target, size: parsed.size, existed: Boolean(existing) });
+      } catch (error) {
+        handle.destroy();
+        if (error && error.partialResiduals) throw error;
+        throw failExtract(error && error.message || "映射写入失败");
+      }
+      pending.delete(parsed.name);
+    }
+    if (stream && stream.sshExit && typeof stream.sshExit.then === "function") await stream.sshExit;
+    for (const item of staged) {
+      assertMappedAncestorChain(root, item.target.localRelativePath);
+      fs.renameSync(item.staging, item.destination);
+      const index = residuals.indexOf(item.staging);
+      if (index >= 0) residuals.splice(index, 1);
+      written.push({
+        remotePath: item.target.remotePath,
+        localRelativePath: item.target.localRelativePath,
+        localPath: item.destination,
+        bytes: item.size,
+        ok: true,
+      });
+      if (onFile) onFile(item.target);
+    }
+  } catch (error) {
+    if (error && error.partialResiduals) throw error;
+    throw failExtract(error && error.message || "映射解包失败");
+  }
+  return written;
+}
+
+function mappedStagingPath(destination) {
+  const leaf = `.${path.basename(destination)}.simple-sftp-partial-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+  return path.join(path.dirname(destination), leaf);
+}
+
+function assertMappedAncestorChain(root, relativePath) {
+  let rootStat;
+  try { rootStat = fs.lstatSync(root); }
+  catch { throw Object.assign(new Error(`本机项目目录不可用：${root}`), { stage: "extract" }); }
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw Object.assign(new Error(`本机项目目录必须是真实目录：${root}`), { stage: "extract" });
+  }
+  let cursor = root;
+  const parts = String(relativePath || "").split("/");
+  for (const [index, part] of parts.entries()) {
+    cursor = path.join(cursor, part);
+    const last = index === parts.length - 1;
+    let stat;
+    try { stat = fs.lstatSync(cursor); }
+    catch (error) {
+      if (error.code === "ENOENT") {
+        if (last) return;
+        throw Object.assign(new Error(`写入前映射父目录缺失：${cursor}`), { stage: "extract" });
+      }
+      throw error;
+    }
+    if (stat.isSymbolicLink()) {
+      throw Object.assign(new Error(`写入前映射路径包含符号链接：${cursor}`), { stage: "extract" });
+    }
+    if (!last && !stat.isDirectory()) {
+      throw Object.assign(new Error(`写入前映射父级不是目录：${cursor}`), { stage: "extract" });
+    }
+    if (!last) {
+      let real;
+      try { real = fs.realpathSync(cursor); }
+      catch { throw Object.assign(new Error(`无法解析映射父目录：${cursor}`), { stage: "extract" }); }
+      const within = path.relative(fs.realpathSync(root), real);
+      if (within === ".." || within.startsWith(`..${path.sep}`) || path.isAbsolute(within)) {
+        throw Object.assign(new Error(`写入前映射路径越出项目根目录：${relativePath}`), { stage: "extract" });
+      }
+    }
+  }
+}
+
+function createTarByteReader(stream) {
+  const chunks = [];
+  let buffered = 0;
+  const pull = () => new Promise((resolve, reject) => {
+    if (stream.readableEnded || stream.destroyed || stream.closed) {
+      const existing = typeof stream.read === "function" ? stream.read() : null;
+      resolve(existing && existing.length ? existing : null);
+      return;
+    }
+    const existing = stream.read();
+    if (existing && existing.length) {
+      resolve(existing);
+      return;
+    }
+    const onReadable = () => {
+      cleanup();
+      resolve(stream.read() || Buffer.alloc(0));
+    };
+    const onDone = () => { cleanup(); resolve(null); };
+    const onError = (error) => { cleanup(); reject(error); };
+    const cleanup = () => {
+      stream.off("readable", onReadable);
+      stream.off("end", onDone);
+      stream.off("close", onDone);
+      stream.off("error", onError);
+    };
+    stream.once("readable", onReadable);
+    stream.once("end", onDone);
+    stream.once("close", onDone);
+    stream.once("error", onError);
+  });
+  return {
+    async take(size) {
+      while (buffered < size) {
+        const chunk = await pull();
+        if (!chunk || !chunk.length) {
+          if (!buffered) return null;
+          const error = new Error("tar 流在块边界前中断。阶段：解包。下一步：重试整批。");
+          error.stage = "extract";
+          throw error;
+        }
+        chunks.push(chunk);
+        buffered += chunk.length;
+      }
+      const out = Buffer.alloc(size);
+      let offset = 0;
+      while (offset < size) {
+        const head = chunks[0];
+        const need = size - offset;
+        if (head.length <= need) {
+          head.copy(out, offset);
+          offset += head.length;
+          buffered -= head.length;
+          chunks.shift();
+        } else {
+          head.copy(out, offset, 0, need);
+          chunks[0] = head.subarray(need);
+          buffered -= need;
+          offset += need;
+        }
+      }
+      return out;
+    },
+    async discard(size) {
+      let left = size;
+      while (left > 0) {
+        const piece = await this.take(Math.min(left, 64 * 1024));
+        if (!piece) {
+          const error = new Error("tar 填充块不完整。阶段：解包。下一步：重试整批。");
+          error.stage = "extract";
+          throw error;
+        }
+        left -= piece.length;
+      }
+    },
+  };
+}
+
+function parseMappedTarHeader(block) {
+  if (!block || block.length !== MAPPED_TAR_BLOCK) {
+    throw Object.assign(new Error("tar 头长度无效。阶段：解包。"), { stage: "extract" });
+  }
+  const checksumField = block.subarray(148, 156).toString("ascii");
+  if (!/^[\0 ]*[0-7]{6}\0[ \0]$/.test(checksumField) && !/^[\0 ]*[0-7]{6}\0 $/.test(checksumField)) {
+    throw Object.assign(new Error("tar 头校验域无效。阶段：解包。"), { stage: "extract" });
+  }
+  const unsigned = Buffer.from(block);
+  unsigned.fill(0x20, 148, 156);
+  const sum = unsigned.reduce((total, value) => total + value, 0);
+  const expected = parseInt(checksumField.replace(/\0.*$/, "").trim(), 8);
+  if (sum !== expected) throw Object.assign(new Error("tar 头校验和不匹配。阶段：解包。"), { stage: "extract" });
+  const name = readTarField(block, 0, 100);
+  const prefix = readTarField(block, 345, 155);
+  const sizeText = block.subarray(124, 136).toString("ascii").replace(/\0.*$/, "").trim();
+  if (sizeText && !/^[0-7]+$/.test(sizeText)) {
+    throw Object.assign(new Error("tar 头大小无效。阶段：解包。"), { stage: "extract" });
+  }
+  const typeflag = String.fromCharCode(block[156] || 48);
+  const size = sizeText ? parseInt(sizeText, 8) : 0;
+  if (!Number.isSafeInteger(size) || size < 0) {
+    throw Object.assign(new Error("tar 头大小无效。阶段：解包。"), { stage: "extract" });
+  }
+  const fullName = prefix ? `${prefix.replace(/\/$/, "")}/${name}` : name;
+  return { name: fullName.replace(/^\.\//, ""), size, typeflag, pax: typeflag === "x" || typeflag === "g" };
+}
+
+function readTarField(block, offset, length) {
+  return block.subarray(offset, offset + length).toString("utf8").replace(/\0.*$/, "").trim();
+}
+
+function writeStreamChunk(stream, chunk) {
+  return new Promise((resolve, reject) => {
+    stream.write(chunk, (error) => error ? reject(error) : resolve());
+  });
+}
+
+function closeWriteStream(stream) {
+  return new Promise((resolve, reject) => {
+    stream.end((error) => error ? reject(error) : resolve());
+  });
+}
+
 async function downloadRemoteToLocal({ localPath, sftp, downloadScope }) {
   return withHostOperationLease("download-workspace", "下载远端工作区", localPath, () => downloadRemoteToLocalCore({ localPath, sftp, downloadScope }));
 }
@@ -4596,6 +5329,14 @@ module.exports = {
     createRemoteExtractCommand,
     createRemoteTarCommand,
     createRemoteDownloadScript,
+    createMappedDownloadCommand,
+    createMappedDownloadScript,
+    normalizeMappedDownloadEntries,
+    assertMappedLocalDestinations,
+    downloadMappedPathsCore,
+    setMappedDownloadTransport,
+    extractMappedTarStream,
+    openMappedDownloadStream,
     directSyncTarget,
     directSyncRelativePath,
     directSyncCommand,

@@ -312,6 +312,7 @@ test("SimpleSFTP exposes the planned public API methods", () => {
     "project.create",
     "sync.fromRemote",
     "sync.downloadPaths",
+    "sync.downloadMappedPaths",
     "transfers.list",
     "transfers.cancel",
     "upload.workspace",

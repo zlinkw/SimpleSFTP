@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.42
+
+- Added `sync.downloadMappedPaths`: one uncompressed remote tar stream carries every selected source-to-local mapping, then extraction writes each file to its own final path.
+- Unsafe paths, symlinks, duplicate destinations, directories, weight files in a metrics batch, and files over the per-file limit are rejected before transfer. `sync.downloadPaths` stays path-identical.
+
 ## 0.2.18
 
 - Removed the legacy configurable ignore command, API, state migration, and settings.
