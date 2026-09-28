@@ -1,4 +1,7 @@
 const vscode = require("vscode");
+const { AsyncLocalStorage } = require("node:async_hooks");
+const { ProgressInactivity } = require("./progress-inactivity");
+const transferContext = new AsyncLocalStorage();
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -119,6 +122,7 @@ const HIDDEN_TOP_LEVEL = new Set([
 const promptedWorkspaces = new Set();
 const uploadQueues = new Map();
 const activeTransfers = new Map();
+const cancelledTransferOperations = new Map();
 const activeUploadOperations = new Map();
 const SAVE_UPLOAD_STATE = "simple-sftp-upload-state.json";
 const TARGET_DOWNLOAD_SCOPE_STATE = "sftp-download-scopes.json";
@@ -780,7 +784,11 @@ function removeLocalStagingDirectory(tempDir) {
   const args = process.platform === "win32"
     ? ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference='Stop'; Set-Location -LiteralPath ${psQuote(parent)}; if ((Get-Location).ProviderPath -ne ${psQuote(parent)}) { throw 'PARENT_CD_FAILED' }; Remove-Item -LiteralPath ${psQuote(`./${leaf}`)} -Recurse -Force -ErrorAction Stop`]
     : ["-c", 'cd -- "$1" || exit 75; test "$(pwd -P)" = "$2" || exit 75; rm -rf -- "./$3"', "sh", parent, safetyRoot, leaf];
-  return new Promise((resolve, reject) => execFile(command, args, { cwd: parent, windowsHide: true, timeout: 120000 }, (error) => error ? reject(error) : resolve()));
+  return new Promise((resolve, reject) => {
+    const child = execFile(command, args, { cwd: parent, windowsHide: true, timeout: 0 }, (error) => error ? reject(error) : resolve());
+    const monitor = watchTransferProcess(child, reject, false);
+    child.stdout?.on("data", monitor.receive);
+  });
 }
 
 async function deleteProjectPath(options = {}) {
@@ -856,8 +864,8 @@ async function inspectRemoteScope(target, relativePath, directory, timeoutMs, re
 
 function relayTarFiles(source, destination, paths, timeoutMs) {
   if (!paths.length) return Promise.resolve();
-  const sourceCommand = `cd ${shellQuote(source.remotePath)} && tar --null -T - -cf -`;
-  const destinationCommand = `cd ${shellQuote(destination.remotePath)} && tar -xf -`;
+  const sourceCommand = `cd ${shellQuote(source.remotePath)} && tar --null -T - -cvf -`;
+  const destinationCommand = `cd ${shellQuote(destination.remotePath)} && tar -xvf - --index-file=/dev/stderr`;
   return new Promise((resolve, reject) => {
     const reader = spawn("ssh", getSshArgs(source, sourceCommand), { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     const writer = spawn("ssh", getSshArgs(destination, destinationCommand), { windowsHide: true, stdio: ["pipe", "ignore", "pipe"] });
@@ -871,7 +879,10 @@ function relayTarFiles(source, destination, paths, timeoutMs) {
       clearTimeout(timer);
       if (error) { reader.kill(); writer.kill(); reject(error); } else resolve();
     };
-    const timer = timeoutMs > 0 ? setTimeout(() => finish(new Error("本机内存转发超过传输时限。")), timeoutMs) : null;
+    const timer = null;
+    const monitor = watchTransferProcess(reader, finish, true, paths);
+    const destinationMonitor = watchTransferProcess(writer, finish, true, paths);
+    reader.stdout.on("data", (chunk) => { monitor.receive(chunk); destinationMonitor.receive(chunk); });
     reader.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
     writer.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
     reader.on("error", (error) => finish(error));
@@ -1101,7 +1112,7 @@ async function projectTree(options = {}) {
 
 function remoteBatchStage(command) {
   const text = String(command || "");
-  if (/tar --null -T - -cf -/.test(text)) return "无压缩打包传输";
+  if (/tar --null -T - -cvf -/.test(text)) return "无压缩打包传输";
   if (/hashlib|sha256|inspect/.test(text) || /python3 -c/.test(text)) return "内容清单";
   return "远端命令";
 }
@@ -1125,8 +1136,10 @@ function runRemoteBatchSsh(source, command, paths, timeoutMs) {
       clearTimeout(timer);
       if (error) reject(error); else resolve(value);
     };
-    const timer = timeoutMs > 0 ? setTimeout(() => { child.kill(); finish(new Error(`跨 Worker ${stage}超时。`)); }, timeoutMs) : null;
+    const timer = null;
+    const monitor = watchTransferProcess(child, finish, true, paths);
     child.stdout.on("data", (chunk) => {
+      monitor.receive(chunk);
       stdout += chunk.toString("utf8");
       if (stdout.length > 4 * 1024 * 1024) { child.kill(); finish(new Error("远端批量清单超过 4 MB。")); }
     });
@@ -1162,6 +1175,8 @@ function hashQuiescenceHelpers() {
     "   chunk=os.read(descriptor,1048576)",
     "   if not chunk: break",
     "   h.update(chunk)",
+    "   hash_stats['processedBytes']=hash_stats.get('processedBytes',0)+len(chunk)",
+    "   sys.stderr.write('SIMPLE_PROGRESS '+json.dumps({'phase':'hashing','processedBytes':hash_stats['processedBytes']})+chr(10)); sys.stderr.flush()",
     "  closed=os.fstat(descriptor)",
     " finally:",
     "  os.close(descriptor)",
@@ -1257,7 +1272,10 @@ function batchFileHashScript() {
     " if os.path.islink(full) or not os.path.isfile(full): raise ValueError('batch path is not a file: '+rel)",
     " stat=os.lstat(full)",
     " cached=lookup_cached(rel,full,stat)",
-    " if cached is not None: found[rel]=cached[0]; continue",
+    " if cached is not None:",
+    "  found[rel]=cached[0]",
+    "  sys.stderr.write('SIMPLE_PROGRESS '+json.dumps({'phase':'hashing','processedFiles':len(found)})+chr(10)); sys.stderr.flush()",
+    "  continue",
     " hashed=stable_digest(full,time.monotonic()+quiet_s,poll_s)",
     " if hashed is None: unstable.append(rel)",
     " else:",
@@ -1368,9 +1386,9 @@ function partitionTransferPaths(paths, singleStreamFiles = 80, parallelSlots = 4
 
 function directTarBatchCommand(source, destination) {
   const destinationHost = `${destination.username}@${destination.host}`;
-  const destinationCommand = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && test "$root" = ${shellQuote(destination.remotePath)} && cd -- "$root" && tar -xf -`;
+  const destinationCommand = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && test "$root" = ${shellQuote(destination.remotePath)} && cd -- "$root" && tar -xvf - --index-file=/dev/stderr`;
   const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${destination.port}`;
-  const sourceCommand = `root=$(realpath -e -- ${shellQuote(source.remotePath)}) && test "$root" = ${shellQuote(source.remotePath)} && cd -- "$root" && tar --null -T - -cf - | ${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(destinationCommand)}`;
+  const sourceCommand = `root=$(realpath -e -- ${shellQuote(source.remotePath)}) && test "$root" = ${shellQuote(source.remotePath)} && cd -- "$root" && tar --null -T - -cvf - | ${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(destinationCommand)}`;
   return `bash -o pipefail -c ${shellQuote(sourceCommand)}`;
 }
 
@@ -2133,7 +2151,7 @@ function inspectRemoteManagedFiles(sftp, manifest, timeoutMs) {
   }
   const script = [
     "import hashlib,json,os,sys",
-    "root=os.path.realpath(sys.argv[1]); files=json.load(sys.stdin); bad=[]",
+    "root=os.path.realpath(sys.argv[1]); files=json.load(sys.stdin); bad=[]; processed=0",
     "for rel,item in files.items():",
     " parts=rel.split('/')",
     " if not rel or any(p in ('','.','..') for p in parts): raise ValueError('unsafe path')",
@@ -2143,7 +2161,9 @@ function inspectRemoteManagedFiles(sftp, manifest, timeoutMs) {
     " if not os.path.isfile(target): bad.append(rel); continue",
     " h=hashlib.sha256()",
     " with open(target,'rb') as stream:",
-    "  for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk)",
+    "  for chunk in iter(lambda:stream.read(1048576),b''):",
+    "   h.update(chunk); processed+=len(chunk)",
+    "   print('SIMPLE_PROGRESS '+json.dumps({'phase':'verifying','processedBytes':processed}),file=sys.stderr,flush=True)",
     " if h.hexdigest()!=str(item.get('sha256','')).lower(): bad.append(rel)",
     "print(json.dumps({'mismatches':bad}))",
   ].join("\n");
@@ -2159,7 +2179,8 @@ function inspectRemoteManagedFiles(sftp, manifest, timeoutMs) {
       clearTimeout(timer);
       if (error) reject(error); else resolve(value);
     };
-    const timer = setTimeout(() => { child.kill(); finish(new Error("远端代码 SHA256 校验超时。")); }, Math.max(1000, Number(timeoutMs) || 120000));
+    const timer = null;
+    const monitor = watchTransferProcess(child, finish);
     child.stdout.on("data", (chunk) => { stdout = (stdout + chunk.toString("utf8")).slice(-20 * 1024 * 1024); });
     child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
     child.on("error", (error) => finish(error));
@@ -2673,7 +2694,7 @@ async function pickRemoteDirectory({ remoteBase, sftp, title = "选择远端项�
 function listRemoteFiles(sftp, remotePath) {
   const command = `find ${shellQuote(remotePath)} -mindepth 1 -maxdepth 1 -type f -printf '%f\\t%s\\n' 2>/dev/null | sort`;
   return new Promise((resolve, reject) => {
-    execFile("ssh", getSshArgs(sftp, command), { timeout: 15000 }, (error, stdout, stderr) => {
+    const child = execFile("ssh", getSshArgs(sftp, command), { timeout: 0, windowsHide: true }, (error, stdout, stderr) => {
       if (error) {
         reject(new Error(`列出远端文件失败：${stderr || error.message}`));
         return;
@@ -2683,19 +2704,23 @@ function listRemoteFiles(sftp, remotePath) {
         return { name: String(name || "").trim(), sizeBytes: Number(sizeText) || 0 };
       }).filter((item) => item.name));
     });
+    const monitor = watchTransferProcess(child, reject, false);
+    child.stdout?.on("data", monitor.receive);
   });
 }
 
 function listRemoteDirs(sftp, remotePath) {
   const args = createListRemoteDirsSshArgs(sftp, remotePath);
   return new Promise((resolve, reject) => {
-    execFile("ssh", args, { timeout: 15000 }, (error, stdout, stderr) => {
+    const child = execFile("ssh", args, { timeout: 0, windowsHide: true }, (error, stdout, stderr) => {
       if (error) {
         reject(new Error(`列出远端目录失败：${stderr || error.message}`));
         return;
       }
       resolve(stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
     });
+    const monitor = watchTransferProcess(child, reject, false);
+    child.stdout?.on("data", monitor.receive);
   });
 }
 
@@ -2897,11 +2922,7 @@ function refreshConnectTimeoutFromConfig() {
     : 15;
 }
 
-function resolvedConnectTimeoutSeconds(value) {
-  const own = Number(value);
-  if (!Number.isFinite(own) || own < 0) return defaultConnectTimeoutSeconds;
-  return Math.min(Math.max(0, Math.floor(own)), 3600);
-}
+function resolvedConnectTimeoutSeconds(value) { return 30; }
 
 function nextTransferId(operation) {
   transferSequence += 1;
@@ -2919,6 +2940,12 @@ function createTransferController({ id, operation, localPath, remotePath, host }
     localPath,
     remotePath,
     host,
+    operationId: transferContext.getStore()?.operationId || id,
+    phase: "preparing",
+    processedFiles: 0,
+    processedBytes: 0,
+    progressScope: id,
+    lastProgressAt: new Date().toISOString(),
     startedAt: new Date().toISOString(),
     status: "running",
     totalBytes: 0,
@@ -2936,24 +2963,45 @@ function createTransferController({ id, operation, localPath, remotePath, host }
       cancelled = true;
       cancelReason = String(reason || "传输已取消");
       controller.status = "cancelled";
+      idle.dispose();
+      localApiServer?.publish({ type: "transfer_cancelled", data: { id, operationId: controller.operationId, reason: cancelReason, status: "cancelled" } });
       for (const listener of [...listeners]) {
         try { listener(cancelReason); } catch {}
       }
       return true;
     },
+    pause() { idle.pause(); parentController?.pause(); },
+    resume() { idle.resume(); parentController?.resume(); },
     dispose() {
       if (disposed) return;
       disposed = true;
+      idle.dispose();
       listeners.clear();
       activeTransfers.delete(controller.id);
     },
   };
+  const idle = new ProgressInactivity(120000, () => controller.cancel("文件步骤 120 秒无真实进展，已取消。请重新连接后检查目标文件，再重试。"));
+  let transferredBytes = 0;
+  Object.defineProperty(controller, "transferredBytes", { enumerable: true, get: () => transferredBytes, set: (value) => { if (disposed || cancelled) return; transferredBytes = value; controller.updateProgress({ processedBytes: value, phase: "transferring" }); } });
+  controller.updateProgress = (evidence) => {
+    if (disposed || cancelled || !idle.update(evidence)) return false;
+    if (evidence.phase) controller.phase = evidence.phase;
+    controller.progressScope = evidence.scope || id;
+    if (evidence.processedBytes !== undefined) controller.processedBytes = evidence.processedBytes;
+    if (evidence.processedFiles !== undefined) controller.processedFiles = Math.max(controller.processedFiles, evidence.processedFiles);
+    controller.lastProgressAt = new Date(idle.lastProgressAt).toISOString();
+    localApiServer?.publish({ type: "transfer_progress", data: { id, operationId: controller.operationId, phase: controller.phase, processedBytes: controller.processedBytes, progressScope: controller.progressScope, processedFiles: controller.processedFiles, lastProgressAt: controller.lastProgressAt, status: controller.status } });
+    if (parentController && parentController !== controller) parentController.updateProgress(evidence);
+    return true;
+  };
+  const parentController = transferContext.getStore();
+  parentController?.onCancel((reason) => controller.cancel(reason));
   activeTransfers.set(controller.id, controller);
   return controller;
 }
 
 function listActiveTransfers() {
-  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status, totalBytes, transferredBytes }) => ({
+  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status, totalBytes, transferredBytes, operationId, phase, processedFiles, processedBytes, progressScope, lastProgressAt }) => ({
     id,
     operation,
     localPath,
@@ -2963,16 +3011,12 @@ function listActiveTransfers() {
     status,
     totalBytes,
     transferredBytes,
+    operationId, phase, processedFiles, lastProgressAt,
+    processedBytes, progressScope,
   }));
 }
 
-function transferTimeoutMs(sftp, options = {}) {
-  const explicit = Number(options && options.timeoutMs);
-  if (Number.isFinite(explicit) && explicit >= 1000) return Math.round(explicit);
-  const seconds = Number(vscode.workspace.getConfiguration("simpleSftp").get("uploadTimeoutSeconds", 600));
-  if (!Number.isFinite(seconds) || seconds <= 0) return 0;
-  return Math.max(1000, Math.round(seconds * 1000));
-}
+function transferTimeoutMs(sftp, options = {}) { return 120000; }
 
 function uploadProgressCancellable(options = {}) {
   if (options && typeof options.cancellable === "boolean") return options.cancellable;
@@ -2980,12 +3024,13 @@ function uploadProgressCancellable(options = {}) {
 }
 
 function runUploadWithProgress(options, title, operation) {
-  // API callers also need the same visible byte progress as command callers.
-  return vscode.window.withProgress({
-    location: vscode.ProgressLocation.Notification,
-    title,
-    cancellable: uploadProgressCancellable(options),
-  }, (progress, token) => operation(token, progress));
+  return vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title, cancellable: uploadProgressCancellable(options) }, async (progress, token) => {
+    const controller = createTransferController({ id: nextTransferId(title), operation: title, localPath: options.localPath || "", remotePath: options.sftp?.remotePath || "", host: options.sftp?.host || "" });
+    controller.operationId = options._operationId || transferContext.getStore()?.operationId || controller.id;
+    const cancellation = token?.onCancellationRequested?.(() => controller.cancel("用户取消"));
+    try { const result = await transferContext.run(controller, () => operation(token, progress)); if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认"); return result; }
+    finally { cancellation?.dispose(); controller.dispose(); }
+  });
 }
 
 async function confirmTransferPath({ localPath, sftp, operation, detail, options = {} }) {
@@ -3011,7 +3056,10 @@ async function confirmTransferPath({ localPath, sftp, operation, detail, options
     const relative = path.win32.relative(currentLocation.hostPath, path.win32.normalize(String(localPath || "")));
     return relative === "" || (!relative.startsWith(`..${path.win32.sep}`) && relative !== ".." && !path.win32.isAbsolute(relative));
   })();
-  const answer = await vscode.window.showWarningMessage(
+  const waiting = transferContext.getStore();
+  waiting?.pause();
+  let answer;
+  try { answer = await vscode.window.showWarningMessage(
     [
       "【SimpleSFTP 文件位置确认】",
       "",
@@ -3023,7 +3071,7 @@ async function confirmTransferPath({ localPath, sftp, operation, detail, options
       preview.detail ? `文件范围：${preview.detail}` : "",
       "",
       "请确认本地宿主位置和远端预期位置均正确后再继续。",
-    ].filter(Boolean).join("\n"), { modal: true }, "仅本次继续", "此后该路径不再提醒", "取消");
+    ].filter(Boolean).join("\n"), { modal: true }, "仅本次继续", "此后该路径不再提醒", "取消"); } finally { waiting?.resume(); }
   if (answer === "此后该路径不再提醒") {
     if (extensionContext && extensionContext.globalState) {
       const next = [...new Set([...(Array.isArray(remembered) ? remembered : []), key])].slice(-100);
@@ -3048,7 +3096,7 @@ function createTransferPreview({ localPath, sftp, operation, detail }) {
 }
 
 function createLocalApiMethods() {
-  return {
+  const methods = {
     status: async () => {
       const active = getActiveSharedServer();
       return {
@@ -3374,11 +3422,17 @@ function createLocalApiMethods() {
     },
     "transfers.cancel": async (params = {}) => {
       const id = String(params.transferId || params.id || "").trim();
-      if (!id) throw new Error("缺少传输 transferId。");
-      const transfer = activeTransfers.get(id);
-      if (!transfer) throw new Error("未找到活动传输：" + (id || "-"));
-      transfer.cancel(String(params.reason || "用户通过 API 取消"));
-      return { ok: true, transferId: id, cancelled: true };
+      const operationId = String(params.operationId || "").trim();
+      if (!id && !operationId) throw new Error("缺少 transferId 或 operationId。");
+      const reason = String(params.reason || "用户通过 API 取消");
+      if (operationId) {
+        cancelledTransferOperations.set(operationId, reason);
+        while (cancelledTransferOperations.size > 512) cancelledTransferOperations.delete(cancelledTransferOperations.keys().next().value);
+      }
+      const targets = [...activeTransfers.values()].filter(t => id ? t.id === id : t.operationId === operationId);
+      if (!targets.length && !operationId) throw new Error("未找到活动传输：" + id);
+      for (const transfer of targets) transfer.cancel(reason);
+      return { ok: true, transferId: id, operationId, cancelled: true };
     },
     "upload.workspace": async (params = {}) => {
       const localPath = String(params.localPath || "").trim();
@@ -3474,6 +3528,17 @@ function createLocalApiMethods() {
       return { ok: true, resetCount: previous.length };
     },
   };
+  for (const [name, method] of Object.entries(methods)) {
+    if (!/^(sync[.]|upload[.]|download[.]|remote[.])/.test(name)) continue;
+    methods[name] = async (params = {}) => {
+      const controller = createTransferController({ id: nextTransferId(name), operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "" });
+      controller.operationId = params._operationId || controller.id;
+      if (cancelledTransferOperations.has(controller.operationId)) { controller.dispose(); throw new Error(cancelledTransferOperations.get(controller.operationId)); }
+      try { const result = await transferContext.run(controller, () => method(params)); if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认"); return result; }
+      finally { controller.dispose(); }
+    };
+  }
+  return methods;
 }
 
 function requireApiConfirmation(params, { method, operation, sftp, localPath, pathRequired, detail }) {
@@ -3768,9 +3833,41 @@ function getRemoteMarkerPath(remotePath, markerName) {
   return `${String(remotePath).replace(/\/+$/, "")}/${safeMarkerName}`;
 }
 
+
+function watchTransferProcess(child, onIdle, fileStep = true, filenames = []) {
+  const parent = transferContext.getStore();
+  let buffer = "", bytes = 0, files = 0;
+  const allowed = new Set(filenames), completed = new Set();
+  const byteBase = parent?.transferredBytes || 0, fileBase = parent?.processedFiles || 0;
+  const idle = new ProgressInactivity(fileStep ? 120000 : 30000, () => { child.kill(); onIdle(new Error(fileStep ? "文件步骤 120 秒无真实进展，已停止。" : "控制请求 30 秒无有效响应，执行结果待确认。")); });
+  parent?.onCancel((reason) => { child.kill(); idle.dispose(); onIdle(new Error(reason)); });
+  if (parent?.status === "cancelled") { child.kill(); idle.dispose(); throw new Error("传输已取消"); }
+  const update = (evidence) => {
+    evidence = { ...evidence, scope: String(child.pid || child) };
+    idle.update(evidence);
+    parent?.updateProgress({ ...evidence, processedBytes: byteBase + (evidence.processedBytes || 0), processedFiles: fileBase + (evidence.processedFiles || 0) });
+  };
+  const receive = (chunk) => { bytes += chunk.length; update({ processedBytes: bytes }); };
+  const stderr = (chunk) => {
+    buffer += chunk.toString("utf8");
+    let index;
+    while ((index = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, index); buffer = buffer.slice(index + 1);
+      if (allowed.has(line) && !completed.has(line)) { completed.add(line); update({ phase: "packing", processedFiles: completed.size }); }
+      if (!line.startsWith("SIMPLE_PROGRESS ")) continue;
+      try { const item = JSON.parse(line.slice(16)); update(item); } catch {}
+    }
+    if (buffer.length > 16384) buffer = buffer.slice(-16384);
+  };
+  child.stderr?.on("data", stderr);
+  child.once("close", () => idle.dispose());
+  child.once("error", () => idle.dispose());
+  return { dispose: () => idle.dispose(), receive, update };
+}
+
 function runSsh(sftp, command, timeout) {
   return new Promise((resolve, reject) => {
-    execFile("ssh", getSshArgs(sftp, command), { timeout, maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
+    const child = execFile("ssh", getSshArgs(sftp, command), { timeout: 0, windowsHide: true, maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
       if (error) {
         const failure = new Error(stderr || error.message);
         failure.stderr = stderr;
@@ -3783,6 +3880,8 @@ function runSsh(sftp, command, timeout) {
       }
       resolve(stdout);
     });
+    const monitor = watchTransferProcess(child, reject, Boolean(transferContext.getStore()));
+    child.stdout?.on("data", monitor.receive);
   });
 }
 
@@ -4232,13 +4331,14 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
         tokenDisposable = token.onCancellationRequested(() => fail(new Error("传输已取消")));
       }
     }
-    const timeout = Number(timeoutMs) || transferTimeoutMs(sftp);
-    if (timeout > 0) {
-      timer = setTimeout(() => fail(new Error(`SimpleSFTP 传输超过 ${Math.round(timeout / 1000)} 秒未完成，已停止。`)), timeout);
-    }
+
 
     sshProc.on("error", fail);
+    let unpackBuffer = ""; const unpacked = new Set();
     sshProc.stderr.on("data", (chunk) => {
+      unpackBuffer += chunk.toString("utf8");
+      const lines = unpackBuffer.split("\n"); unpackBuffer = lines.pop() || "";
+      for (const name of lines) { if (plan.files.some(file => tarEntryPath(file.relativePath) === name) && !unpacked.has(name)) { unpacked.add(name); controller.updateProgress({ phase: "unpacking", processedFiles: unpacked.size }); } }
       sshStderr = appendProcessOutput(sshStderr, chunk);
     });
     sshProc.stdin.on("error", () => {});
@@ -4267,7 +4367,7 @@ function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, 
 
 function createRemoteExtractCommand(remotePath) {
   const safeRemotePath = String(remotePath).replace(/\/+$/, "");
-  return `mkdir -p ${shellQuote(safeRemotePath)} && tar -xf - -C ${shellQuote(safeRemotePath)}`;
+  return `mkdir -p ${shellQuote(safeRemotePath)} && tar -xvf - --index-file=/dev/stderr -C ${shellQuote(safeRemotePath)}`;
 }
 
 let mappedDownloadTransport = null;
@@ -4319,7 +4419,7 @@ async function downloadMappedPathsCore(options = {}) {
         timeoutMs: transferTimeoutMs(sftp, options),
         transferId: options.transferId,
         signal: {
-          cancelled: () => Boolean(options.token && options.token.isCancellationRequested),
+          cancelled: () => Boolean(options.token && options.token.isCancellationRequested || transferContext.getStore()?.status === "cancelled"),
         },
       }));
       stream = transportResult;
@@ -4344,12 +4444,13 @@ async function downloadMappedPathsCore(options = {}) {
       localPath,
       maxFileBytes: plan.maxFileBytes,
       overwrite: plan.overwrite,
-      shouldCancel: () => Boolean(options.token && options.token.isCancellationRequested),
+      shouldCancel: () => Boolean(options.token && options.token.isCancellationRequested || transferContext.getStore()?.status === "cancelled"),
       onFileBytes: (bytes) => {
         progressState.transferredBytes += bytes;
+        transferContext.getStore()?.updateProgress({ phase: "distributing", processedBytes: progressState.transferredBytes });
         report(`已接收 ${progressState.transferredBytes} 字节，正在按映射写入`);
       },
-      onFile: () => { progressState.completedFiles += 1; },
+      onFile: () => { progressState.completedFiles += 1; transferContext.getStore()?.updateProgress({ phase: "distributing", processedFiles: progressState.completedFiles }); },
     });
     if (written.length !== plan.entries.length) {
       const missing = plan.entries.filter((entry) => !written.some((item) => item.remotePath === entry.remotePath));
@@ -4460,10 +4561,7 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
       tokenDisposable = token.onCancellationRequested(() => fail(new Error("传输已取消")));
     }
   }
-  const timeout = Number(timeoutMs) || transferTimeoutMs(sftp);
-  if (timeout > 0) {
-    timer = setTimeout(() => fail(new Error(`SimpleSFTP 传输超过 ${Math.round(timeout / 1000)} 秒未完成，已停止。`)), timeout);
-  }
+
   sshProc.on("error", fail);
   sshProc.stderr.on("data", (chunk) => { sshStderr = appendProcessOutput(sshStderr, chunk); });
   sshProc.stdout.on("data", (chunk) => {
@@ -4869,7 +4967,7 @@ function runRemoteTarExtract({ localPath, sftp, downloadScope, timeoutMs, token,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    const tarProc = spawn("tar", ["-xf", "-", "-C", localPath], {
+    const tarProc = spawn("tar", ["-xvf", "-", "-C", localPath], {
       windowsHide: true,
       stdio: ["pipe", "ignore", "pipe"],
     });
@@ -4938,18 +5036,26 @@ function runRemoteTarExtract({ localPath, sftp, downloadScope, timeoutMs, token,
         tokenDisposable = token.onCancellationRequested(() => fail(new Error("传输已取消")));
       }
     }
-    const timeout = Number(timeoutMs) || transferTimeoutMs(sftp);
-    if (timeout > 0) {
-      timer = setTimeout(() => fail(new Error(`SimpleSFTP 传输超过 ${Math.round(timeout / 1000)} 秒未完成，已停止。`)), timeout);
-    }
+
 
     sshProc.on("error", fail);
     tarProc.on("error", fail);
     sshProc.stderr.on("data", (chunk) => {
       sshStderr = appendProcessOutput(sshStderr, chunk);
     });
+    let unpackBuffer = ""; const unpacked = new Set();
     tarProc.stderr.on("data", (chunk) => {
       tarStderr = appendProcessOutput(tarStderr, chunk);
+      unpackBuffer += chunk.toString("utf8");
+      let newline;
+      while ((newline = unpackBuffer.indexOf("\n")) >= 0) {
+        const entry = unpackBuffer.slice(0, newline).replace(/\r$/, ""); unpackBuffer = unpackBuffer.slice(newline + 1);
+        // Windows bsdtar reports only successfully extracted members with the x prefix.
+        if (entry.startsWith("x ") && !unpacked.has(entry)) {
+          unpacked.add(entry); controller.updateProgress({ phase: "unpacking", processedFiles: unpacked.size });
+        }
+      }
+      if (unpackBuffer.length > 16384) unpackBuffer = unpackBuffer.slice(-16384);
     });
     tarProc.stdin.on("error", () => {});
 
