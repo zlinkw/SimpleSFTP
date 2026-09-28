@@ -23,6 +23,9 @@ function createRunner() {
       },
     },
     uploadProgressCancellable: () => true,
+    createTransferController: () => ({ id: "test", status: "running", dispose() {} }),
+    transferContext: new (require("node:async_hooks").AsyncLocalStorage)(),
+    nextTransferId: () => "test",
   };
   vm.createContext(sandbox);
   vm.runInContext(`${source.slice(start, end)}\nthis.run = runUploadWithProgress;`, sandbox);
@@ -63,6 +66,8 @@ test("SSH spawn errors settle uploads even if killing the child throws", async (
     createRemoteExtractCommand: () => "tar -xf -",
     hashUploadPlanChunks: () => ({ algorithm: "sha256", chunks: [] }),
     tarEntryPath: (value) => value,
+    remoteResourceServer: () => "worker:22",
+    withFileResourceLease: (_operation, _project, _paths, _server, work) => work(),
     createTransferController: () => ({ onCancel() {}, dispose() { disposed = true; } }),
     nextTransferId: () => "test-upload",
     getSshArgs: () => [],

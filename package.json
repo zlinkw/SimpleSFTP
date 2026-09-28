@@ -1,8 +1,8 @@
 {
 	"name": "simple-sftp",
 	"displayName": "SimpleSFTP",
-	"description": "为远端项目创建本地 SFTP 同步工作区，并提供低频文件上传下载能力。",
-	"version": "0.2.44",
+	"description": "为远端项目创建本地 SFTP 同步工作区，并提供批量文件上传下载与进度反馈。",
+	"version": "0.2.45",
 	"publisher": "simple-local",
 	"extensionKind": [
 		"ui"
@@ -10,7 +10,7 @@
 	"license": "MIT",
 	"scripts": {
 		"test": "node --check extension.js && node --check tar-writer.js && node --test test/*.test.js",
-    "package": "npm exec -- @vscode/vsce package --no-dependencies --out simple-sftp-0.2.44.vsix --allow-missing-repository"
+    "package": "npm exec -- @vscode/vsce package --no-dependencies --out simple-sftp-0.2.45.vsix --allow-missing-repository"
 	},
 	"bin": {
 		"simple-sftp-api": "./bin/simple-sftp-api.js"
@@ -20,6 +20,7 @@
 		"api-server.js",
 		"host-operation-lease.js",
 		"progress-inactivity.js",
+		"resource-operation-lease.js",
 		"workspace-path.js",
 		"tar-writer.js",
 		"bin/simple-sftp-api.js",
@@ -167,7 +168,7 @@
 				},
 				"simpleSftp.connectTimeoutSeconds": {
 					"type": "number",
-					"default": 15,
+					"default": 30,
 					"minimum": 1,
 					"maximum": 3600,
 					"description": "SSH 建立连接超时秒数，防止服务器未开机或隧道不可用时上传、下载长时间挂起。"
@@ -177,7 +178,7 @@
 					"default": 600,
 					"minimum": 0,
 					"maximum": 86400,
-					"description": "上传或下载整体超时秒数，0 表示不限制。"
+					"description": "兼容旧配置；不再限制业务总时长。文件步骤连续 120 秒无真实进展才结束等待。"
 				},
 				"simpleSftp.uploadCancellable": {
 					"type": "boolean",

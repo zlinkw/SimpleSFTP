@@ -800,7 +800,7 @@ async function deleteProjectPath(options = {}) {
       requires: ["confirm", "pathConfirmed", "secondConfirmation", "confirmedAbsolutePath"] });
   const command = guardedRemoteDeleteCommand(target, relativePath);
   try {
-    await runSsh(target, command, transferTimeoutMs(target, options));
+    await withFileResourceLease("删除确认目标", target.remotePath, [relativePath], remoteResourceServer(target), () => runSsh(target, command, transferTimeoutMs(target, options)));
   } catch (error) {
     const message = formatError(error);
     if (message.includes("PARENT_CD_FAILED")) throw new Error(`PARENT_CD_FAILED：无法进入或验证父目录 ${path.posix.dirname(absolutePath)}；禁止删除。`);
@@ -813,7 +813,7 @@ function directSyncCommand(source, destination, relativePath, directory, deleteO
   const sourcePath = path.posix.join(source.remotePath, relativePath);
   const destinationPath = path.posix.join(destination.remotePath, relativePath);
   const destinationHost = `${destination.username}@${destination.host}`;
-  const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p ${destination.port}`;
+  const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 -p ${destination.port}`;
   const destinationGuard = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && target=$(realpath -m -- ${shellQuote(destinationPath)}) && case "$target" in "$root"/*) ;; *) exit 72;; esac`;
   if (deleteOnly) return `${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(guardedRemoteDeleteCommand(destination, relativePath))}`;
   const destinationParent = directory ? destinationPath : path.posix.dirname(destinationPath);
@@ -844,7 +844,7 @@ async function syncServerToServer(options = {}) {
     source, destination, relativePath, directory: options.directory === true, deleteOnly: options.deleteOnly === true, deleteStale: true,
   });
   if (options.deleteOnly === true) {
-    await runSsh(destination, guardedRemoteDeleteCommand(destination, relativePath), transferTimeoutMs(destination, options));
+    await withFileResourceLease("删除确认目标", destination.remotePath, [relativePath], remoteResourceServer(destination), () => runSsh(destination, guardedRemoteDeleteCommand(destination, relativePath), transferTimeoutMs(destination, options)));
     return { ok: true, source, destination, relativePath, directory: options.directory === true, deletedStale: true };
   }
   const packed = await syncServerToServerFpsync({ ...options, source, destination,
@@ -863,6 +863,11 @@ async function inspectRemoteScope(target, relativePath, directory, timeoutMs, re
 }
 
 function relayTarFiles(source, destination, paths, timeoutMs) {
+  if (!paths.length) return Promise.resolve();
+  return withFileResourceLease("Worker 流传输", destination.remotePath, paths, remoteResourceServer(destination),
+    () => relayTarFilesCore(source, destination, paths, timeoutMs));
+}
+function relayTarFilesCore(source, destination, paths, timeoutMs) {
   if (!paths.length) return Promise.resolve();
   const sourceCommand = `cd ${shellQuote(source.remotePath)} && tar --null -T - -cvf -`;
   const destinationCommand = `cd ${shellQuote(destination.remotePath)} && tar -xvf - --index-file=/dev/stderr`;
@@ -1393,6 +1398,11 @@ function directTarBatchCommand(source, destination) {
 }
 
 async function transferPartitionedTar(source, destination, paths, timeoutMs, onPartition) {
+  if (!paths.length) return transferPartitionedTarCore(source, destination, paths, timeoutMs, onPartition);
+  return withFileResourceLease("Worker 批量同步", destination.remotePath, paths, remoteResourceServer(destination),
+    () => transferPartitionedTarCore(source, destination, paths, timeoutMs, onPartition));
+}
+async function transferPartitionedTarCore(source, destination, paths, timeoutMs, onPartition) {
   // One uncompressed tar stream for a small batch. Larger batches use at most
   // four live streams. A failure stops new groups and waits for live ones.
   const groups = partitionTransferPaths(paths);
@@ -2808,15 +2818,24 @@ function getWorkspaceRoot(folder = getPrimaryWorkspaceFolder()) {
   return location ? location.hostPath : "";
 }
 
+async function withFileResourceLease(operation, project, paths, server, work) {
+  if (process.platform !== "win32") throw new Error("SimpleSFTP 文件副作用必须由 Windows UI Extension Host 执行。");
+  const targetProject = server === "local" ? path.resolve(project) : String(project).replace(/\/+$/, "");
+  const resources = (paths.length ? paths : [targetProject]).map(target => ({
+    server, project: targetProject, target: server === "local" ? path.resolve(targetProject, target) : (target.startsWith("/") ? target : targetProject + "/" + target),
+  }));
+  return hostOperationLease.run({ pluginId: "simple-local.simple-sftp", workspaceUri: "file://" + targetProject,
+    hostProjectPath: targetProject, actionType: operation, actionLabel: operation, resources }, work);
+}
+function remoteResourceServer(sftp) { return String(sftp.host).toLowerCase() + ":" + normalizeSshPort(sftp.port, 22); }
+
 async function withHostOperationLease(actionType, actionLabel, localPath, operation) {
   if (process.platform !== "win32") {
     throw new Error("SimpleSFTP 文件副作用必须由 Windows UI Extension Host 执行。");
   }
+  if (/^(upload-|download-|sync-from-remote|mark-handoff-ready)/.test(actionType)) return operation();
   const folders = Array.isArray(vscode.workspace.workspaceFolders) ? vscode.workspace.workspaceFolders : [];
-  if (folders.length > 1) {
-    throw new Error("检测到多个工作区文件夹，已阻止 SimpleSFTP 宿主副作用操作。请在独立窗口中只打开一个目标项目。");
-  }
-  const folder = folders[0];
+  const folder = getWorkspaceFolderForFile(localPath) || (folders.length === 1 ? folders[0] : null);
   const location = folder ? workspaceLocationForFolder(folder) : null;
   const hostProjectPath = String(location && location.hostPath || localPath || "(未打开工作区)");
   const workspaceUri = String(location && location.editorUri || folder && folder.uri && folder.uri.toString?.(true) || "untitled://simple-sftp/no-workspace");
@@ -2997,6 +3016,7 @@ function createTransferController({ id, operation, localPath, remotePath, host }
   const parentController = transferContext.getStore();
   parentController?.onCancel((reason) => controller.cancel(reason));
   activeTransfers.set(controller.id, controller);
+  if (parentController?.status === "cancelled") controller.cancel("上层操作已取消");
   return controller;
 }
 
@@ -3024,13 +3044,18 @@ function uploadProgressCancellable(options = {}) {
 }
 
 function runUploadWithProgress(options, title, operation) {
-  return vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title, cancellable: uploadProgressCancellable(options) }, async (progress, token) => {
+  const execute = async (progress, token) => {
     const controller = createTransferController({ id: nextTransferId(title), operation: title, localPath: options.localPath || "", remotePath: options.sftp?.remotePath || "", host: options.sftp?.host || "" });
     controller.operationId = options._operationId || transferContext.getStore()?.operationId || controller.id;
     const cancellation = token?.onCancellationRequested?.(() => controller.cancel("用户取消"));
-    try { const result = await transferContext.run(controller, () => operation(token, progress)); if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认"); return result; }
-    finally { cancellation?.dispose(); controller.dispose(); }
-  });
+    try {
+      if (controller.status === "cancelled") throw new Error("传输已取消");
+      const result = await transferContext.run(controller, () => operation(token, progress));
+      if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认"); return result;
+    } finally { cancellation?.dispose(); controller.dispose(); }
+  };
+  if (options.apiMode) return execute({ report() {} }, undefined);
+  return vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title, cancellable: uploadProgressCancellable(options) }, execute);
 }
 
 async function confirmTransferPath({ localPath, sftp, operation, detail, options = {} }) {
@@ -3825,7 +3850,7 @@ async function writeRemoteHandoffMarker(sftp, markerName, marker) {
   const markerPath = getRemoteMarkerPath(sftp.remotePath, markerName);
   const json = `${JSON.stringify(marker, null, 2)}\n`;
   const command = `printf %s ${shellQuote(json)} > ${shellQuote(markerPath)}`;
-  await runSsh(sftp, command, 15000);
+  await withFileResourceLease("写入交接标记", sftp.remotePath, [markerPath], remoteResourceServer(sftp), () => runSsh(sftp, command, 15000));
 }
 
 function getRemoteMarkerPath(remotePath, markerName) {
@@ -4236,7 +4261,13 @@ function getWorkspaceFolderForFile(filePath) {
     .map(({ folder }) => folder)[0] || null;
 }
 
-function runLocalTarUpload({ localPath, sftp, uploadPlan, operation, timeoutMs, token, transferId, progress }) {
+function runLocalTarUpload(options) {
+  const plan = options.uploadPlan || createWorkspaceUploadPlan(options.localPath, options.sftp);
+  return withFileResourceLease(options.operation || "批量上传", options.sftp.remotePath,
+    plan.files.map(file => file.relativePath), remoteResourceServer(options.sftp),
+    () => runLocalTarUploadCore({ ...options, uploadPlan: plan }));
+}
+function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, timeoutMs, token, transferId, progress }) {
   const remoteCommand = createRemoteExtractCommand(sftp.remotePath);
   const plan = uploadPlan || createWorkspaceUploadPlan(localPath, sftp);
   const manifestContent = `${plan.files.map((file) => tarEntryPath(file.relativePath)).join("\n")}\n`;
@@ -4438,7 +4469,7 @@ async function downloadMappedPathsCore(options = {}) {
       watchSshExit();
     }
     stage.name = "extract";
-    const written = await extractMappedTarStream({
+    const written = await withFileResourceLease("指标文件分发", localPath, plan.entries.map(entry => entry.localRelativePath), "local", () => extractMappedTarStream({
       stream,
       byArchiveName,
       localPath,
@@ -4451,7 +4482,7 @@ async function downloadMappedPathsCore(options = {}) {
         report(`已接收 ${progressState.transferredBytes} 字节，正在按映射写入`);
       },
       onFile: () => { progressState.completedFiles += 1; transferContext.getStore()?.updateProgress({ phase: "distributing", processedFiles: progressState.completedFiles }); },
-    });
+    }));
     if (written.length !== plan.entries.length) {
       const missing = plan.entries.filter((entry) => !written.some((item) => item.remotePath === entry.remotePath));
       const error = new Error(`映射下载未完成：缺少 ${missing.map((entry) => entry.remotePath).join("、") || "未知条目"}。阶段：解包。下一步：核对远端文件是否仍是普通文件后重试这一批。`);
@@ -4953,7 +4984,11 @@ async function downloadRemoteToLocalCore({ localPath, sftp, downloadScope }) {
   );
 }
 
-function runRemoteTarExtract({ localPath, sftp, downloadScope, timeoutMs, token, transferId, progress }) {
+function runRemoteTarExtract(options) {
+  return withFileResourceLease("批量下载", options.localPath, options.downloadScope?.paths || [], "local",
+    () => runRemoteTarExtractCore(options));
+}
+function runRemoteTarExtractCore({ localPath, sftp, downloadScope, timeoutMs, token, transferId, progress }) {
   const remoteCommand = createRemoteTarCommand(sftp, downloadScope);
   return new Promise((resolve, reject) => {
     const controller = createTransferController({
