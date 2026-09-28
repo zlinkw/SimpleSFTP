@@ -10,9 +10,9 @@ const LOOPBACK_REMOTE_ADDRESSES = new Set([
   "::1",
   "::ffff:127.0.0.1",
 ]);
-const DEFAULT_MAX_EVENTS = 64;
+const DEFAULT_MAX_EVENTS = 0;
 const DEFAULT_EVENT_BUFFER_LIMIT = 128;
-const DEFAULT_SSE_TIMEOUT_MS = 30_000;
+const DEFAULT_SSE_TIMEOUT_MS = 0;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_PORT = 65535;
 
@@ -46,7 +46,7 @@ class LocalApiServer {
     this.discoveryPath = options.discoveryPath || "";
     this.sseTimeoutMs = positiveNumber(options.sseTimeoutMs, DEFAULT_SSE_TIMEOUT_MS);
     this.maxEvents = Math.max(
-      1,
+      0,
       Math.min(1024, positiveNumber(options.maxEvents, DEFAULT_MAX_EVENTS))
     );
     this.events = [];
@@ -214,6 +214,7 @@ class LocalApiServer {
     });
     let sent = 0;
     let closed = false;
+    let timer;
     const close = () => {
       if (closed) return;
       closed = true;
@@ -222,23 +223,24 @@ class LocalApiServer {
       response.end();
     };
     const sendEvent = (item) => {
-      if (closed || sent >= this.maxEvents) return;
+      if (item.type === "done") { close(); return; }
+      if (closed || (this.maxEvents > 0 && sent >= this.maxEvents)) return;
       response.write(`id: ${item.seq}\nevent: ${item.type}\ndata: ${JSON.stringify(item.data)}\n\n`);
       sent += 1;
-      if (sent >= this.maxEvents) close();
+      if (this.maxEvents > 0 && sent >= this.maxEvents) close();
     };
     const listener = (item) => sendEvent(item);
     this.listeners.add(listener);
-    request.on("close", close);
+    response.on("close", close);
     for (const item of this.events) {
       if (item.seq > since) sendEvent(item);
       if (closed) return;
     }
-    if (this.maxEvents === 0 || sent >= this.maxEvents) {
+    if (this.maxEvents > 0 && sent >= this.maxEvents) {
       close();
       return;
     }
-    const timer = setTimeout(close, this.sseTimeoutMs);
+    if (this.sseTimeoutMs > 0) timer = setTimeout(close, this.sseTimeoutMs);
   }
 
   health() {
@@ -308,7 +310,7 @@ class LocalApiServer {
         },
         "/api/v1/health": { get: { responses: { 200: { description: "Health" } } } },
         "/api/v1/capabilities": { get: { responses: { 200: { description: "Capabilities" } } } },
-        "/api/v1/events": { get: { responses: { 200: { description: "Bounded SSE stream" } } } },
+        "/api/v1/events": { get: { responses: { 200: { description: "Persistent SSE stream" } } } },
       },
     };
   }
