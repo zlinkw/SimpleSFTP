@@ -245,6 +245,10 @@ function startLocalApiServer(context) {
     preferredPort: 19766,
     discoveryPath: path.join(APPDATA, "SimpleSFTP", "api.json"),
     methods: createLocalApiMethods(),
+    methodOptions: {
+      "sync.serverToServerFpsync": { compression: ["auto", "gzip", "none"], singleStream: "boolean" },
+      "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"] },
+    },
   });
   localApiServer = server;
   context.subscriptions.push({
@@ -862,15 +866,16 @@ async function inspectRemoteScope(target, relativePath, directory, timeoutMs, re
   return scopeHashPayload(JSON.parse(stdout));
 }
 
-function relayTarFiles(source, destination, paths, timeoutMs) {
+function relayTarFiles(source, destination, paths, timeoutMs, options = {}) {
   if (!paths.length) return Promise.resolve();
   return withFileResourceLease("Worker 流传输", destination.remotePath, paths, remoteResourceServer(destination),
-    () => relayTarFilesCore(source, destination, paths, timeoutMs));
+    () => relayTarFilesCore(source, destination, paths, timeoutMs, options));
 }
-function relayTarFilesCore(source, destination, paths, timeoutMs) {
+function relayTarFilesCore(source, destination, paths, timeoutMs, options = {}) {
   if (!paths.length) return Promise.resolve();
-  const sourceCommand = `cd ${shellQuote(source.remotePath)} && tar --null -T - -cvf -`;
-  const destinationCommand = `cd ${shellQuote(destination.remotePath)} && tar -xvf - --index-file=/dev/stderr`;
+  const compression = transferCompression(options);
+  const sourceCommand = `bash -o pipefail -c ${shellQuote(`cd ${shellQuote(source.remotePath)} && ${tarPackingCommand(compression)}`)}`;
+  const destinationCommand = `bash -o pipefail -c ${shellQuote(`cd ${shellQuote(destination.remotePath)} && ${tarUnpackingCommand(compression)}`)}`;
   return new Promise((resolve, reject) => {
     const reader = spawn("ssh", getSshArgs(source, sourceCommand), { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     const writer = spawn("ssh", getSshArgs(destination, destinationCommand), { windowsHide: true, stdio: ["pipe", "ignore", "pipe"] });
@@ -1117,7 +1122,7 @@ async function projectTree(options = {}) {
 
 function remoteBatchStage(command) {
   const text = String(command || "");
-  if (/tar --null -T - -cvf -/.test(text)) return "无压缩打包传输";
+  if (/tar --null -T - -cvf -/.test(text)) return /gzip|pigz/.test(text) ? "压缩打包传输" : "无压缩打包传输";
   if (/hashlib|sha256|inspect/.test(text) || /python3 -c/.test(text)) return "内容清单";
   return "远端命令";
 }
@@ -1389,29 +1394,46 @@ function partitionTransferPaths(paths, singleStreamFiles = 80, parallelSlots = 4
   return groups;
 }
 
-function directTarBatchCommand(source, destination) {
+function transferCompression(options = {}) {
+  const compression = options.compression === undefined ? "auto" : String(options.compression);
+  if (!["auto", "gzip", "none"].includes(compression)) throw new Error("compression 必须是 auto、gzip 或 none。");
+  return compression === "none" ? "none" : "gzip";
+}
+
+function tarPackingCommand(compression) {
+  // Bound compressor CPU even when several transfers share the same Worker.
+  const compressor = "if command -v pigz >/dev/null 2>&1; then pigz -p 2 -6 -c; else gzip -6 -c; fi";
+  return `tar --null -T - -cvf -${compression === "none" ? "" : ` | (${compressor})`}`;
+}
+
+function tarUnpackingCommand(compression) {
+  return `${compression === "none" ? "" : "gzip -dc | "}tar -xvf - --index-file=/dev/stderr`;
+}
+
+function directTarBatchCommand(source, destination, options = {}) {
+  const compression = transferCompression(options);
   const destinationHost = `${destination.username}@${destination.host}`;
-  const destinationCommand = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && test "$root" = ${shellQuote(destination.remotePath)} && cd -- "$root" && tar -xvf - --index-file=/dev/stderr`;
+  const destinationScript = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && test "$root" = ${shellQuote(destination.remotePath)} && cd -- "$root" && ${tarUnpackingCommand(compression)}`;
+  const destinationCommand = `bash -o pipefail -c ${shellQuote(destinationScript)}`;
   const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${destination.port}`;
-  const sourceCommand = `root=$(realpath -e -- ${shellQuote(source.remotePath)}) && test "$root" = ${shellQuote(source.remotePath)} && cd -- "$root" && tar --null -T - -cvf - | ${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(destinationCommand)}`;
+  const sourceCommand = `root=$(realpath -e -- ${shellQuote(source.remotePath)}) && test "$root" = ${shellQuote(source.remotePath)} && cd -- "$root" && ${tarPackingCommand(compression)} | ${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(destinationCommand)}`;
   return `bash -o pipefail -c ${shellQuote(sourceCommand)}`;
 }
 
-async function transferPartitionedTar(source, destination, paths, timeoutMs, onPartition) {
-  if (!paths.length) return transferPartitionedTarCore(source, destination, paths, timeoutMs, onPartition);
+async function transferPartitionedTar(source, destination, paths, timeoutMs, onPartition, options = {}) {
+  if (!paths.length) return transferPartitionedTarCore(source, destination, paths, timeoutMs, onPartition, options);
   return withFileResourceLease("Worker 批量同步", destination.remotePath, paths, remoteResourceServer(destination),
-    () => transferPartitionedTarCore(source, destination, paths, timeoutMs, onPartition));
+    () => transferPartitionedTarCore(source, destination, paths, timeoutMs, onPartition, options));
 }
-async function transferPartitionedTarCore(source, destination, paths, timeoutMs, onPartition) {
-  // One uncompressed tar stream for a small batch. Larger batches use at most
-  // four live streams. A failure stops new groups and waits for live ones.
-  const groups = partitionTransferPaths(paths);
+async function transferPartitionedTarCore(source, destination, paths, timeoutMs, onPartition, options = {}) {
+  // Explicit grouped archives stay in one stream; other large batches use at most four.
+  const groups = partitionTransferPaths(paths, options.singleStream === true ? Math.max(paths.length, 1) : 80);
   let next = 0;
   let completed = 0;
   let completedFiles = 0;
   let failed = false;
   let failure = null;
-  const directCommand = directTarBatchCommand(source, destination);
+  const directCommand = directTarBatchCommand(source, destination, options);
   const report = (phase, index, group) => {
     if (failed || !onPartition) return;
     onPartition({ phase, index, groupFiles: group.length, completed, total: groups.length, completedFiles, totalFiles: paths.length });
@@ -1439,7 +1461,7 @@ async function transferPartitionedTarCore(source, destination, paths, timeoutMs,
             return;
           }
           try {
-            await relayTarFiles(source, destination, group, timeoutMs);
+            await relayTarFiles(source, destination, group, timeoutMs, options);
           } catch (relayError) {
             noteFailure(relayError);
             return;
@@ -1484,6 +1506,7 @@ async function syncServerToServerFpsync(options = {}) {
 }
 
 async function syncServerToServerFpsyncCore(options = {}, progress) {
+  const compression = transferCompression(options);
   const source = directSyncTarget(options.source, "来源");
   const destination = directSyncTarget(options.destination, "目标");
   if (source.host === destination.host && source.port === destination.port && source.remotePath === destination.remotePath) throw new Error("来源与目标相同。");
@@ -1527,9 +1550,9 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   const paths = directory ? Object.keys(sourceHashes).sort() : requested;
   const digest = (entry) => typeof entry === "string" ? entry : entry && entry.sha256;
   const changed = paths.filter((name) => digest(sourceHashes[name]) !== digest(destinationHashes[name]));
-  const planned = partitionTransferPaths(changed);
+  const planned = partitionTransferPaths(changed, options.singleStream === true ? Math.max(changed.length, 1) : 80);
   progress.report({ message: changed.length
-    ? `清单完成（${inventoryMs} ms）；需无压缩流处理 ${changed.length}/${paths.length} 个文件，共 ${planned.length} 组`
+    ? `清单完成（${inventoryMs} ms）；需${compression === "none" ? "无压缩" : "gzip 压缩"}流处理 ${changed.length}/${paths.length} 个文件，共 ${planned.length} 组`
     : `清单完成（${inventoryMs} ms）；${paths.length} 个文件均无需传输，准备校验…` });
   const streamStartedAt = Date.now();
   const partitions = await transferPartitionedTar(source, destination, changed, timeoutMs, (event) => {
@@ -1539,7 +1562,7 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
     }
     const percent = event.totalFiles ? Math.floor(event.completedFiles * 90 / event.totalFiles) : 90;
     advance(percent, `第 ${event.index}/${event.total} 组流处理结束 · 已完成 ${event.completedFiles}/${event.totalFiles} 个文件`);
-  });
+  }, options);
   const streamMs = Math.max(0, Date.now() - streamStartedAt);
   advance(95, `流处理结束（${streamMs} ms，含打包、传输与解包）；正在校验目标 Worker 的 ${paths.length} 个文件…`);
   const verifyStartedAt = Date.now();
@@ -1565,7 +1588,8 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   };
   advance(100, `完成：传输 ${changed.length}/${paths.length} 个文件，SHA256 校验通过 · 清单 ${timing.inventoryMs} ms · 流处理 ${timing.streamMs} ms · 校验 ${timing.verifyMs} ms`);
   return { ok: true, paths: paths.length, transferredFiles: changed.length, partitions,
-    verification: "sha256", transport: "partitioned-tar", directory, relativePath, timing, hashCache };
+    verification: "sha256", transport: "partitioned-tar", compression, singleStream: options.singleStream === true,
+    directory, relativePath, timing, hashCache };
 }
 
 async function syncFromRemoteCore(options = {}) {
@@ -2414,6 +2438,7 @@ function normalizeMappedDownloadEntries(options = {}) {
     entries,
     maxFileBytes,
     overwrite,
+    compression: transferCompression({ compression: options.compression === undefined ? "none" : options.compression }),
     byteCount: entries.reduce((total, entry) => total + (entry.bytes || 0), 0),
   };
 }
@@ -4431,7 +4456,7 @@ async function downloadMappedPathsCore(options = {}) {
     progressState.message = message;
     if (options.progress && typeof options.progress.report === "function") options.progress.report({ message });
   };
-  report(`校验 ${plan.entries.length} 个映射，准备一次无压缩打包`);
+  report(`校验 ${plan.entries.length} 个映射，准备一次${plan.compression === "gzip" ? "gzip 压缩" : "无压缩"}打包`);
   let stream;
   let sshExitSeen = null;
   const watchSshExit = () => {
@@ -4505,6 +4530,7 @@ async function downloadMappedPathsCore(options = {}) {
       transferredBytes: progressState.transferredBytes,
       completedFiles: written.length,
       streamCount: 1,
+      compression: plan.compression || "none",
       sshCount: stage.sshCount,
       entries: written,
       phase: "complete",
@@ -4564,6 +4590,7 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
   let timer;
   let tokenDisposable;
   let lastProgressAt = 0;
+  const archiveDecoder = plan.compression === "gzip" ? require("node:zlib").createGunzip() : null;
   const finishFailure = (error) => {
     const classified = classifySftpFailure(error, sftp, {
       command: remoteCommand,
@@ -4574,6 +4601,7 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
     classified.sshCode = error && error.sshCode;
     classified.nextStep = "SSH 打包流未完成；核对主机、超时和远端 python3 后重试整批。";
     rejectExit(classified);
+    archiveDecoder?.destroy();
     output.destroy();
   };
   const fail = (error) => {
@@ -4582,6 +4610,7 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
     clearTimeout(timer);
     if (tokenDisposable && typeof tokenDisposable.dispose === "function") tokenDisposable.dispose();
     controller.dispose();
+    archiveDecoder?.destroy();
     try { sshProc.kill(); } catch {}
     finishFailure(error);
   };
@@ -4594,6 +4623,11 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
   }
 
   sshProc.on("error", fail);
+  if (archiveDecoder) {
+    archiveDecoder.on("error", fail);
+    archiveDecoder.on("data", (chunk) => { if (!output.write(chunk)) archiveDecoder.pause(); });
+    archiveDecoder.on("drain", () => sshProc.stdout.resume());
+  }
   sshProc.stderr.on("data", (chunk) => { sshStderr = appendProcessOutput(sshStderr, chunk); });
   sshProc.stdout.on("data", (chunk) => {
     controller.transferredBytes += chunk.length;
@@ -4602,9 +4636,10 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
       progress.report({ message: `已接收 ${controller.transferredBytes} 字节，正在解包映射` });
       lastProgressAt = now;
     }
-    if (!output.write(chunk)) sshProc.stdout.pause();
+    if (!(archiveDecoder || output).write(chunk)) sshProc.stdout.pause();
   });
   output.on("drain", () => {
+    if (archiveDecoder) { archiveDecoder.resume(); return; }
     if (sshProc.stdout && !sshProc.stdout.destroyed && typeof sshProc.stdout.resume === "function") sshProc.stdout.resume();
   });
   output.on("close", () => {
@@ -4630,9 +4665,14 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
       return;
     }
     if (settled) return;
-    settled = true;
-    output.end();
-    resolveExit({ sshCode: 0 });
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      output.end();
+      resolveExit({ sshCode: 0 });
+    };
+    if (archiveDecoder) { archiveDecoder.once("end", finish); archiveDecoder.end(); }
+    else finish();
   });
   return output;
 }
@@ -4646,9 +4686,10 @@ function createMappedDownloadScript(remotePath, plan) {
   const payload = Buffer.from(JSON.stringify({
     files: plan.entries.map((entry) => ({ remotePath: entry.remotePath, archiveName: `mapped/${entry.index}`, bytes: entry.bytes })),
     maxFileBytes: plan.maxFileBytes,
+    compression: plan.compression || "none",
   }), "utf8").toString("base64");
   return [
-    "import base64,json,os,sys,tarfile",
+    "import base64,gzip,json,os,sys,tarfile",
     `root=os.path.realpath(${JSON.stringify(remotePath)})`,
     `request=json.loads(base64.b64decode(${JSON.stringify(payload)}).decode('utf-8'))`,
     "files=request.get('files') or []",
@@ -4680,13 +4721,15 @@ function createMappedDownloadScript(remotePath, plan) {
     "    if size > limit: fail('remote file exceeds limit: '+rel)",
     "    if declared is not None and int(declared) != size: fail('remote size changed: '+rel)",
     "    selected.append((archive, full, size))",
-    "with tarfile.open(fileobj=sys.stdout.buffer, mode='w|', format=tarfile.GNU_FORMAT) as archive:",
+    "sink=gzip.GzipFile(fileobj=sys.stdout.buffer,mode='wb',compresslevel=6) if request.get('compression') == 'gzip' else sys.stdout.buffer",
+    "with tarfile.open(fileobj=sink, mode='w|', format=tarfile.GNU_FORMAT) as archive:",
     "    for name, full, size in selected:",
     "        info=tarfile.TarInfo(name)",
     "        info.size=size",
     "        info.mode=0o644",
     "        info.type=tarfile.REGTYPE",
     "        with open(full, 'rb') as handle: archive.addfile(info, handle)",
+    "if request.get('compression') == 'gzip': sink.close()",
   ].join("\n");
 }
 
@@ -5485,6 +5528,9 @@ module.exports = {
     removeLocalStagingDirectory,
     batchDestinationGuardCommand,
     directTarBatchCommand,
+    tarPackingCommand,
+    tarUnpackingCommand,
+    transferCompression,
     partitionTransferPaths,
     transferPartitionedTar,
     syncServerToServerFpsyncCore,

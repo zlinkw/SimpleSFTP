@@ -130,8 +130,10 @@ test("partitioned packed transfer groups small files and blocks unconfirmed writ
     __test.directSyncTarget({ host: "target", user: "research", remotePath: "/projects/demo" }, "目标"),
   );
   assert.match(direct, /bash -o pipefail -c/);
-  assert.match(direct, /tar --null -T - -cf -/);
-  assert.match(direct, /tar -xf -/);
+  assert.match(direct, /tar --null -T - -cvf -/);
+  assert.match(direct, /tar -xvf -/);
+  assert.match(direct, /gzip -dc/);
+  assert.match(direct, /pigz -p 2 -6 -c/);
   assert.doesNotMatch(direct, /--delete|rm -/);
   const method = __test.createLocalApiMethods()["sync.serverToServerFpsync"];
   const params = {

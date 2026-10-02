@@ -46,10 +46,13 @@ test("first packed group reports before the batch finishes and completion waits 
   let releaseTar;
   const tarGate = new Promise((resolve) => { releaseTar = resolve; });
   let sawStartBeforeRelease = false;
+  let packedStarted;
+  const started = new Promise((resolve) => { packedStarted = resolve; });
   installTransport(async (source, command, paths) => {
-    if (/tar --null -T - -cf -/.test(command)) {
+    if (/tar --null -T - -cvf -/.test(command)) {
       tarCalls += 1;
       if (!sawStartBeforeRelease) sawStartBeforeRelease = messages.some((message) => message.includes("正在流处理（打包、传输与解包）"));
+      packedStarted();
       await tarGate;
       return "";
     }
@@ -67,7 +70,7 @@ test("first packed group reports before the batch finishes and completion waits 
     pathConfirmed: true,
     timeoutMs: 1000,
   }, { report: (event) => { messages.push(event.message); reports.push(event); } });
-  await new Promise((resolve) => setTimeout(resolve, 30));
+  await started;
   assert.equal(sawStartBeforeRelease, true);
   assert.equal(messages.some((message) => message.startsWith("完成：")), false);
   assert.equal(reports.reduce((sum, event) => sum + (event.increment || 0), 0), 0);
@@ -198,14 +201,14 @@ test("nonzero pack exit keeps the stage, stderr, and exit code", async () => {
   const childProcess = require("node:child_process");
   const realSpawn = childProcess.spawn;
   childProcess.spawn = () => {
+    const child = new (require("node:events").EventEmitter)();
     const handlers = {};
-    return {
+    return Object.assign(child, {
       stdout: { on() {} },
       stderr: { on(event, fn) { if (event === "data") handlers.stderr = fn; } },
-      stdin: { on() {}, end() { queueMicrotask(() => { if (handlers.stderr) handlers.stderr(Buffer.from("tar: refused\n")); if (handlers.close) handlers.close(23); }); } },
+      stdin: { on() {}, end() { queueMicrotask(() => { if (handlers.stderr) handlers.stderr(Buffer.from("tar: refused\n")); child.emit("close", 23); }); } },
       kill() {},
-      on(event, fn) { if (event === "close") handlers.close = fn; },
-    };
+    });
   };
   const extensionPath = require.resolve("../extension.js");
   delete require.cache[extensionPath];
@@ -220,7 +223,7 @@ test("nonzero pack exit keeps the stage, stderr, and exit code", async () => {
   try {
     const fresh = require("../extension.js");
     await assert.rejects(fresh.__test.transferPartitionedTar(endpoint("source-a"), endpoint("target-b"), ["runs/steady.bin"], 0, () => {}), (error) => {
-      return error.exitCode === 23 && error.stage === "无压缩打包传输" && /tar: refused/.test(error.stderr) && /无压缩打包传输失败（退出码 23）/.test(error.message);
+      return error.exitCode === 23 && error.stage === "压缩打包传输" && /tar: refused/.test(error.stderr) && /压缩打包传输失败（退出码 23）/.test(error.message);
     });
   } finally {
     childProcess.spawn = realSpawn;

@@ -150,8 +150,9 @@ test("local API handles malformed JSON-RPC and unknown methods", async () => {
   }
 });
 
-test("local API exposes health, capabilities and loadable OpenAPI", async () => {
-  const f = await startServer({ "status": async () => ({ ok: true }), "upload.workspace": async () => ({ ok: true }) });
+test("local API exposes health, compression capabilities and loadable OpenAPI", async () => {
+  const methodOptions = { "sync.serverToServerFpsync": { compression: ["auto", "gzip", "none"], singleStream: "boolean" } };
+  const f = await startServer({ "status": async () => ({ ok: true }), "upload.workspace": async () => ({ ok: true }) }, { methodOptions });
   try {
     const health = await request(f.server.port, {
       method: "GET",
@@ -167,6 +168,7 @@ test("local API exposes health, capabilities and loadable OpenAPI", async () => 
       headers: { Authorization: `Bearer ${f.token}` },
     });
     assert.equal(JSON.parse(capabilities.text).confirmation.required, true);
+    assert.deepEqual(JSON.parse(capabilities.text).methodOptions, methodOptions);
 
     const openapi = await request(f.server.port, {
       method: "GET",
@@ -284,10 +286,11 @@ test("SimpleSFTP gates direct rsync behind explicit path confirmation", () => {
   assert.match(extensionSource, /const rsyncArgs = `-a -c -s --delete-missing-args/);
 });
 
-test("SimpleSFTP uploads have connect timeout, transfer timeout, cancellation and API control", () => {
+test("SimpleSFTP uploads have connect timeout, progress inactivity, cancellation and API control", () => {
   assert.match(extensionSource, /defaultConnectTimeoutSeconds = 15/);
   assert.match(extensionSource, /"-o", `ConnectTimeout=\$\{connectTimeout\}`/);
-  assert.match(extensionSource, /uploadTimeoutSeconds/);
+  assert.match(extensionSource, /ProgressInactivity/);
+  assert.equal(require("../package.json").contributes.configuration.properties["simpleSftp.uploadTimeoutSeconds"].description.includes("不再限制业务总时长"), true);
   assert.match(extensionSource, /cancellable: uploadProgressCancellable/);
   assert.match(extensionSource, /transfer\.cancel\(/);
   assert.match(extensionSource, /"transfers\.list": async/);

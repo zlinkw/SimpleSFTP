@@ -158,7 +158,9 @@ simple-sftp-api upload.workspace --json upload.json
 
 公开方法以 `/api/v1/capabilities` 的实时返回为准。
 
-`sync.downloadMappedPaths` 一次接收多条源到目标映射。请求需要明确的 `server`、本机安全根 `localPath`，以及 `entries`：每项含远端项目相对路径 `remotePath` 和本机项目相对路径 `localRelativePath`。远端只生成一个无压缩 tar 流，SSH 接收一次，解包时按映射写到各自最终路径。它不扫描整个项目，也不对每个文件单独发起 SSH。`confirm: true` 和 `pathConfirmed: true` 都是必需的；预览里包含每条映射。`overwrite: true` 才覆盖已有普通文件。`maxFileBytes` 默认 128 MiB。`metricsOnly: true` 只接受 csv/json/md/txt/log，并拒绝权重和检查点。绝对路径、`..`、符号链接、越出项目根、重复目标、把目录当文件，都会在传输前拒绝。失败或取消不会报整批成功，也不会删除已有目标。`sync.downloadPaths` 仍然要求远端相对路径与本机相对路径相同。
+`sync.serverToServerFpsync` 支持跨 Plan 的精确文件数组。`compression` 默认为 `auto`，采用 gzip 压缩流；来源可用 pigz 时使用两个线程，否则使用 gzip。`none` 可显式关闭压缩。`singleStream: true` 将同一来源和目标的一批文件放入一个压缩流，不按 Plan 分包；单次上限仍为 5000 个安全相对路径。直接 Worker 传输和本机中继都保持压缩，传输后仍逐文件校验 SHA256，不删除旧文件。
+
+`sync.downloadMappedPaths` 一次接收多条源到目标映射。请求需要明确的 `server`、本机安全根 `localPath`，以及 `entries`：每项含远端项目相对路径 `remotePath` 和本机项目相对路径 `localRelativePath`。远端只生成一个 tar 流，SSH 接收一次，解包时按映射写到各自最终路径。`compression: "auto"` 或 `"gzip"` 启用 gzip，完整解压校验与 SSH 成功后才发布文件；省略或 `"none"` 保持旧版无压缩兼容。SimpleExperiment 结果批量下载请求压缩。它不扫描整个项目，也不对每个文件单独发起 SSH。`confirm: true` 和 `pathConfirmed: true` 都是必需的；预览里包含每条映射。`overwrite: true` 才覆盖已有普通文件。`maxFileBytes` 默认 128 MiB。`metricsOnly: true` 只接受 csv/json/md/txt/log，并拒绝权重和检查点。绝对路径、`..`、符号链接、越出项目根、重复目标、把目录当文件，都会在传输前拒绝。失败或取消不会报整批成功，也不会删除已有目标。`sync.downloadPaths` 仍然要求远端相对路径与本机相对路径相同。
 
 指定文件上传时，`remotePath` 是实际目标目录。若同时传入 `server.remotePath`，两者必须一致；不一致时插件会拒绝上传。`target.show`、API 确认预览和实际传输使用同一目标解析逻辑。用服务器名称指定目标时，该名称必须匹配已保存的服务器配置；未知名称不会回退到当前活动服务器。上传前请核对预览中的主机、端口与远端目录。
 

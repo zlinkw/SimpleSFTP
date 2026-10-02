@@ -43,6 +43,7 @@ class LocalApiServer {
       options.token ||
       crypto.randomBytes(32).toString("base64url").replace(/[^a-zA-Z0-9]/g, "");
     this.methods = options.methods && typeof options.methods === "object" ? options.methods : {};
+    this.methodOptions = options.methodOptions || {};
     this.discoveryPath = options.discoveryPath || "";
     this.sseTimeoutMs = positiveNumber(options.sseTimeoutMs, DEFAULT_SSE_TIMEOUT_MS);
     this.maxEvents = Math.max(
@@ -263,6 +264,7 @@ class LocalApiServer {
       transport: ["http", "cli"],
       rpc: "json-rpc-2.0",
       methods: Object.keys(this.methods).sort(),
+      methodOptions: this.methodOptions,
       confirmation: {
         required: true,
         categories: ["confirm", "pathConfirmed"],

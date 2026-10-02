@@ -472,3 +472,51 @@ test("remote mapped script checks the file list before writing a tar", () => {
   assert.match(script, /mode='w\|'/);
   assert.doesNotMatch(script, /os\.walk/);
 });
+
+test("cross-Plan metrics download uses one gzip stream and waits for decompression before publishing", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-gzip-"));
+  keep(root);
+  const entries = [
+    { remotePath: "results/plan-a/raw.csv", localRelativePath: "out/a.csv" },
+    { remotePath: "results/plan-b/raw.csv", localRelativePath: "out/b.csv" },
+  ];
+  const params = baseParams(root, entries, { compression: "auto" });
+  const plan = __test.normalizeMappedDownloadEntries(params);
+  let streams = 0;
+  __test.setMappedDownloadTransport(async ({ remoteCommand }) => {
+    assert.match(remoteCommand, /gzip\.GzipFile/);
+    const chunks = [];
+    for await (const chunk of tarStream([{ name: "mapped/0", body: "latest-a" }, { name: "mapped/1", body: "latest-b" }])) chunks.push(chunk);
+    streams++;
+    return __test.openMappedDownloadStream({
+      sftp: server(), plan, localPath: root,
+      spawnImpl: () => fakeSsh([require("node:zlib").gzipSync(Buffer.concat(chunks))], 0),
+    });
+  });
+  const result = await __test.createLocalApiMethods()["sync.downloadMappedPaths"](params);
+  assert.equal(streams, 1);
+  assert.equal(result.compression, "gzip");
+  assert.equal(result.fileCount, 2);
+  assert.equal(fs.readFileSync(path.join(root, "out/a.csv"), "utf8"), "latest-a");
+  assert.equal(fs.readFileSync(path.join(root, "out/b.csv"), "utf8"), "latest-b");
+});
+
+test("a truncated gzip footer fails without replacing the current metrics file", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-gzip-truncated-"));
+  keep(root);
+  fs.mkdirSync(path.join(root, "out"));
+  fs.writeFileSync(path.join(root, "out/a.csv"), "last-good", "utf8");
+  const params = baseParams(root, [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv" }], { compression: "gzip", overwrite: true });
+  const plan = __test.normalizeMappedDownloadEntries(params);
+  __test.setMappedDownloadTransport(async () => {
+    const chunks = [];
+    for await (const chunk of tarStream([{ name: "mapped/0", body: "new" }])) chunks.push(chunk);
+    const compressed = require("node:zlib").gzipSync(Buffer.concat(chunks));
+    return __test.openMappedDownloadStream({
+      sftp: server(), plan, localPath: root,
+      spawnImpl: () => fakeSsh([compressed.subarray(0, compressed.length - 8)], 0),
+    });
+  });
+  await assert.rejects(__test.createLocalApiMethods()["sync.downloadMappedPaths"](params), /unexpected end|打包流|解包/);
+  assert.equal(fs.readFileSync(path.join(root, "out/a.csv"), "utf8"), "last-good");
+});
