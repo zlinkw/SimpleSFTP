@@ -361,6 +361,7 @@ test("API cancel during the real SSH stream kills that one child", async () => {
   const stdout = new PassThrough();
   let killed = 0;
   let sshCalls = 0;
+  let sshProc;
   const token = {
     isCancellationRequested: false,
     onCancellationRequested(listener) {
@@ -368,6 +369,7 @@ test("API cancel during the real SSH stream kills that one child", async () => {
       if (this.ready) this.ready();
     },
   };
+  const operationId = `mapped-cancel-${Date.now()}`;
   const plan = __test.normalizeMappedDownloadEntries({
     entries: [
       { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
@@ -383,28 +385,43 @@ test("API cancel during the real SSH stream kills that one child", async () => {
     token,
     spawnImpl: () => {
       sshCalls += 1;
-      return {
+      const handlers = new Map();
+      sshProc = {
         stdout,
         stderr: new PassThrough(),
         kill() { killed += 1; },
         on(event, listener) {
-          if (event === "error") this.onError = listener;
+          const listeners = handlers.get(event) || [];
+          listeners.push(listener); handlers.set(event, listeners);
           return this;
         },
+        once(event, listener) { return this.on(event, listener); },
       };
+      sshProc.emitClose = (code = null, signal = "SIGTERM") => { for (const listener of handlers.get("close") || []) listener(code, signal); };
+      return sshProc;
     },
   }));
-  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  const methods = __test.createLocalApiMethods();
+  const method = methods["sync.downloadMappedPaths"];
   const pending = method(baseParams(root, [
     { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
     { remotePath: "results/b.csv", localRelativePath: "out/b.csv" },
-  ], { token }));
+  ], { token, _operationId: operationId }));
   await new Promise((resolve) => { token.ready = resolve; });
-  token.isCancellationRequested = true;
-  token.listener();
+  const cancellation = await methods["transfers.cancel"]({ operationId });
+  assert.equal(cancellation.status, "cancelling");
+  assert.equal(cancellation.settled, false);
   await assert.rejects(pending, /取消|阶段：transfer/);
   assert.equal(sshCalls, 1);
   assert.equal(killed, 1);
+  assert.equal(__test.listActiveTransfers().some((transfer) => transfer.operation === "映射批量下载"), true);
+  const beforeExit = await methods["transfers.list"]({});
+  assert.equal(beforeExit.settledOperations.some((row) => row.operationId === operationId), false);
+  sshProc.emitClose();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(__test.listActiveTransfers().some((transfer) => transfer.operation === "映射批量下载"), false);
+  const afterExit = await methods["transfers.list"]({});
+  assert.equal(afterExit.settledOperations.some((row) => row.operationId === operationId && row.status === "settled"), true);
 });
 
 test("ancestor junction swapped after the first file is rejected before the second write", async () => {

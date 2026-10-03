@@ -250,6 +250,7 @@ class LocalApiServer {
       schemaVersion: 1,
       name: this.name,
       version: this.version,
+      instanceId: this.instanceId(),
       pid: process.pid,
       port: this.port,
       startedAt: this.startedAt,
@@ -261,6 +262,8 @@ class LocalApiServer {
       schemaVersion: 1,
       name: this.name,
       version: this.version,
+      instanceId: this.instanceId(),
+      features: { transferSettlementReceipts: true },
       transport: ["http", "cli"],
       rpc: "json-rpc-2.0",
       methods: Object.keys(this.methods).sort(),
@@ -270,6 +273,10 @@ class LocalApiServer {
         categories: ["confirm", "pathConfirmed"],
       },
     };
+  }
+
+  instanceId() {
+    return this.startedAt ? `${process.pid}:${this.startedAt}` : "";
   }
 
   openapi() {

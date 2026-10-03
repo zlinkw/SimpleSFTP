@@ -167,8 +167,11 @@ test("local API exposes health, compression capabilities and loadable OpenAPI", 
       path: "/api/v1/capabilities",
       headers: { Authorization: `Bearer ${f.token}` },
     });
-    assert.equal(JSON.parse(capabilities.text).confirmation.required, true);
-    assert.deepEqual(JSON.parse(capabilities.text).methodOptions, methodOptions);
+    const capabilityBody = JSON.parse(capabilities.text);
+    assert.equal(capabilityBody.confirmation.required, true);
+    assert.match(capabilityBody.instanceId, /^\d+:/);
+    assert.equal(capabilityBody.features.transferSettlementReceipts, true);
+    assert.deepEqual(capabilityBody.methodOptions, methodOptions);
 
     const openapi = await request(f.server.port, {
       method: "GET",

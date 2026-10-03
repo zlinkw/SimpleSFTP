@@ -56,7 +56,7 @@ test("SSH spawn errors settle uploads even if killing the child throws", async (
   const uploadStart = source.indexOf("function runLocalTarUpload(");
   const uploadEnd = source.indexOf("function createRemoteExtractCommand(", uploadStart);
   assert.ok(uploadStart >= 0 && uploadEnd > uploadStart);
-  let disposed = false;
+  let disposed = false, child;
   const sandbox = {
     Date,
     Promise,
@@ -69,6 +69,7 @@ test("SSH spawn errors settle uploads even if killing the child throws", async (
     remoteResourceServer: () => "worker:22",
     withFileResourceLease: (_operation, _project, _paths, _server, work) => work(),
     createTransferController: () => ({ onCancel() {}, dispose() { disposed = true; } }),
+    trackTransferResource: () => {},
     nextTransferId: () => "test-upload",
     getSshArgs: () => [],
     transferTimeoutMs: () => 200,
@@ -76,8 +77,9 @@ test("SSH spawn errors settle uploads even if killing the child throws", async (
     appendProcessOutput: () => "",
     writeTarEntriesToStream: () => new Promise(() => {}),
     spawn: () => {
-      const child = new EventEmitter();
+      child = new EventEmitter();
       child.stdin = new EventEmitter();
+      child.stdin.end = () => {};
       child.stderr = new EventEmitter();
       child.kill = () => { throw new Error("kill failed"); };
       queueMicrotask(() => child.emit("error", new Error("ssh unavailable")));
@@ -93,5 +95,7 @@ test("SSH spawn errors settle uploads even if killing the child throws", async (
     operation: "test",
     timeoutMs: 200,
   }), /ssh unavailable/);
+  assert.equal(disposed, false);
+  child.emit("close", null, "SIGTERM");
   assert.equal(disposed, true);
 });

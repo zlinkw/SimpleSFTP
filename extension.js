@@ -124,12 +124,19 @@ const uploadQueues = new Map();
 const activeTransfers = new Map();
 const cancelledTransferOperations = new Map();
 const activeUploadOperations = new Map();
+const transferOperationLedger = new Map();
+const activeTransferResources = new Map();
 const SAVE_UPLOAD_STATE = "simple-sftp-upload-state.json";
 const TARGET_DOWNLOAD_SCOPE_STATE = "sftp-download-scopes.json";
 const DEFAULT_DOWNLOAD_EXTENSIONS = ["*"];
 const DEFAULT_DOWNLOAD_MAX_FILE_SIZE_MB = 1024;
 const PATH_CONFIRMATIONS_STATE = "simple-sftp-confirmed-transfer-paths.v1";
+const TRANSFER_OPERATION_STATE = "simple-sftp-transfer-settlement.v1";
+const MAX_TRANSFER_OPERATIONS = 512;
+const SETTLED_TRANSFER_TTL_MS = 24 * 60 * 60 * 1000;
 let transferSequence = 0;
+let transferLedgerLoaded = false;
+let transferLedgerWrite = Promise.resolve();
 let defaultConnectTimeoutSeconds = 15;
 let extensionContext;
 let localApiServer;
@@ -139,6 +146,7 @@ const hostOperationLease = new HostOperationLeaseManager();
 
 function activate(context) {
   extensionContext = context;
+  loadTransferOperationLedger();
   refreshConnectTimeoutFromConfig();
   const command = vscode.commands.registerCommand(
     "simpleSftp.createOrOpen",
@@ -1843,7 +1851,7 @@ async function uploadManifestLocalFilesToRemote({ localPath, sftp, manifest, cha
 
 async function uploadFiles(options = {}) {
   const localPath = resolveLocalWorkspacePath(options.localBase || options.localPath, "上传指定文件");
-  const operationId = String(options.transferId || nextTransferId("upload-files"));
+  const operationId = String(transferContext.getStore()?.operationId || options.transferId || nextTransferId("upload-files"));
   activeUploadOperations.set(operationId, { id: operationId, stage: "acquiring-lease", startedAt: new Date().toISOString() });
   try {
     return await withHostOperationLease("upload-files", "上传指定文件", localPath, () => {
@@ -3022,6 +3030,7 @@ function createTransferController({ id, operation, localPath, remotePath, host }
       idle.dispose();
       listeners.clear();
       activeTransfers.delete(controller.id);
+      void maybeSettleTransferOperation(controller.operationId);
     },
   };
   const idle = new ProgressInactivity(120000, () => controller.cancel("文件步骤 120 秒无真实进展，已取消。请重新连接后检查目标文件，再重试。"));
@@ -3059,6 +3068,183 @@ function listActiveTransfers() {
     operationId, phase, processedFiles, lastProgressAt,
     processedBytes, progressScope,
   }));
+}
+
+function currentTransferApiInstanceId() {
+  return localApiServer && typeof localApiServer.instanceId === "function" && localApiServer.instanceId()
+    ? localApiServer.instanceId()
+    : `${process.pid}:simple-sftp-unavailable`;
+}
+
+function loadTransferOperationLedger() {
+  if (transferLedgerLoaded) return;
+  transferLedgerLoaded = true;
+  const saved = extensionContext?.globalState?.get(TRANSFER_OPERATION_STATE, []);
+  if (!Array.isArray(saved)) return;
+  for (const row of saved.slice(-MAX_TRANSFER_OPERATIONS)) {
+    if (!row || typeof row.operationId !== "string" || typeof row.operationInstanceId !== "string") continue;
+    const normalized = {
+      operationId: row.operationId,
+      operationInstanceId: row.operationInstanceId,
+      status: row.status === "settled" ? "settled" : "outcomeUnknown",
+      startedAt: String(row.startedAt || ""),
+      settledAt: row.status === "settled" ? String(row.settledAt || "") : "",
+      cancelRequestedAt: String(row.cancelRequestedAt || ""),
+      reason: String(row.reason || ""),
+      remoteMutation: row.remoteMutation === true,
+      requestKey: String(row.requestKey || ""),
+      requestDone: false,
+      outcomeUnknown: row.status !== "settled",
+      persisted: row.status === "settled",
+      settling: false,
+    };
+    if (normalized.status !== "settled" || Date.now() - Date.parse(normalized.settledAt || "") < SETTLED_TRANSFER_TTL_MS)
+      transferOperationLedger.set(normalized.operationId, normalized);
+  }
+}
+
+function pruneTransferOperationLedger() {
+  const now = Date.now();
+  for (const [id, row] of transferOperationLedger) {
+    if (row.status === "settled" && now - Date.parse(row.settledAt || "") >= SETTLED_TRANSFER_TTL_MS)
+      transferOperationLedger.delete(id);
+  }
+  while (transferOperationLedger.size >= MAX_TRANSFER_OPERATIONS) {
+    const settledId = [...transferOperationLedger].find(([, row]) => row.status === "settled")?.[0];
+    if (!settledId) throw new Error("SimpleSFTP 有过多尚未确认退出的传输，未启动新传输。");
+    transferOperationLedger.delete(settledId);
+  }
+}
+
+function persistTransferOperationLedger() {
+  const context = extensionContext;
+  transferLedgerWrite = transferLedgerWrite.catch(() => undefined).then(() => {
+    if (!context?.globalState?.update) return;
+    const rows = [...transferOperationLedger.values()].slice(-MAX_TRANSFER_OPERATIONS).map(({ requestDone, outcomeUnknown, persisted, settling, ...row }) => row);
+    return context.globalState.update(TRANSFER_OPERATION_STATE, rows);
+  });
+  return transferLedgerWrite;
+}
+
+function transferRequestKey(method, params) {
+  const localPath = String(params.localPath || params.localBase || params.workspacePath || "").trim().replace(/[\\/]+/g, "/");
+  const identity = {
+    method,
+    localPath: process.platform === "win32" ? localPath.toLowerCase() : localPath,
+    remotePath: String(params.remotePath || "").trim(),
+    targetId: params.targetId || params.serverId || "",
+    host: params.host || "",
+    server: params.server && { id: params.server.id, name: params.server.name, host: params.server.host, remotePath: params.server.remotePath, port: params.server.port, username: params.server.username },
+    source: params.source && { id: params.source.id, host: params.source.host, remotePath: params.source.remotePath, port: params.source.port, username: params.source.username },
+    destination: params.destination && { id: params.destination.id, host: params.destination.host, remotePath: params.destination.remotePath, port: params.destination.port, username: params.destination.username },
+    target: params.target && { id: params.target.id, host: params.target.host, remotePath: params.target.remotePath, port: params.target.port, username: params.target.username },
+  };
+  return crypto.createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+}
+
+async function beginTransferOperation(operationId, requestedInstanceId, remoteMutation, requestKey) {
+  loadTransferOperationLedger();
+  pruneTransferOperationLedger();
+  const id = String(operationId || "").trim();
+  const instanceId = currentTransferApiInstanceId();
+  if (!id || !instanceId) throw new Error("SimpleSFTP 传输身份尚未就绪，未启动传输。");
+  if (requestedInstanceId && requestedInstanceId !== instanceId)
+    throw new Error("SimpleSFTP 实例已变化，未启动旧身份传输。");
+  if (transferOperationLedger.has(id)) throw new Error("SimpleSFTP 请求身份已使用，未重复启动传输。");
+  const targetKey = /^[a-f0-9]{64}$/i.test(String(requestKey || "")) ? String(requestKey).toLowerCase() : transferRequestKey("unknown", {});
+  const blocker = [...transferOperationLedger.values()].find((row) => row.status !== "settled" && row.requestKey === targetKey);
+  if (blocker) {
+    const error = new Error("相同传输目标仍有未确认的旧请求，未启动并发传输。");
+    error.apiData = { blockedOperationId: blocker.operationId, operationInstanceId: blocker.operationInstanceId };
+    throw error;
+  }
+  const row = { operationId: id, operationInstanceId: instanceId, requestKey: targetKey, status: "running", startedAt: new Date().toISOString(), settledAt: "", cancelRequestedAt: "", reason: "", remoteMutation: remoteMutation === true, requestDone: false, outcomeUnknown: false, persisted: false, settling: false };
+  transferOperationLedger.set(id, row);
+  try { await persistTransferOperationLedger(); row.persisted = true; }
+  catch (error) { row.status = "outcomeUnknown"; row.outcomeUnknown = true; row.reason = "could not persist transfer start receipt"; throw error; }
+}
+
+function transferOperationResourceCount(operationId) {
+  return activeTransferResources.get(operationId)?.size || 0;
+}
+
+async function settleTransferOperation(row) {
+  if (!row || !row.requestDone || row.status === "settled" || row.outcomeUnknown || row.settling || transferOperationResourceCount(row.operationId) > 0) return;
+  const hasLiveController = [...activeTransfers.values()].some((transfer) => transfer.operationId === row.operationId);
+  const hasLiveUpload = activeUploadOperations.has(row.operationId);
+  if (hasLiveController || hasLiveUpload) return;
+  row.settling = true;
+  row.status = "settled";
+  row.settledAt = new Date().toISOString();
+  row.persisted = false;
+  try {
+    await persistTransferOperationLedger();
+    row.persisted = true;
+  } catch (error) {
+    row.status = "outcomeUnknown";
+    row.settledAt = "";
+    row.reason = "settlement receipt persistence failed";
+    row.outcomeUnknown = true;
+    await persistTransferOperationLedger().catch(() => undefined);
+    throw error;
+  } finally { row.settling = false; }
+}
+
+async function finishTransferOperation(operationId) {
+  const row = transferOperationLedger.get(operationId);
+  if (!row || row.status === "settled") return;
+  row.requestDone = true;
+  if (row.status !== "cancelling" && !row.outcomeUnknown && transferOperationResourceCount(operationId) > 0) row.status = "draining";
+  await persistTransferOperationLedger();
+  row.persisted = true;
+  await settleTransferOperation(row);
+}
+
+function markTransferOperationUnknown(operationId, reason) {
+  const row = transferOperationLedger.get(operationId);
+  if (!row || row.status === "settled") return;
+  row.outcomeUnknown = true;
+  row.status = "outcomeUnknown";
+  row.reason = String(reason || "transfer process exit could not confirm remote settlement");
+  void persistTransferOperationLedger().catch(() => undefined);
+}
+
+function trackTransferResource(resource, operationId = transferContext.getStore()?.operationId) {
+  const id = String(operationId || "").trim();
+  if (!id || !resource || typeof resource.once !== "function") return;
+  let resources = activeTransferResources.get(id);
+  if (!resources) activeTransferResources.set(id, resources = new Set());
+  if (resources.has(resource)) return;
+  resources.add(resource);
+  resource.once("close", (code, signal) => {
+    resources.delete(resource);
+    if (!resources.size) activeTransferResources.delete(id);
+    const row = transferOperationLedger.get(id);
+    if (row?.remoteMutation && (code === null || code === undefined || signal || code === 255))
+      markTransferOperationUnknown(id, `process closed without authoritative remote exit status (${signal || code})`);
+    void maybeSettleTransferOperation(id);
+  });
+}
+
+async function maybeSettleTransferOperation(operationId) {
+  const row = transferOperationLedger.get(operationId);
+  if (!row) return;
+  try { await settleTransferOperation(row); } catch { /* Keep outcome unknown and fail closed. */ }
+}
+
+async function listTransferOperationState() {
+  loadTransferOperationLedger();
+  await transferLedgerWrite.catch(() => undefined);
+  const rows = [...transferOperationLedger.values()].slice(-MAX_TRANSFER_OPERATIONS).map((row) => ({
+    operationId: row.operationId, operationInstanceId: row.operationInstanceId, status: row.status,
+    startedAt: row.startedAt, settledAt: row.settledAt || undefined, reason: row.reason || undefined,
+    childCount: transferOperationResourceCount(row.operationId),
+  }));
+  return {
+    instanceId: currentTransferApiInstanceId(),
+    operations: [...activeUploadOperations.values(), ...rows.filter((row) => row.status !== "settled").map((row) => ({ id: row.operationId, ...row }))],
+    settledOperations: rows.filter((row) => row.status === "settled" && row.settledAt && transferOperationLedger.get(row.operationId)?.persisted),
+  };
 }
 
 function transferTimeoutMs(sftp, options = {}) { return 120000; }
@@ -3468,21 +3654,43 @@ function createLocalApiMethods() {
       return result;
     },
     "transfers.list": async () => {
-      return { ok: true, transfers: listActiveTransfers(), operations: [...activeUploadOperations.values()] };
+      const operationState = await listTransferOperationState();
+      return { ok: true, instanceId: operationState.instanceId, transfers: listActiveTransfers(), operations: operationState.operations, settledOperations: operationState.settledOperations };
     },
     "transfers.cancel": async (params = {}) => {
       const id = String(params.transferId || params.id || "").trim();
       const operationId = String(params.operationId || "").trim();
       if (!id && !operationId) throw new Error("缺少 transferId 或 operationId。");
       const reason = String(params.reason || "用户通过 API 取消");
+      let operation = operationId ? transferOperationLedger.get(operationId) : undefined;
+      if (operation && params.operationInstanceId && params.operationInstanceId !== operation.operationInstanceId)
+        return { ok: true, transferId: id, operationId, cancelled: false, status: "identityMismatch", settled: false, operationInstanceId: operation.operationInstanceId, instanceId: currentTransferApiInstanceId() };
+      if (operation && operation.status === "settled") {
+        await transferLedgerWrite.catch(() => undefined);
+        operation = transferOperationLedger.get(operationId);
+        if (operation?.status === "settled" && operation.persisted)
+          return { ok: true, transferId: id, operationId, cancelled: true, status: "settled", settled: true, operationInstanceId: operation.operationInstanceId, instanceId: currentTransferApiInstanceId() };
+        return { ok: true, transferId: id, operationId, cancelled: false, status: "outcomeUnknown", settled: false, operationInstanceId: operation?.operationInstanceId || "", instanceId: currentTransferApiInstanceId() };
+      }
       if (operationId) {
+        if (!operation) return { ok: true, transferId: id, operationId, cancelled: false, status: "notFound", settled: false, operationInstanceId: "", instanceId: currentTransferApiInstanceId() };
+        if (operation.outcomeUnknown)
+          return { ok: true, transferId: id, operationId, cancelled: false, status: "outcomeUnknown", settled: false, operationInstanceId: operation.operationInstanceId, instanceId: currentTransferApiInstanceId() };
+        if (operation.operationInstanceId !== currentTransferApiInstanceId())
+          return { ok: true, transferId: id, operationId, cancelled: false, status: "outcomeUnknown", settled: false, operationInstanceId: operation.operationInstanceId, instanceId: currentTransferApiInstanceId() };
         cancelledTransferOperations.set(operationId, reason);
         while (cancelledTransferOperations.size > 512) cancelledTransferOperations.delete(cancelledTransferOperations.keys().next().value);
+        operation.status = "cancelling";
+        operation.cancelRequestedAt ||= new Date().toISOString();
+        operation.reason = reason;
+        await persistTransferOperationLedger();
       }
       const targets = [...activeTransfers.values()].filter(t => id ? t.id === id : t.operationId === operationId);
       if (!targets.length && !operationId) throw new Error("未找到活动传输：" + id);
       for (const transfer of targets) transfer.cancel(reason);
-      return { ok: true, transferId: id, operationId, cancelled: true };
+      if (operation) await maybeSettleTransferOperation(operationId);
+      operation = operationId ? transferOperationLedger.get(operationId) : undefined;
+      return { ok: true, transferId: id, operationId, cancelled: Boolean(targets.length || operation), status: operation?.status || "cancelling", settled: operation?.status === "settled" && operation.persisted === true, operationInstanceId: operation?.operationInstanceId || "", instanceId: currentTransferApiInstanceId() };
     },
     "upload.workspace": async (params = {}) => {
       const localPath = String(params.localPath || "").trim();
@@ -3581,11 +3789,21 @@ function createLocalApiMethods() {
   for (const [name, method] of Object.entries(methods)) {
     if (!/^(sync[.]|upload[.]|download[.]|remote[.])/.test(name)) continue;
     methods[name] = async (params = {}) => {
-      const controller = createTransferController({ id: nextTransferId(name), operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "" });
-      controller.operationId = params._operationId || controller.id;
-      if (cancelledTransferOperations.has(controller.operationId)) { controller.dispose(); throw new Error(cancelledTransferOperations.get(controller.operationId)); }
-      try { const result = await transferContext.run(controller, () => method(params)); if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认"); return result; }
-      finally { controller.dispose(); }
+      const controllerId = nextTransferId(name);
+      const operationId = String(params._operationId || controllerId);
+      const remoteMutation = /^(upload[.]|handoff[.]|sync[.](?:serverToServer|deletePath)|remote[.])/.test(name);
+      await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, params._requestKey || transferRequestKey(name, params));
+      const controller = createTransferController({ id: controllerId, operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "" });
+      controller.operationId = operationId;
+      try {
+        if (cancelledTransferOperations.has(operationId)) throw new Error(cancelledTransferOperations.get(operationId));
+        const result = await transferContext.run(controller, () => method(params));
+        if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认");
+        return result;
+      } finally {
+        controller.dispose();
+        await finishTransferOperation(operationId);
+      }
     };
   }
   return methods;
@@ -3886,6 +4104,7 @@ function getRemoteMarkerPath(remotePath, markerName) {
 
 function watchTransferProcess(child, onIdle, fileStep = true, filenames = []) {
   const parent = transferContext.getStore();
+  trackTransferResource(child, parent?.operationId);
   let buffer = "", bytes = 0, files = 0;
   const allowed = new Set(filenames), completed = new Set();
   const byteBase = parent?.transferredBytes || 0, fileBase = parent?.processedFiles || 0;
@@ -4312,6 +4531,7 @@ function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, timeout
       windowsHide: true,
       stdio: ["pipe", "ignore", "pipe"],
     });
+    trackTransferResource(sshProc, controller.operationId);
 
     let settled = false;
     let sshCode;
@@ -4320,21 +4540,20 @@ function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, timeout
     let tokenDisposable;
     let timer;
 
-    const stopController = () => {
+    const stopController = (disposeController = true) => {
       clearTimeout(timer);
       if (tokenDisposable && typeof tokenDisposable.dispose === "function") {
         tokenDisposable.dispose();
       }
-      controller.dispose();
+      if (disposeController) controller.dispose();
     };
 
     const fail = (error) => {
       if (settled) return;
       settled = true;
-      stopController();
-      // A failed spawn can make kill() throw. Always settle the upload Promise
-      // so the API request and shared host lease can finish with the cause.
-      try { sshProc.kill(); } catch {}
+      stopController(false);
+      // EOF lets the remote tar process report its exit before retry is permitted.
+      try { sshProc.stdin.end(); } catch { try { sshProc.kill(); } catch {} }
       try {
         reject(classifySftpFailure(error, sftp, {
           command: remoteCommand,
@@ -4413,6 +4632,7 @@ function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, timeout
       .catch(fail);
     sshProc.on("close", (code, signal) => {
       sshCode = code === null ? `signal ${signal || "unknown"}` : code;
+      if (settled) { controller.dispose(); return; }
       finish();
       });
     });
@@ -4584,6 +4804,7 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  trackTransferResource(sshProc, controller.operationId);
   if (onSpawn) onSpawn(sshProc);
   let sshStderr = "";
   let settled = false;
@@ -4609,7 +4830,6 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
     settled = true;
     clearTimeout(timer);
     if (tokenDisposable && typeof tokenDisposable.dispose === "function") tokenDisposable.dispose();
-    controller.dispose();
     archiveDecoder?.destroy();
     try { sshProc.kill(); } catch {}
     finishFailure(error);
@@ -4789,6 +5009,7 @@ async function extractMappedTarStream({ stream, byArchiveName, localPath, maxFil
       const staging = mappedStagingPath(destination);
       residuals.push(staging);
       const handle = fs.createWriteStream(staging, { flags: "wx" });
+      trackTransferResource(handle);
       let received = 0;
       try {
         while (received < parsed.size) {
@@ -5049,6 +5270,8 @@ function runRemoteTarExtractCore({ localPath, sftp, downloadScope, timeoutMs, to
       windowsHide: true,
       stdio: ["pipe", "ignore", "pipe"],
     });
+    trackTransferResource(sshProc, controller.operationId);
+    trackTransferResource(tarProc, controller.operationId);
 
     let settled = false;
     let sshCode;
@@ -5060,18 +5283,25 @@ function runRemoteTarExtractCore({ localPath, sftp, downloadScope, timeoutMs, to
     let timer;
     let lastProgressAt = 0;
 
-    const stopController = () => {
+    const stopController = (disposeController = true) => {
       clearTimeout(timer);
       if (tokenDisposable && typeof tokenDisposable.dispose === "function") {
         tokenDisposable.dispose();
       }
+      if (disposeController) controller.dispose();
+    };
+
+    const disposeAfterProcessesClose = () => {
+      if (sshCode === undefined || tarCode === undefined) return;
+      clearTimeout(timer);
+      if (tokenDisposable && typeof tokenDisposable.dispose === "function") tokenDisposable.dispose();
       controller.dispose();
     };
 
     const fail = (error) => {
       if (settled) return;
       settled = true;
-      stopController();
+      stopController(false);
       try { sshProc.kill(); } catch {}
       try { tarProc.kill(); } catch {}
       reject(classifySftpFailure(error, sftp, {
@@ -5079,6 +5309,7 @@ function runRemoteTarExtractCore({ localPath, sftp, downloadScope, timeoutMs, to
         sshStderr,
         tarStderr,
       }));
+      disposeAfterProcessesClose();
     };
 
     const finish = () => {
@@ -5148,10 +5379,12 @@ function runRemoteTarExtractCore({ localPath, sftp, downloadScope, timeoutMs, to
     sshProc.stdout.pipe(tarProc.stdin);
     sshProc.on("close", (code, signal) => {
       sshCode = code === null ? `signal ${signal || "unknown"}` : code;
+      if (settled) { disposeAfterProcessesClose(); return; }
       finish();
     });
     tarProc.on("close", (code, signal) => {
       tarCode = code === null ? `signal ${signal || "unknown"}` : code;
+      if (settled) { disposeAfterProcessesClose(); return; }
       finish();
     });
   });
@@ -5553,6 +5786,22 @@ module.exports = {
     createTransferPreview,
     createTransferController,
     createLocalApiMethods,
+    setTransferSettlementTestContext(options = {}) {
+      extensionContext = { globalState: options.globalState };
+      localApiServer = { instanceId: () => String(options.instanceId || "test-instance") };
+      if (options.reset !== false) {
+        transferLedgerLoaded = false;
+        transferLedgerWrite = Promise.resolve();
+        transferOperationLedger.clear();
+        activeTransferResources.clear();
+        activeTransfers.clear();
+        activeUploadOperations.clear();
+      }
+    },
+    beginTransferOperation,
+    finishTransferOperation,
+    trackTransferResource,
+    listTransferOperationState,
     atomicWriteJsonIfMissing,
     migrateLegacyCodeSyncState,
     createManifestUploadPlan,
