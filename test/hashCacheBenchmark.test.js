@@ -64,7 +64,7 @@ test("cold warm and one-change hashes share one five-field cache", () => {
   const warmBatch = runPython(__test.batchFileHashScript(), [root, "2", "0.01"], env, Buffer.from(names.map((name) => `${name}\0`).join(""), "utf8"));
   assert.equal(warmBatch.digestReads, 0);
   assert.equal(warmBatch.cacheHits, 81);
-  for (const name of names) assert.equal(warmBatch.files[name], digests[name]);
+  for (const name of names) assert.equal(warmBatch.files[name].sha256, digests[name]);
   const changed = names[7];
   const changedPath = path.join(root, changed);
   const preserved = fs.statSync(changedPath);
@@ -90,7 +90,7 @@ test("same-size restored mtime still rehashes when ctime changes and unsafe path
   assert.equal(cold.digestReads, 1);
   assert.equal(cold.files["missing.bin"], null);
   const warmed = crypto.createHash("sha256").update("same-size-body").digest("hex");
-  assert.equal(cold.files["nested/keep.bin"], warmed);
+  assert.equal(cold.files["nested/keep.bin"].sha256, warmed);
   const target = path.join(root, "nested", "keep.bin");
   const stat = fs.statSync(target);
   fs.writeFileSync(target, "same-size-NEWb");
@@ -186,7 +186,7 @@ test("final lstat ctime-only change rejects a cached batch digest", () => {
   const env = { SIMPLE_SFTP_HASH_CACHE_DIR: cacheDir };
   const primed = runPython(__test.batchFileHashScript(), [root, "0.2", "0.01"], env, Buffer.from("keep.bin\0", "utf8"));
   assert.equal(primed.digestReads, 1);
-  assert.equal(primed.files["keep.bin"], crypto.createHash("sha256").update("cached-body").digest("hex"));
+  assert.equal(primed.files["keep.bin"].sha256, crypto.createHash("sha256").update("cached-body").digest("hex"));
   const shifted = [
     "import os",
     "real_lstat=os.lstat",
@@ -211,5 +211,5 @@ test("final lstat ctime-only change rejects a cached batch digest", () => {
   const checked = runPython(shifted, [root, "0.2", "0.01"], env, Buffer.from("keep.bin\0", "utf8"));
   assert.equal(checked.cacheHits, 0);
   assert.equal(checked.digestReads, 1);
-  assert.equal(checked.files["keep.bin"], primed.files["keep.bin"]);
+  assert.deepEqual(checked.files["keep.bin"], primed.files["keep.bin"]);
 });

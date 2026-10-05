@@ -92,6 +92,7 @@ function baseParams(root, entries, extra = {}) {
     confirm: true,
     pathConfirmed: true,
     timeoutMs: 1000,
+    compression: "none",
     ...extra,
   };
 }
@@ -197,7 +198,8 @@ test("mapped download reports a truncated stream without claiming completion", a
   ])).then(() => { throw new Error("expected rejection"); }, (value) => value);
   assert.match(String(error.message), /阶段：解包/);
   assert.equal(error.ok, undefined);
-  assert.equal(fs.readFileSync(path.join(root, "out", "a.csv"), "utf8"), "only-one");
+  assert.equal(fs.existsSync(path.join(root, "out", "a.csv")), false);
+  assert.equal(fs.readFileSync(error.partialResiduals[0], "utf8"), "only-one");
   assert.equal(fs.existsSync(path.join(root, "out", "b.csv")), false);
 });
 
@@ -247,6 +249,7 @@ test("interrupted SSH stream settles while the reader is waiting for bytes", asy
   const { PassThrough } = require("node:stream");
   const stdout = new PassThrough();
   const plan = __test.normalizeMappedDownloadEntries({
+    compression: "none",
     entries: [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv" }],
   });
   const sftp = { host: "worker-a", username: "research", remotePath: "/projects/demo", port: 22 };
@@ -292,6 +295,7 @@ test("nonzero SSH exit after a valid tar rejects with transfer stage", async () 
   let sshCalls = 0;
   const started = Date.now();
   const plan = __test.normalizeMappedDownloadEntries({
+    compression: "none",
     entries: [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv" }],
   });
   const sftp = { host: "worker-a", username: "research", remotePath: "/projects/demo", port: 22 };
@@ -324,6 +328,7 @@ test("success waits for SSH exit after the tar trailer", async () => {
     throw new Error("use spawn");
   });
   const plan = __test.normalizeMappedDownloadEntries({
+    compression: "none",
     entries: [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv" }],
   });
   const sftp = { host: "worker-a", username: "research", remotePath: "/projects/demo", port: 22 };
@@ -342,13 +347,21 @@ test("success waits for SSH exit after the tar trailer", async () => {
   const pending = method(baseParams(root, [
     { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
   ])).then((result) => { settled = true; return result; });
-  await new Promise((resolve) => setTimeout(resolve, 80));
-  assert.equal(settled, false);
-  assert.equal(fs.existsSync(path.join(root, "out", "a.csv")), false);
-  const staged = fs.readdirSync(path.join(root, "out")).filter((name) => name.includes(".simple-sftp-partial-"));
-  assert.equal(staged.length, 1);
-  assert.equal(fs.readFileSync(path.join(root, "out", staged[0]), "utf8"), "ready");
-  proc.emitClose(0);
+  try {
+    const deadline = Date.now() + 1500;
+    let staged = [];
+    while (Date.now() < deadline) {
+      if (fs.existsSync(path.join(root, "out"))) staged = fs.readdirSync(path.join(root, "out")).filter((name) => name.includes(".simple-sftp-partial-"));
+      if (staged.length === 1 && fs.readFileSync(path.join(root, "out", staged[0]), "utf8") === "ready") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(settled, false);
+    assert.equal(fs.existsSync(path.join(root, "out", "a.csv")), false);
+    assert.equal(staged.length, 1);
+    assert.equal(fs.readFileSync(path.join(root, "out", staged[0]), "utf8"), "ready");
+  } finally {
+    if (proc) proc.emitClose(0);
+  }
   const result = await pending;
   assert.equal(result.ok, true);
   assert.equal(result.fileCount, 1);
@@ -371,6 +384,7 @@ test("API cancel during the real SSH stream kills that one child", async () => {
   };
   const operationId = `mapped-cancel-${Date.now()}`;
   const plan = __test.normalizeMappedDownloadEntries({
+    compression: "none",
     entries: [
       { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
       { remotePath: "results/b.csv", localRelativePath: "out/b.csv" },
@@ -411,13 +425,14 @@ test("API cancel during the real SSH stream kills that one child", async () => {
   const cancellation = await methods["transfers.cancel"]({ operationId });
   assert.equal(cancellation.status, "cancelling");
   assert.equal(cancellation.settled, false);
-  await assert.rejects(pending, /取消|阶段：transfer/);
   assert.equal(sshCalls, 1);
   assert.equal(killed, 1);
   assert.equal(__test.listActiveTransfers().some((transfer) => transfer.operation === "映射批量下载"), true);
   const beforeExit = await methods["transfers.list"]({});
   assert.equal(beforeExit.settledOperations.some((row) => row.operationId === operationId), false);
+  const rejected = assert.rejects(pending, /取消|阶段：transfer/);
   sshProc.emitClose();
+  await rejected;
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(__test.listActiveTransfers().some((transfer) => transfer.operation === "映射批量下载"), false);
   const afterExit = await methods["transfers.list"]({});

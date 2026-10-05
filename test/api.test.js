@@ -6,6 +6,7 @@ const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { HostOperationLeaseManager } = require("../host-operation-lease");
 
 const {
   LocalApiServer,
@@ -15,6 +16,30 @@ const {
 } = require("../api-server.js");
 
 const extensionSource = fs.readFileSync(path.join(__dirname, "../extension.js"), "utf8");
+
+test("discovery failure releases the newly opened listener", async () => {
+  const api = new LocalApiServer({ preferredPort: 23240 });
+  let listener;
+  api.writeDiscovery = async () => { listener = api.server; throw new Error("discovery unavailable"); };
+  await assert.rejects(api.start(), /discovery unavailable/);
+  assert.equal(listener.listening, false);
+  assert.equal(api.server, undefined);
+  assert.equal(api.port, 0);
+});
+
+test("oversized RPC output is rejected as a bounded response", async () => {
+  const f = await startServer({ huge: async () => "x".repeat(8 * 1024 * 1024) });
+  try {
+    const response = await fetch(`${f.server.discovery().baseUrl}/api/v1/rpc`, {
+      method: "POST", headers: { Authorization: `Bearer ${f.server.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "huge" }),
+    });
+    assert.equal(response.status, 413);
+    const body = await response.json();
+    assert.equal(body.error.message, "RESPONSE_TOO_LARGE");
+    assert.ok(JSON.stringify(body).length < 128);
+  } finally { await f.cleanup(); }
+});
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -36,6 +61,7 @@ async function startServer(methods = {}, options = {}) {
     preferredPort: port,
     discoveryPath: path.join(root, "api.json"),
     methods,
+    discoveryLease: new HostOperationLeaseManager({ leasePath: path.join(root, "discovery.lock"), windowId: "api-fixture:" + root, heartbeatMs: 0 }),
     ...options,
   });
   const discovery = await server.start();
@@ -46,7 +72,7 @@ async function startServer(methods = {}, options = {}) {
     token: discovery.token,
     cleanup: async () => {
       await server.dispose();
-      fs.rmSync(root, { recursive: true, force: true });
+      fs.writeFileSync(path.join(root, "KEEP.txt"), "Isolated test evidence retained; no automatic recursive removal.\n", "utf8");
     },
   };
 }
@@ -112,6 +138,38 @@ test("local API rejects non-loopback peers", () => {
   assert.equal(loopbackRequest({ socket: { remoteAddress: "::1" } }), true);
   assert.equal(loopbackRequest({ socket: { remoteAddress: "10.0.0.1" } }), false);
   assert.equal(loopbackRequest({ socket: { remoteAddress: "fe80::1" } }), false);
+});
+
+test("disposal preserves a newer discovery and consumes its own fixed writing slot", async () => {
+  const f = await startServer();
+  const replacement = new LocalApiServer({ discoveryPath: path.join(f.root, "api.json"), discoveryLease: f.server.discoveryLease });
+  replacement.startedAt = "new-generation"; replacement.port = 12345;
+  await replacement.writeDiscovery();
+  await f.server.dispose();
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.root, "api.json"), "utf8")).startedAt, "new-generation");
+  await replacement.dispose();
+  const final = JSON.parse(fs.readFileSync(path.join(f.root, "api.json"), "utf8"));
+  assert.equal(final.status, "stopped"); assert.equal(final.token, "");
+  assert.equal(fs.existsSync(path.join(f.root, "api.json.writing")), false);
+  await f.cleanup();
+});
+
+test("disconnected readers cancel while writes remain owned by durable operations", async () => {
+  const { EventEmitter } = require("node:events");
+  for (const [method, readOnly] of [["project.inventory", true], ["upload.start", false]]) {
+    let entered, release, captured;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const server = new LocalApiServer({ methods: { [method]: async (_params, _server, context) => {
+      captured = context.signal; entered(); return new Promise(resolve => { release = resolve; });
+    } } });
+    const request = new EventEmitter(), response = new EventEmitter();
+    response.writeHead = () => {}; response.end = () => {};
+    const pending = server.handleRpc(request, response);
+    request.emit("data", Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: {} }))); request.emit("end");
+    await ready; response.emit("close");
+    assert.equal(captured.aborted, readOnly); release({ ok: true }); await pending;
+    assert.equal(server.activeRpc, 0); await server.dispose();
+  }
 });
 
 test("local API requires bearer auth for every endpoint", async () => {
@@ -248,7 +306,7 @@ test("CLI reads the SimpleSFTP discovery file", () => {
     delete process.env.SIMPLE_SFTP_API_FILE;
   } finally {
     delete process.env.SIMPLE_SFTP_API_FILE;
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.writeFileSync(path.join(root, "KEEP.txt"), "Isolated test evidence retained.\n", "utf8");
   }
 });
 

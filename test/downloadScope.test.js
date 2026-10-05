@@ -61,13 +61,13 @@ test("scoped remote archive applies selected paths, extensions and size", () => 
     fs.writeFileSync(path.join(root, "results", "large.csv"), Buffer.alloc(256 * 1024));
     fs.writeFileSync(path.join(root, "logs", "outside.csv"), "skip\n");
     const script = helpers.script(root, { paths: ["results"], extensions: [".csv"], maxFileSizeMB: 0.1 });
-    const python = spawnSync("python", ["-c", script], { encoding: null, maxBuffer: 2 * 1024 * 1024 });
+    const python = spawnSync("python", ["-B", "-X", "utf8", path.join(__dirname, "download_scope_probe.py"), Buffer.from(script, "utf8").toString("base64")], { encoding: null, maxBuffer: 2 * 1024 * 1024, timeout: 10000, windowsHide: true });
     assert.equal(python.status, 0, String(python.stderr || ""));
-    const listed = spawnSync("tar", ["-tf", "-"], { input: python.stdout, encoding: "utf8" });
+    const listed = spawnSync("tar", ["-tf", "-"], { input: python.stdout, encoding: "utf8", timeout: 10000, windowsHide: true });
     assert.equal(listed.status, 0, listed.stderr);
     assert.deepEqual(listed.stdout.trim().split(/\r?\n/).filter(Boolean), ["results/small.csv"]);
   } finally {
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.writeFileSync(path.join(root, "KEEP.txt"), "Isolated test evidence retained.\n", "utf8");
   }
 });
 

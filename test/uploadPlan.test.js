@@ -81,7 +81,7 @@ test("workspace upload plan excludes ignore rules and nested Git repositories", 
     assert.equal(plan.excludedNestedGitRepos, 1);
     assert.deepEqual([...plan.nestedGitRoots], ["nested/repo"]);
   } finally {
-    fs.rmSync(localPath, { recursive: true, force: true });
+    fs.writeFileSync(path.join(localPath, "KEEP.txt"), "Isolated test evidence retained.\n", "utf8");
   }
 });
 
@@ -123,7 +123,7 @@ test("managed upload transfers only files failing remote content verification", 
     assert.deepEqual([...plan.files.map((file) => file.relativePath)], ["changed.py", "new.py"]);
     assert.equal(sandbox.createPlan({ localPath, sftp: {}, manifest }).fileCount, 3);
   } finally {
-    fs.rmSync(localPath, { recursive: true, force: true });
+    fs.writeFileSync(path.join(localPath, "KEEP.txt"), "Isolated test evidence retained.\n", "utf8");
   }
 });
 
@@ -174,12 +174,12 @@ test("tar writer preserves UTF-8 and long POSIX paths", async () => {
       archive.end();
     });
     fs.mkdirSync(extract);
-    await execFileAsync("tar", ["-xf", path.join(root, "workspace.tar"), "-C", extract]);
+    await execFileAsync("tar", ["-xf", path.join(root, "workspace.tar"), "-C", extract], { timeout: 10000, windowsHide: true });
     assert.equal(fs.readFileSync(path.join(extract, unicodeRelative), "utf8"), "中文内容\n");
     assert.equal(fs.readFileSync(path.join(extract, longRelative), "utf8"), "ok\n");
     assert.equal(transferredBytes, Buffer.byteLength("中文内容\n") + Buffer.byteLength("ok\n"));
   } finally {
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.writeFileSync(path.join(root, "KEEP.txt"), "Isolated test evidence retained.\n", "utf8");
   }
 });
 
@@ -227,7 +227,7 @@ test("managed manifest trusts caller-selected data files while retaining path sa
       assert.throws(() => sandbox.getPaths({ localPath, manifest: { [blocked]: {} } }), /不安全的受管理代码路径|非法远端相对路径/);
     }
   } finally {
-    fs.rmSync(localPath, { recursive: true, force: true });
+    fs.writeFileSync(path.join(localPath, "KEEP.txt"), "Isolated test evidence retained.\n", "utf8");
   }
 });
 
@@ -256,11 +256,12 @@ test("legacy managed state is copied atomically and remains a read-only source",
     assert.equal(sandbox.migrate(localPath), false);
     assert.equal(fs.readFileSync(newFile, "utf8"), before);
 
-    fs.rmSync(path.join(localPath, "simple_cluster"), { recursive: true, force: true });
-    fs.writeFileSync(legacyFile, "{broken", "utf8");
-    assert.equal(sandbox.migrate(localPath), false);
-    assert.equal(fs.existsSync(newFile), false);
+    const brokenRoot = path.join(localPath, "broken-fixture");
+    fs.mkdirSync(path.join(brokenRoot, "zlk_cluster"), { recursive: true });
+    fs.writeFileSync(path.join(brokenRoot, "zlk_cluster/code_sync_state.json"), "{broken", "utf8");
+    assert.equal(sandbox.migrate(brokenRoot), false);
+    assert.equal(fs.existsSync(path.join(brokenRoot, "simple_cluster/code_sync_state.json")), false);
   } finally {
-    fs.rmSync(localPath, { recursive: true, force: true });
+    fs.writeFileSync(path.join(localPath, "KEEP.txt"), "Isolated test evidence retained.\n", "utf8");
   }
 });

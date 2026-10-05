@@ -68,6 +68,7 @@ test("SSH spawn errors settle uploads even if killing the child throws", async (
     tarEntryPath: (value) => value,
     remoteResourceServer: () => "worker:22",
     withFileResourceLease: (_operation, _project, _paths, _server, work) => work(),
+    withTransferCapacity: (_options, work) => work(),
     createTransferController: () => ({ onCancel() {}, dispose() { disposed = true; } }),
     trackTransferResource: () => {},
     nextTransferId: () => "test-upload",

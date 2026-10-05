@@ -131,7 +131,7 @@ test("partitioned packed transfer groups small files and blocks unconfirmed writ
   );
   assert.match(direct, /bash -o pipefail -c/);
   assert.match(direct, /tar --null -T - -cvf -/);
-  assert.match(direct, /tar -xvf -/);
+  assert.match(direct, /simple_sftp_staged_receive/);
   assert.match(direct, /gzip -dc/);
   assert.match(direct, /pigz -p 2 -6 -c/);
   assert.doesNotMatch(direct, /--delete|rm -/);
@@ -239,6 +239,6 @@ test("inventory keeps stable hashes when another file changes during hashing", (
     assert.equal(exact.status, 0, exact.stderr);
     assert.deepEqual(Object.keys(JSON.parse(exact.stdout).files), ["steady.bin"]);
   } finally {
-    fs.rmSync(parent, { recursive: true, force: true });
+    fs.writeFileSync(path.join(parent, "KEEP.txt"), "Isolated test evidence retained.\n", "utf8");
   }
 });

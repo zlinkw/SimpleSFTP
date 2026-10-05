@@ -1,6 +1,14 @@
 const vscode = require("vscode");
 const { AsyncLocalStorage } = require("node:async_hooks");
 const { ProgressInactivity } = require("./progress-inactivity");
+const { LatestSnapshotWriter } = require("./latest-snapshot-writer");
+const { TransferCapacity } = require("./transfer-capacity");
+const transferCapacity = new TransferCapacity();
+let extensionDeactivating = false;
+const { chooseSampleFiles, chooseCompression, CompressionHistory, SAMPLE_TIMEOUT_MS } = require("./compression-policy");
+const compressionSampleScript = require("node:fs").readFileSync(require("node:path").join(__dirname, "compression-sample.py"), "utf8");
+const compressionHistory = new CompressionHistory();
+let compressionProbeTransport = null;
 const transferContext = new AsyncLocalStorage();
 const fs = require("fs");
 const os = require("os");
@@ -9,7 +17,7 @@ const crypto = require("crypto");
 const { execFile, spawn } = require("child_process");
 const { resolveWorkspaceLocation } = require("./workspace-path.js");
 const { toTarPath: tarEntryPath, writeTarEntriesToStream } = require("./tar-writer.js");
-const { LocalApiServer, confirmationRequired } = require("./api-server.js");
+const { LocalApiServer, confirmationRequired, currentApiRequestContext } = require("./api-server.js");
 const {
   HostOperationLeaseConflictError,
   HostOperationLeaseManager,
@@ -137,6 +145,9 @@ const SETTLED_TRANSFER_TTL_MS = 24 * 60 * 60 * 1000;
 let transferSequence = 0;
 let transferLedgerLoaded = false;
 let transferLedgerWrite = Promise.resolve();
+const transferLedgerWriter = new LatestSnapshotWriter(async ({ context, rows }) => {
+  if (context?.globalState?.update) await context.globalState.update(TRANSFER_OPERATION_STATE, rows);
+});
 let defaultConnectTimeoutSeconds = 15;
 let extensionContext;
 let localApiServer;
@@ -145,6 +156,7 @@ let sharedWatcher;
 const hostOperationLease = new HostOperationLeaseManager();
 
 function activate(context) {
+  extensionDeactivating = false;
   extensionContext = context;
   loadTransferOperationLedger();
   refreshConnectTimeoutFromConfig();
@@ -254,8 +266,8 @@ function startLocalApiServer(context) {
     discoveryPath: path.join(APPDATA, "SimpleSFTP", "api.json"),
     methods: createLocalApiMethods(),
     methodOptions: {
-      "sync.serverToServerFpsync": { compression: ["auto", "gzip", "none"], singleStream: "boolean" },
-      "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"] },
+      "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024 },
+      "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number" },
     },
   });
   localApiServer = server;
@@ -772,7 +784,9 @@ function directSyncTarget(value, label) {
 
 function directSyncRelativePath(value) {
   const relative = String(value || "").trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+  if (Buffer.byteLength(relative, "utf8") > 4096 || /[:\0\r\n]/.test(relative)) throw new Error("Plan 产物相对路径不安全。");
   if (!relative || relative.startsWith("/") || relative.split("/").some((part) => !part || part === "." || part === "..")) throw new Error("Plan 产物相对路径不安全。");
+  if (relative.split("/").some((part) => part.startsWith(".simple-sftp-stage-"))) throw new Error("路径保留给 SimpleSFTP 传输暂存使用。");
   return relative;
 }
 
@@ -784,13 +798,15 @@ function guardedRemoteDeleteCommand(target, relativePath) {
   return `root=$(realpath -e -- ${shellQuote(target.remotePath)}) || { echo PARENT_CD_FAILED >&2; exit 75; }; parent=$(realpath -e -- ${shellQuote(parent)}) || { echo PARENT_CD_FAILED >&2; exit 75; }; case "$parent" in "$root"|"$root"/*) ;; *) exit 72;; esac; cd -- "$parent" || { echo PARENT_CD_FAILED >&2; exit 75; }; test "$(pwd -P)" = "$parent" || { echo PARENT_CD_FAILED >&2; exit 75; }; test ! -L ${shellQuote(leaf)} || exit 72; if test -d ${shellQuote(leaf)}; then command -v rsync >/dev/null 2>&1 || { echo RSYNC_UNAVAILABLE >&2; exit 76; }; empty=$(mktemp -d -- './.simple-sftp-empty.XXXXXXXX') || exit 76; trap 'rmdir -- "$empty" >/dev/null 2>&1 || true' EXIT; rsync -r --delete -- "$empty/" ${shellQuote(`${leaf}/`)} && rmdir -- ${shellQuote(leaf)}; else rm -f -- ${shellQuote(leaf)}; fi && test ! -e ${shellQuote(leaf)}`;
 }
 
-function removeLocalStagingDirectory(tempDir) {
+function removeLocalStagingDirectory(tempDir, options = {}) {
   const safetyRoot = fs.realpathSync(os.tmpdir());
   const parent = fs.realpathSync(path.dirname(tempDir));
   const leaf = path.basename(tempDir);
   const info = fs.lstatSync(tempDir);
   if (parent !== safetyRoot || !/^simple-sftp-(?:files|code-sync-state)-[A-Za-z0-9]+$/.test(leaf) || !info.isDirectory() || info.isSymbolicLink())
     throw new Error("临时目录不在已验证的暂存根目录内；禁止清理。");
+  if (options.confirm !== true || options.secondConfirmation !== true || options.confirmedAbsolutePath !== tempDir)
+    throw confirmationRequired({ method: "local.cleanupStaging", absolutePath: tempDir, requires: ["confirm", "secondConfirmation", "confirmedAbsolutePath"] });
   const psQuote = (value) => `'${value.replace(/'/g, "''")}'`;
   const command = process.platform === "win32" ? "pwsh.exe" : "sh";
   const args = process.platform === "win32"
@@ -882,8 +898,8 @@ function relayTarFiles(source, destination, paths, timeoutMs, options = {}) {
 function relayTarFilesCore(source, destination, paths, timeoutMs, options = {}) {
   if (!paths.length) return Promise.resolve();
   const compression = transferCompression(options);
-  const sourceCommand = `bash -o pipefail -c ${shellQuote(`cd ${shellQuote(source.remotePath)} && ${tarPackingCommand(compression)}`)}`;
-  const destinationCommand = `bash -o pipefail -c ${shellQuote(`cd ${shellQuote(destination.remotePath)} && ${tarUnpackingCommand(compression)}`)}`;
+  const sourceCommand = options.sourceCommand || `bash -o pipefail -c ${shellQuote(`cd ${shellQuote(source.remotePath)} && ${tarPackingCommand(compression)}`)}`;
+  const destinationCommand = options.destinationCommand || `bash -o pipefail -c ${shellQuote(stagedTarUnpackingCommand(destination, compression, options.transferId, options.expectedFiles, paths) )}`;
   return new Promise((resolve, reject) => {
     const reader = spawn("ssh", getSshArgs(source, sourceCommand), { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     const writer = spawn("ssh", getSshArgs(destination, destinationCommand), { windowsHide: true, stdio: ["pipe", "ignore", "pipe"] });
@@ -891,16 +907,17 @@ function relayTarFilesCore(source, destination, paths, timeoutMs, options = {}) 
     let destinationCode;
     let stderr = "";
     let settled = false;
+    let wireBytes = 0;
     const finish = (error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (error) { reader.kill(); writer.kill(); reject(error); } else resolve();
+      if (error) { reader.kill(); writer.kill(); reject(error); } else { options.onWireBytes?.(wireBytes); resolve(); }
     };
     const timer = null;
     const monitor = watchTransferProcess(reader, finish, true, paths);
     const destinationMonitor = watchTransferProcess(writer, finish, true, paths);
-    reader.stdout.on("data", (chunk) => { monitor.receive(chunk); destinationMonitor.receive(chunk); });
+    reader.stdout.on("data", (chunk) => { wireBytes += chunk.length; monitor.receive(chunk); destinationMonitor.receive(chunk); });
     reader.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
     writer.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
     reader.on("error", (error) => finish(error));
@@ -915,23 +932,10 @@ function relayTarFilesCore(source, destination, paths, timeoutMs, options = {}) 
 }
 
 async function removeStaleRemoteFiles(destination, scope, paths, timeoutMs) {
-  for (let offset = 0; offset < paths.length; offset += 100) {
-    const encoded = Buffer.from(JSON.stringify(paths.slice(offset, offset + 100)), "utf8").toString("base64");
-    const script = [
-      "import base64,json,os,sys",
-      "root=os.path.realpath(sys.argv[1]); scope=os.path.realpath(os.path.join(root,sys.argv[2]))",
-      "for rel in json.loads(base64.b64decode(sys.argv[3])):",
-      " target=os.path.join(root,*rel.split('/'))",
-      " if os.path.commonpath((scope,os.path.realpath(target)))!=scope or os.path.islink(target) or not os.path.isfile(target): raise ValueError('unsafe stale file')",
-      " parent=os.path.realpath(os.path.dirname(target))",
-      " if os.path.commonpath((scope,parent))!=scope: raise ValueError('unsafe stale parent')",
-      " try: os.chdir(parent)",
-      " except OSError as error: raise RuntimeError('PARENT_CD_FAILED: '+str(error))",
-      " if os.path.realpath(os.getcwd())!=parent: raise RuntimeError('PARENT_CD_FAILED')",
-      " os.unlink('./'+os.path.basename(target))",
-    ].join("\n");
-    await runSsh(destination, `python3 -c ${shellQuote(script)} ${shellQuote(destination.remotePath)} ${shellQuote(scope)} ${shellQuote(encoded)}`, timeoutMs);
-  }
+  // Preserve the legacy entry as a preview. Removal uses the explicit double-confirmed API.
+  throw confirmationRequired({ method: "sync.deletePath", target: destination, relativePath: scope,
+    absolutePaths: paths.map(name => path.posix.join(destination.remotePath, directSyncRelativePath(name))),
+    requires: ["confirm", "pathConfirmed", "secondConfirmation", "confirmedAbsolutePath"] });
 }
 
 async function relayServerToServer(source, destination, relativePath, directory, timeoutMs) {
@@ -944,8 +948,8 @@ async function relayServerToServer(source, destination, relativePath, directory,
   }
   const changed = Object.keys(sourceFiles).filter((name) => sourceFiles[name].sha256 !== destinationFiles[name]?.sha256).sort();
   const stale = Object.keys(destinationFiles).filter((name) => !sourceFiles[name]).sort();
-  await relayTarFiles(source, destination, changed, timeoutMs);
   if (stale.length) await removeStaleRemoteFiles(destination, relativePath, stale, timeoutMs);
+  await relayTarFiles(source, destination, changed, timeoutMs, { expectedFiles: sourceFiles });
   const verified = (await inspectRemoteScope(destination, relativePath, directory, timeoutMs)).files;
   if (JSON.stringify(Object.entries(sourceFiles).sort()) !== JSON.stringify(Object.entries(verified).sort()))
     throw new Error("本机内存转发后内容 SHA256 不一致；同步保持待处理。");
@@ -992,6 +996,39 @@ async function projectInventory(options = {}) {
   const result = JSON.parse(output);
   if (!result.files || typeof result.files !== "object" || Array.isArray(result.files)) throw new Error("远端项目清单无效。");
   return { ok: true, files: result.files, unverifiedFiles: result.unverifiedFiles || {}, hashedFiles: result.hashedFiles, reusedFiles: result.reusedFiles };
+}
+
+async function projectFileStats(options = {}) {
+  const source = directSyncTarget(options.source, "来源");
+  if (!Array.isArray(options.paths) || !options.paths.length) throw new Error("文件属性查询必须提供 paths，且不能扫描整个项目。");
+  if (options.paths.length > 128) throw new Error("一次最多查询 128 个项目内文件属性。");
+  const paths = [...new Map(options.paths.map((item) => {
+    const relative = directSyncRelativePath(item);
+    if (!projectTreePathAllowed(relative)) throw new Error(`文件属性路径属于插件或机器状态：${relative}`);
+    return [relative.toLowerCase(), relative];
+  })).values()];
+  const script = [
+    "import json,os,stat,sys",
+    "root=os.path.realpath(sys.argv[1]); paths=json.loads(sys.argv[2]); files={}; missing=[]",
+    "for rel in paths:",
+    " parts=rel.split('/')",
+    " if any(part in ('','.','..') for part in parts): raise ValueError('unsafe path')",
+    " cursor=root",
+    " for part in parts:",
+    "  cursor=os.path.join(cursor,part)",
+    "  if os.path.islink(cursor): raise ValueError('symlink path: '+rel)",
+    " full=os.path.realpath(cursor)",
+    " if os.path.commonpath((root,full))!=root: raise ValueError('path outside project: '+rel)",
+    " try: st=os.stat(full,follow_symlinks=False)",
+    " except FileNotFoundError: missing.append(rel); continue",
+    " if not stat.S_ISREG(st.st_mode): raise ValueError('not a regular file: '+rel)",
+    " files[rel]={'size':int(st.st_size),'modifiedAtMs':int(st.st_mtime_ns//1000000)}",
+    "print(json.dumps({'files':files,'missing':missing},ensure_ascii=False,separators=(',',':')))"
+  ].join("\n");
+  const output = await runSsh(source, `python3 -c ${shellQuote(script)} ${shellQuote(source.remotePath)} ${shellQuote(JSON.stringify(paths))}`, transferTimeoutMs(source, options));
+  const result = JSON.parse(output);
+  if (!result.files || typeof result.files !== "object" || Array.isArray(result.files)) throw new Error("远端文件属性响应无效。");
+  return { ok: true, files: result.files, missing: Array.isArray(result.missing) ? result.missing : [] };
 }
 
 function projectInventoryScript() {
@@ -1078,6 +1115,10 @@ function projectInventoryScript() {
     "  if updates:",
     "   db.executemany('INSERT INTO hashes (root,path,dev,ino,size,mtime_ns,ctime_ns,sha256) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(root,path) DO UPDATE SET dev=excluded.dev,ino=excluded.ino,size=excluded.size,mtime_ns=excluded.mtime_ns,ctime_ns=excluded.ctime_ns,sha256=excluded.sha256',updates)",
     "   db.commit()",
+    "  count=int(db.execute('SELECT COUNT(*) FROM hashes').fetchone()[0])",
+    "  if count>250000:",
+    "   db.execute('DELETE FROM hashes WHERE rowid IN (SELECT rowid FROM hashes ORDER BY rowid LIMIT ?)',(count-250000,))",
+    "   db.commit()",
     " except (OSError,sqlite3.Error): pass",
     " finally: db.close()",
     "print(json.dumps({'files':found,'unverifiedFiles':unverified,'hashedFiles':hashed,'reusedFiles':reused},separators=(',',':')))",
@@ -1130,7 +1171,7 @@ async function projectTree(options = {}) {
 
 function remoteBatchStage(command) {
   const text = String(command || "");
-  if (/tar --null -T - -cvf -/.test(text)) return /gzip|pigz/.test(text) ? "压缩打包传输" : "无压缩打包传输";
+  if (/tar --null -T - -cvf -/.test(text)) return /gzip|pigz|zstd/.test(text) ? "压缩打包传输" : "无压缩打包传输";
   if (/hashlib|sha256|inspect/.test(text) || /python3 -c/.test(text)) return "内容清单";
   return "远端命令";
 }
@@ -1140,28 +1181,40 @@ function setRemoteBatchTransport(fn) {
   remoteBatchTransport = typeof fn === "function" ? fn : null;
 }
 
-function runRemoteBatchSsh(source, command, paths, timeoutMs) {
-  if (remoteBatchTransport) return Promise.resolve().then(() => remoteBatchTransport(source, command, paths, timeoutMs));
-  const stage = remoteBatchStage(command);
+function runRemoteBatchSsh(source, command, paths, timeoutMs, options = {}) {
+  if (remoteBatchTransport) return Promise.resolve().then(() => remoteBatchTransport(source, command, paths, timeoutMs, options));
+  const stage = options.stage || remoteBatchStage(command);
   return new Promise((resolve, reject) => {
     const child = spawn("ssh", ["-A", "-o", "BatchMode=yes", ...getSshArgs(source, command)], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
+    let wireBuffer = "", wireBytes = 0;
     let settled = false;
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (error) reject(error); else resolve(value);
+      if (error) reject(error); else { options.onWireBytes?.(wireBytes); resolve(value); }
     };
     const timer = null;
-    const monitor = watchTransferProcess(child, finish, true, paths);
+    const monitor = watchTransferProcess(child, finish, true, paths, options.remoteMutation);
     child.stdout.on("data", (chunk) => {
       monitor.receive(chunk);
       stdout += chunk.toString("utf8");
       if (stdout.length > 4 * 1024 * 1024) { child.kill(); finish(new Error("远端批量清单超过 4 MB。")); }
     });
-    child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
+    child.stderr.on("data", (chunk) => {
+      stderr = (stderr + chunk.toString("utf8")).slice(-16384);
+      wireBuffer += chunk.toString("utf8");
+      let end;
+      while ((end = wireBuffer.indexOf("\n")) >= 0) {
+        const line = wireBuffer.slice(0, end); wireBuffer = wireBuffer.slice(end + 1);
+        if (!line.startsWith("SIMPLE_COMPRESSION_WIRE ")) continue;
+        const count = Number(line.slice(24).trim());
+        if (Number.isSafeInteger(count) && count >= wireBytes) wireBytes = count;
+      }
+      wireBuffer = wireBuffer.slice(-1024);
+    });
     child.on("error", (error) => finish(error));
     child.on("close", (code) => code === 0
       ? finish(null, stdout.trim())
@@ -1234,6 +1287,14 @@ function batchHashCacheHelpers() {
     " if hasattr(os,'O_NOFOLLOW'): flags|=os.O_NOFOLLOW",
     " if hasattr(os,'O_BINARY'): flags|=os.O_BINARY",
     " return os.open(full,flags)",
+    "def trim_hash_cache():",
+    " if not cache_ready: return",
+    " try:",
+    "  count=int(db.execute('SELECT COUNT(*) FROM hashes').fetchone()[0])",
+    "  if count>250000:",
+    "   db.execute('DELETE FROM hashes WHERE rowid IN (SELECT rowid FROM hashes ORDER BY rowid LIMIT ?)',(count-250000,))",
+    "   db.commit()",
+    " except sqlite3.Error: pass",
     "def lookup_cached(rel,full,stat):",
     " global cache_hits,cache_queries",
     " if not cache_ready or statmod.S_ISLNK(stat.st_mode) or not statmod.S_ISREG(stat.st_mode): return None",
@@ -1266,6 +1327,7 @@ function batchHashCacheHelpers() {
     "  if cache_updates:",
     "   db.executemany('INSERT INTO hashes (root,path,dev,ino,size,mtime_ns,ctime_ns,sha256) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(root,path) DO UPDATE SET dev=excluded.dev,ino=excluded.ino,size=excluded.size,mtime_ns=excluded.mtime_ns,ctime_ns=excluded.ctime_ns,sha256=excluded.sha256',cache_updates)",
     "   db.commit()",
+    "  trim_hash_cache()",
     " except (OSError,sqlite3.Error): pass",
     " finally:",
     "  try: db.close()",
@@ -1291,14 +1353,14 @@ function batchFileHashScript() {
     " stat=os.lstat(full)",
     " cached=lookup_cached(rel,full,stat)",
     " if cached is not None:",
-    "  found[rel]=cached[0]",
+    "  found[rel]={'sha256':cached[0],'size':cached[1]}",
     "  sys.stderr.write('SIMPLE_PROGRESS '+json.dumps({'phase':'hashing','processedFiles':len(found)})+chr(10)); sys.stderr.flush()",
     "  continue",
     " hashed=stable_digest(full,time.monotonic()+quiet_s,poll_s)",
     " if hashed is None: unstable.append(rel)",
     " else:",
     "  remember_hash(rel,hashed[2],hashed[0])",
-    "  found[rel]=hashed[0]",
+    "  found[rel]={'sha256':hashed[0],'size':hashed[1]}",
     "flush_hash_cache()",
     "if unstable: raise ValueError('file changed during batch sync: '+', '.join(unstable))",
     "print(json.dumps({'files':found,'cacheHits':cache_hits,'cacheRehash':cache_rehash,'digestReads':hash_stats['digestReads'],'cacheQueries':cache_queries},separators=(',',':')))",
@@ -1365,7 +1427,7 @@ function scopeHashPayload(parsed) {
 
 async function inspectRemoteBatchFiles(target, paths, timeoutMs) {
   const script = batchFileHashScript();
-  const stdout = await runRemoteBatchSsh(target, `python3 -c ${shellQuote(script)} ${shellQuote(target.remotePath)} ${BATCH_HASH_QUIET_SECONDS} ${BATCH_HASH_POLL_SECONDS}`, paths, timeoutMs);
+  const stdout = await runRemoteBatchSsh(target, `python3 -c ${shellQuote(script)} ${shellQuote(target.remotePath)} ${BATCH_HASH_QUIET_SECONDS} ${BATCH_HASH_POLL_SECONDS}`, paths, timeoutMs, { remoteMutation: false });
   return batchHashPayload(JSON.parse(stdout), paths.length);
 }
 
@@ -1389,11 +1451,43 @@ async function syncServerToServerBatch(options = {}) {
   return syncServerToServerFpsync({ ...options, source, destination, relativePaths: paths, confirm: true, pathConfirmed: true });
 }
 
-function partitionTransferPaths(paths, singleStreamFiles = 80, parallelSlots = 4) {
+const FPSYNC_MAX_BATCH_BYTES = 128 * 1024 * 1024;
+const FPSYNC_PARALLEL_STREAMS = 2;
+
+function partitionTransferPaths(paths, singleStreamFiles = 80, parallelSlots = 4, fileSizes, maxBytes = Infinity) {
   const list = Array.isArray(paths) ? paths : [];
-  const cap = Math.max(1, singleStreamFiles);
+  const cap = Math.max(1, Math.min(5000, singleStreamFiles));
   const slots = Math.max(1, parallelSlots);
   if (!list.length) return [];
+  if (fileSizes && Number.isFinite(maxBytes) && maxBytes > 0) {
+    const groups = [];
+    let group = [];
+    let groupBytes = 0;
+    let manifestBytes = 0;
+    for (const name of list) {
+      const rawSize = typeof fileSizes[name] === "object" ? fileSizes[name]?.size : fileSizes[name];
+      const size = Number.isFinite(Number(rawSize)) && Number(rawSize) > 0 ? Math.floor(Number(rawSize)) : 0;
+      const entryBytes = Buffer.byteLength(name, "utf8") * 2 + 160;
+      if (group.length && (group.length >= cap || groupBytes + size > maxBytes || manifestBytes + entryBytes > 32000)) {
+        groups.push(group);
+        group = [];
+        groupBytes = 0;
+        manifestBytes = 0;
+      }
+      group.push(name);
+      manifestBytes += entryBytes;
+      groupBytes += size;
+      // An oversized file remains alone; callers can report it separately and avoid mixing it with other work.
+      if (group.length === 1 && size > maxBytes) {
+        groups.push(group);
+        group = [];
+        groupBytes = 0;
+        manifestBytes = 0;
+      }
+    }
+    if (group.length) groups.push(group);
+    return groups;
+  }
   if (list.length <= cap) return [list.slice()];
   const width = Math.min(slots, list.length);
   const span = Math.ceil(list.length / width);
@@ -1404,28 +1498,148 @@ function partitionTransferPaths(paths, singleStreamFiles = 80, parallelSlots = 4
 
 function transferCompression(options = {}) {
   const compression = options.compression === undefined ? "auto" : String(options.compression);
-  if (!["auto", "gzip", "none"].includes(compression)) throw new Error("compression 必须是 auto、gzip 或 none。");
-  return compression === "none" ? "none" : "gzip";
+  if (!["auto", "gzip", "zstd", "none"].includes(compression)) throw new Error("compression 必须是 auto、gzip、zstd 或 none。");
+  return compression === "auto" ? "gzip" : compression;
 }
 
-function tarPackingCommand(compression) {
+function requestedTransferCompression(options = {}) {
+  const compression = options.compression === undefined ? "auto" : String(options.compression);
+  if (!["auto", "gzip", "zstd", "none"].includes(compression)) throw new Error("compression 必须是 auto、gzip、zstd 或 none。");
+  return compression;
+}
+
+async function negotiateTransferCompression(options, source, destination, timeoutMs) {
+  return (await selectTransferCompression(options, source, destination, options.samplePaths || [], options.fileSizes || {})).compression;
+}
+
+function setCompressionProbeTransport(fn) { compressionProbeTransport = typeof fn === "function" ? fn : null; }
+
+function runCompressionProbe(target, command) {
+  if (compressionProbeTransport) return Promise.resolve().then(() => compressionProbeTransport(target, command));
+  // Existing transport test doubles represent archive/hash channels only.
+  if (remoteBatchTransport || mappedDownloadTransport) return Promise.resolve("");
+  return new Promise((resolve, reject) => {
+    const child = execFile("ssh", getSshArgs(target, command), { timeout: SAMPLE_TIMEOUT_MS, windowsHide: true, maxBuffer: 16384 }, (error, stdout) => error ? reject(error) : resolve(stdout));
+    const monitor = watchTransferProcess(child, reject, false, [], false);
+    child.stdout?.on("data", monitor.receive);
+  });
+}
+
+async function selectTransferCompression(options, source, destination, paths, sizes, gzipOnly = false) {
+  const requested = requestedTransferCompression(options);
+  if (requested === "none" || requested === "gzip") return { compression: requested, reason: "explicit", sampleBytes: 0 };
+  const cancelled = () => options.token?.isCancellationRequested || transferContext.getStore()?.status === "cancelled";
+  if (cancelled()) throw new Error("传输已取消");
+  const probe = (target) => runCompressionProbe(target, "command -v zstd >/dev/null 2>&1 && printf supported || printf unavailable").then(value => String(value).trim() === "supported");
+  if (requested === "zstd") {
+    if (gzipOnly) throw new Error("映射下载支持 auto、gzip 或 none；此通道不支持 zstd。");
+    const supported = await Promise.all([probe(source), probe(destination)]);
+    if (cancelled()) throw new Error("传输已取消");
+    if (!supported.every(Boolean)) throw new Error("来源和目标 Worker 必须都支持 zstd；未开始传输。");
+    return { compression: "zstd", reason: "explicit-negotiated", sampleBytes: 0 };
+  }
+  const selected = chooseSampleFiles(paths, sizes);
+  if (!selected.length) return { compression: "gzip", reason: "no-changed-files", sampleBytes: 0 };
+  try {
+    const request = JSON.stringify({ root: source.remotePath, paths: selected, zstd: !gzipOnly });
+    const [text, supportsZstd] = await Promise.all([
+      runCompressionProbe(source, `python3 -c ${shellQuote(compressionSampleScript)} ${shellQuote(request)}`),
+      gzipOnly ? false : probe(destination),
+    ]);
+    if (cancelled()) throw new Error("传输已取消");
+    const sample = JSON.parse(String(text));
+    const history = compressionHistory.get(compressionHistory.key(source, destination));
+    return chooseCompression(sample, supportsZstd ? ["gzip", "zstd"] : ["gzip"], history?.bytesPerSecond, !!history);
+  } catch (error) {
+    if (cancelled()) throw new Error("传输已取消");
+    // Read-only sampling cannot change data authority; transfers still require complete hashes.
+    return { compression: "gzip", reason: "sample-unavailable", sampleBytes: 0 };
+  }
+}
+
+function tarPackingCommand(compression, telemetry = false) {
+  return `tar --null -T - -cvf -${compressionStreamCommand(compression, telemetry)}`;
+}
+
+function compressionStreamCommand(compression, telemetry = false) {
   // Bound compressor CPU even when several transfers share the same Worker.
-  const compressor = "if command -v pigz >/dev/null 2>&1; then pigz -p 2 -6 -c; else gzip -6 -c; fi";
-  return `tar --null -T - -cvf -${compression === "none" ? "" : ` | (${compressor})`}`;
+  const compressor = compression === "zstd" ? "zstd -T2 -6 -c" : "if command -v pigz >/dev/null 2>&1; then pigz -p 2 -6 -c; else gzip -6 -c; fi";
+  const counter = "import sys; n=0\nwhile True:\n b=sys.stdin.buffer.read(65536)\n if not b: break\n sys.stdout.buffer.write(b); n+=len(b)\nsys.stdout.buffer.flush(); sys.stderr.write('SIMPLE_COMPRESSION_WIRE '+str(n)+'\\n')";
+  return `${compression === "none" ? "" : ` | (${compressor})`}${telemetry ? ` | python3 -c ${shellQuote(counter)}` : ""}`;
 }
 
 function tarUnpackingCommand(compression) {
-  return `${compression === "none" ? "" : "gzip -dc | "}tar -xvf - --index-file=/dev/stderr`;
+  const decoder = compression === "zstd" ? "zstd -dc | " : compression === "none" ? "" : "gzip -dc | ";
+  return `${decoder}tar -xvf - --index-file=/dev/stderr`;
+}
+
+function stagedTarUnpackingCommand(destination, compression, stageId, expectedFiles = {}, paths = Object.keys(expectedFiles)) {
+  const entries = paths.map(name => {
+    const item = expectedFiles[name];
+    return { path: directSyncRelativePath(name), sha256: typeof item === "string" ? item : item?.sha256 || "", size: typeof item?.size === "number" ? item.size : null };
+  });
+  const identity = crypto.createHash("sha256").update(String(stageId || "") + JSON.stringify(entries)).digest("hex");
+  const request = Buffer.from(JSON.stringify({ root: destination.remotePath, identity, entries }), "utf8");
+  if (request.length > 65536) throw new Error("暂存 manifest 超过有界大小，必须拆分批次。");
+  const payload = require("node:zlib").deflateRawSync(request).toString("base64");
+  const decoder = compression === "zstd" ? "zstd -dc | " : compression === "none" ? "" : "gzip -dc | ";
+  return decoder + stagedReceiverInvocation(payload);
+}
+
+function stagedReceiverInvocation(payload) {
+  const source = fs.readFileSync(path.join(__dirname, "staged-tar-receive.py"), "utf8");
+  const code = require("node:zlib").deflateSync(Buffer.from(source, "utf8")).toString("base64");
+  const loader = "import base64,zlib,sys; code=zlib.decompress(base64.b64decode(sys.argv[1])); sys.argv=sys.argv[1:]; exec(compile(code,'simple_sftp_staged_receive','exec'))";
+  return `python3 -c ${shellQuote(loader)} ${shellQuote(code)} ${shellQuote(payload)}`;
 }
 
 function directTarBatchCommand(source, destination, options = {}) {
   const compression = transferCompression(options);
   const destinationHost = `${destination.username}@${destination.host}`;
-  const destinationScript = `root=$(realpath -e -- ${shellQuote(destination.remotePath)}) && test "$root" = ${shellQuote(destination.remotePath)} && cd -- "$root" && ${tarUnpackingCommand(compression)}`;
+  const destinationScript = stagedTarUnpackingCommand(destination, compression, options.transferId, options.expectedFiles, options.groupPaths);
   const destinationCommand = `bash -o pipefail -c ${shellQuote(destinationScript)}`;
   const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${destination.port}`;
-  const sourceCommand = `root=$(realpath -e -- ${shellQuote(source.remotePath)}) && test "$root" = ${shellQuote(source.remotePath)} && cd -- "$root" && ${tarPackingCommand(compression)} | ${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(destinationCommand)}`;
+  const sourceCommand = `root=$(realpath -e -- ${shellQuote(source.remotePath)}) && test "$root" = ${shellQuote(source.remotePath)} && cd -- "$root" && ${tarPackingCommand(compression, options.wireTelemetry === true)} | ${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(destinationCommand)}`;
   return `bash -o pipefail -c ${shellQuote(sourceCommand)}`;
+}
+
+function chunkTransferCommand(target, request) {
+  const payload = require("node:zlib").deflateRawSync(Buffer.from(JSON.stringify({ ...request, root: target.remotePath }), "utf8")).toString("base64");
+  return stagedReceiverInvocation(payload);
+}
+
+function remoteTransferOutcomeUnknown() {
+  const operationId = transferContext.getStore()?.operationId;
+  return !!operationId && transferOperationLedger.get(operationId)?.outcomeUnknown === true;
+}
+
+async function transferChunkedServerFile(source, destination, name, timeoutMs, options) {
+  const entry = options.expectedFiles?.[name];
+  if (!entry || !Number.isSafeInteger(entry.size) || entry.size > 64 * 1024 * 1024 * 1024 || !/^[a-f0-9]{64}$/.test(entry.sha256 || "")) throw new Error("大文件分块需要完整 SHA256/size，单文件上限 64GiB。");
+  const entries = [{ path: name, sha256: entry.sha256, size: entry.size }];
+  const identity = crypto.createHash("sha256").update(JSON.stringify([destination.remotePath, entries])).digest("hex");
+  const request = { identity, entries };
+  // Checkpoint reconciliation can create/truncate an owned staging file and write its journal.
+  // A disconnected status request therefore requires the same settlement protection as writes.
+  const reply = await runRemoteBatchSsh(destination, chunkTransferCommand(destination, { ...request, mode: "chunkStatus" }), [], timeoutMs, { remoteMutation: true, stage: "核验分块检查点" });
+  const status = JSON.parse(reply);
+  const chunkBytes = 8 * 1024 * 1024;
+  if (!Number.isSafeInteger(status.offset) || status.offset < 0 || status.offset >= entry.size || status.offset % chunkBytes || status.chunkBytes !== chunkBytes) throw new Error("大文件恢复检查点无效。");
+  if (options.token?.isCancellationRequested || remoteTransferOutcomeUnknown()) throw new Error("旧传输未确认退出，未重发大文件分块。");
+  {
+    const offset = status.offset;
+    const read = chunkTransferCommand(source, { ...request, mode: "readChunks", offset }) + compressionStreamCommand(options.compression, options.wireTelemetry === true);
+    const decode = options.compression === "zstd" ? "zstd -dc | " : options.compression === "none" ? "" : "gzip -dc | ";
+    const receive = decode + chunkTransferCommand(destination, { ...request, mode: "receiveChunks", offset });
+    const sourceCommand = `bash -o pipefail -c ${shellQuote(read)}`;
+    const destinationCommand = `bash -o pipefail -c ${shellQuote(receive)}`;
+    const direct = `bash -o pipefail -c ${shellQuote(`${read} | ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${destination.port} ${shellQuote(`${destination.username}@${destination.host}`)} ${shellQuote(destinationCommand)}`)}`;
+    try { await runRemoteBatchSsh(source, direct, [], timeoutMs, { ...options, stage: options.compression === "none" ? "分块传输" : "压缩分块传输" }); }
+    catch (error) {
+      if (remoteTransferOutcomeUnknown() || !/host key verification failed|no .* host key|permission denied|connect to host|network is unreachable|could not resolve hostname|connection refused/i.test(formatError(error))) throw error;
+      await relayTarFilesCore(source, destination, [name], timeoutMs, { ...options, sourceCommand, destinationCommand });
+    }
+  }
 }
 
 async function transferPartitionedTar(source, destination, paths, timeoutMs, onPartition, options = {}) {
@@ -1434,14 +1648,14 @@ async function transferPartitionedTar(source, destination, paths, timeoutMs, onP
     () => transferPartitionedTarCore(source, destination, paths, timeoutMs, onPartition, options));
 }
 async function transferPartitionedTarCore(source, destination, paths, timeoutMs, onPartition, options = {}) {
-  // Explicit grouped archives stay in one stream; other large batches use at most four.
-  const groups = partitionTransferPaths(paths, options.singleStream === true ? Math.max(paths.length, 1) : 80);
+  // Explicit grouped archives stay in one stream; other large batches use at most two.
+  const groups = partitionTransferPaths(paths, options.singleStream === true ? Math.max(paths.length, 1) : 80,
+    FPSYNC_PARALLEL_STREAMS, options.fileSizes, FPSYNC_MAX_BATCH_BYTES);
   let next = 0;
   let completed = 0;
   let completedFiles = 0;
   let failed = false;
   let failure = null;
-  const directCommand = directTarBatchCommand(source, destination, options);
   const report = (phase, index, group) => {
     if (failed || !onPartition) return;
     onPartition({ phase, index, groupFiles: group.length, completed, total: groups.length, completedFiles, totalFiles: paths.length });
@@ -1450,7 +1664,7 @@ async function transferPartitionedTarCore(source, destination, paths, timeoutMs,
     failed = true;
     if (!failure) failure = error;
   };
-  const workers = Array.from({ length: Math.min(4, groups.length) }, async () => {
+  const workers = Array.from({ length: Math.min(FPSYNC_PARALLEL_STREAMS, groups.length) }, async () => {
     try {
       while (next < groups.length) {
         if (failed) return;
@@ -1460,16 +1674,26 @@ async function transferPartitionedTarCore(source, destination, paths, timeoutMs,
         report("start", index + 1, group);
         await Promise.resolve();
         if (failed) return;
+        const transferId = require("crypto").createHash("sha256").update(group.join("\0")).digest("hex").slice(0, 32);
+        if (group.length === 1 && Number(options.fileSizes?.[group[0]]) > FPSYNC_MAX_BATCH_BYTES) {
+          await transferChunkedServerFile(source, destination, group[0], timeoutMs, options);
+          if (failed) return;
+          completed += 1;
+          completedFiles += 1;
+          report("done", index + 1, group);
+          continue;
+        }
+        const directCommand = directTarBatchCommand(source, destination, { ...options, transferId, groupPaths: group });
         try {
-          await runRemoteBatchSsh(source, directCommand, group, timeoutMs);
+          await runRemoteBatchSsh(source, directCommand, group, timeoutMs, options);
         } catch (error) {
           const retryable = /host key verification failed|no .* host key|permission denied|connection timed out|connect to host|network is unreachable|could not resolve hostname|connection refused/i.test(formatError(error));
-          if (!retryable) {
+          if (!retryable || remoteTransferOutcomeUnknown()) {
             noteFailure(error);
             return;
           }
           try {
-            await relayTarFiles(source, destination, group, timeoutMs, options);
+            await relayTarFiles(source, destination, group, timeoutMs, { ...options, transferId });
           } catch (relayError) {
             noteFailure(relayError);
             return;
@@ -1510,11 +1734,11 @@ async function syncServerToServerFpsync(options = {}) {
     location: vscode.ProgressLocation.Notification,
     title: fpsyncProgressTitle(options),
     cancellable: false,
-  }, (progress) => syncServerToServerFpsyncCore(options, progress));
+  }, (progress) => withTransferCapacity(options, () => syncServerToServerFpsyncCore(options, progress)));
 }
 
 async function syncServerToServerFpsyncCore(options = {}, progress) {
-  const compression = transferCompression(options);
+  const requestedCompression = requestedTransferCompression(options);
   const source = directSyncTarget(options.source, "来源");
   const destination = directSyncTarget(options.destination, "目标");
   if (source.host === destination.host && source.port === destination.port && source.remotePath === destination.remotePath) throw new Error("来源与目标相同。");
@@ -1557,10 +1781,18 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   const inventoryMs = Math.max(0, Date.now() - inventoryStartedAt);
   const paths = directory ? Object.keys(sourceHashes).sort() : requested;
   const digest = (entry) => typeof entry === "string" ? entry : entry && entry.sha256;
+  const fileSizes = Object.fromEntries(paths.map((name) => [name, Number(sourceHashes[name]?.size) || 0]));
   const changed = paths.filter((name) => digest(sourceHashes[name]) !== digest(destinationHashes[name]));
-  const planned = partitionTransferPaths(changed, options.singleStream === true ? Math.max(changed.length, 1) : 80);
+  const compressionDecision = changed.length
+    ? await selectTransferCompression({ ...options, compression: requestedCompression }, source, destination, changed, fileSizes)
+    : { compression: requestedCompression === "none" ? "none" : requestedCompression === "zstd" ? "zstd" : "gzip", reason: "no-changed-files", sampleBytes: 0 };
+  const compression = compressionDecision.compression;
+  let wireBytes = 0;
+  const effectiveOptions = { ...options, compression, expectedFiles: sourceHashes, wireTelemetry: true, onWireBytes: (count) => { wireBytes += count; } };
+  const planned = partitionTransferPaths(changed, options.singleStream === true ? Math.max(changed.length, 1) : 80,
+    FPSYNC_PARALLEL_STREAMS, fileSizes, FPSYNC_MAX_BATCH_BYTES);
   progress.report({ message: changed.length
-    ? `清单完成（${inventoryMs} ms）；需${compression === "none" ? "无压缩" : "gzip 压缩"}流处理 ${changed.length}/${paths.length} 个文件，共 ${planned.length} 组`
+    ? "清单完成（" + inventoryMs + " ms）；采用" + (compression === "none" ? "无压缩" : compression === "zstd" ? "zstd 压缩" : "gzip 压缩") + "流处理 " + changed.length + "/" + paths.length + " 个文件，共 " + planned.length + " 组"
     : `清单完成（${inventoryMs} ms）；${paths.length} 个文件均无需传输，准备校验…` });
   const streamStartedAt = Date.now();
   const partitions = await transferPartitionedTar(source, destination, changed, timeoutMs, (event) => {
@@ -1570,8 +1802,9 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
     }
     const percent = event.totalFiles ? Math.floor(event.completedFiles * 90 / event.totalFiles) : 90;
     advance(percent, `第 ${event.index}/${event.total} 组流处理结束 · 已完成 ${event.completedFiles}/${event.totalFiles} 个文件`);
-  }, options);
+  }, { ...effectiveOptions, fileSizes });
   const streamMs = Math.max(0, Date.now() - streamStartedAt);
+  compressionHistory.record(compressionHistory.key(source, destination), wireBytes, streamMs);
   advance(95, `流处理结束（${streamMs} ms，含打包、传输与解包）；正在校验目标 Worker 的 ${paths.length} 个文件…`);
   const verifyStartedAt = Date.now();
   const verifiedPayload = directory
@@ -1597,7 +1830,7 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   advance(100, `完成：传输 ${changed.length}/${paths.length} 个文件，SHA256 校验通过 · 清单 ${timing.inventoryMs} ms · 流处理 ${timing.streamMs} ms · 校验 ${timing.verifyMs} ms`);
   return { ok: true, paths: paths.length, transferredFiles: changed.length, partitions,
     verification: "sha256", transport: "partitioned-tar", compression, singleStream: options.singleStream === true,
-    directory, relativePath, timing, hashCache };
+    directory, relativePath, timing, hashCache, compressionDecision, wireBytes };
 }
 
 async function syncFromRemoteCore(options = {}) {
@@ -1869,7 +2102,6 @@ function setUploadOperationStage(operationId, stage) {
 }
 
 async function uploadFilesCore(options = {}) {
-  let tempDir = "";
   try {
     const localBase = resolveLocalWorkspacePath(options.localBase || options.localPath, "上传指定文件");
     if (!localBase) throw new Error("请先打开工作区，或传入 localBase。");
@@ -1880,8 +2112,7 @@ async function uploadFilesCore(options = {}) {
     if (!files.length && !options.manifest) throw new Error("没有要上传的文件。");
     setUploadOperationStage(options.transferId, "confirming-path");
     await confirmTransferPath({ localPath: localBase, sftp, operation: "上传指定文件", detail: filesSummary(options.files), options });
-    setUploadOperationStage(options.transferId, "staging-files");
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-files-"));
+    setUploadOperationStage(options.transferId, "preparing-files");
     const relativePaths = [];
     const uploadPlanFiles = [];
     for (const item of files) {
@@ -1891,20 +2122,18 @@ async function uploadFilesCore(options = {}) {
         throw new Error(`本地文件不存在：${localPath || "-"}`);
       }
       const remoteName = sanitizeRelativeUploadPath(typeof item === "string" ? path.basename(localPath) : (item.remoteName || item.relativePath || path.basename(localPath)));
-      const targetPath = path.join(tempDir, remoteName);
-      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
       relativePaths.push(toPosixPath(remoteName));
       uploadPlanFiles.push({ relativePath: toPosixPath(remoteName), fullPath: localPath, size: fs.statSync(localPath).size });
     }
     if (options.manifest) {
-      const manifestPath = path.join(tempDir, "runtime_manifest.json");
-      fs.writeFileSync(manifestPath, `${JSON.stringify(options.manifest, null, 2)}\n`, "utf8");
+      const content = Buffer.from(`${JSON.stringify(options.manifest, null, 2)}\n`, "utf8");
+      if (content.length > 2 * 1024 * 1024) throw new Error("运行清单超过 2MiB 上限。");
       relativePaths.push("runtime_manifest.json");
-      uploadPlanFiles.push({ relativePath: "runtime_manifest.json", fullPath: manifestPath, size: fs.statSync(manifestPath).size });
+      uploadPlanFiles.push({ relativePath: "runtime_manifest.json", content, size: content.length });
     }
     setUploadOperationStage(options.transferId, "transferring");
     const stats = await runUploadWithProgress(options, `上传指定文件 -> ${sftp.remotePath}`, (token, progress) => runLocalTarUpload({
-        localPath: tempDir,
+        localPath: localBase,
         sftp,
         uploadPlan: { files: uploadPlanFiles, fileCount: uploadPlanFiles.length, byteCount: uploadPlanFiles.reduce((total, file) => total + file.size, 0), excludedRuleHits: 0, excludedNestedGitRepos: 0, nestedGitRoots: [] },
         operation: "上传指定文件",
@@ -1927,9 +2156,6 @@ async function uploadFilesCore(options = {}) {
     const message = `上传指定文件失败：${formatError(error)}`;
     vscode.window.showErrorMessage(message);
     return { ok: false, error: message };
-  } finally {
-    setUploadOperationStage(options.transferId, "cleaning-staging-files");
-    if (tempDir) await removeLocalStagingDirectory(tempDir);
   }
 }
 
@@ -2241,34 +2467,27 @@ function inspectRemoteManagedFiles(sftp, manifest, timeoutMs) {
 
 async function writeRemoteCodeSyncState(sftp, state, manifest) {
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) return;
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-code-sync-state-"));
-  try {
-    const stateDir = path.join(tempDir, "simple_cluster");
-    fs.mkdirSync(stateDir, { recursive: true });
-    fs.writeFileSync(path.join(stateDir, "code_sync_state.json"), `${JSON.stringify(state, null, 2)}\n`, "utf8");
-    fs.writeFileSync(path.join(stateDir, "code_sync_manifest.json"), `${JSON.stringify({
-      version: 1,
-      files: manifest,
-      updatedAt: new Date().toISOString(),
-    }, null, 2)}\n`, "utf8");
-    await runLocalTarUpload({
-      localPath: tempDir,
+  const files = [
+    ["simple_cluster/code_sync_state.json", state],
+    ["simple_cluster/code_sync_manifest.json", { version: 1, files: manifest, updatedAt: new Date().toISOString() }],
+  ].map(([relativePath, value]) => {
+    const content = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+    if (content.length > 2 * 1024 * 1024) throw new Error("代码同步清单超过 2MiB 上限。");
+    return { relativePath, content, size: content.length };
+  });
+  await runLocalTarUpload({
+      localPath: sftp.remotePath,
       sftp,
       uploadPlan: {
-        files: [
-          { relativePath: "simple_cluster/code_sync_state.json", fullPath: path.join(stateDir, "code_sync_state.json"), size: fs.statSync(path.join(stateDir, "code_sync_state.json")).size },
-          { relativePath: "simple_cluster/code_sync_manifest.json", fullPath: path.join(stateDir, "code_sync_manifest.json"), size: fs.statSync(path.join(stateDir, "code_sync_manifest.json")).size },
-        ],
+        files,
         fileCount: 2,
+        byteCount: files.reduce((sum, file) => sum + file.size, 0),
         excludedRuleHits: 0,
         excludedNestedGitRepos: 0,
         nestedGitRoots: [],
       },
       operation: "上传代码同步 manifest",
-    });
-  } finally {
-    await removeLocalStagingDirectory(tempDir);
-  }
+  });
 }
 
 function isSafeRemoteManagedPath(relativePath) {
@@ -2363,6 +2582,7 @@ function explicitDownloadScope(options = {}) {
 }
 
 const MAPPED_DOWNLOAD_DEFAULT_MAX_FILE_BYTES = 128 * 1024 * 1024;
+const MAPPED_DOWNLOAD_DEFAULT_MAX_BATCH_BYTES = 128 * 1024 * 1024;
 const MAPPED_DOWNLOAD_MAX_ENTRIES = 256;
 const METRIC_DOWNLOAD_EXTENSIONS = new Set([".csv", ".json", ".md", ".txt", ".log"]);
 const WEIGHT_DOWNLOAD_EXTENSIONS = new Set([".pt", ".pth", ".ckpt", ".safetensors", ".bin", ".onnx", ".pkl", ".pickle"]);
@@ -2373,6 +2593,7 @@ function normalizeMappedRelativePath(value, label) {
     throw new Error(`${label}必须是项目内相对文件路径：${value}`);
   }
   const normalized = raw.replace(/^\.\//, "").replace(/\/+$/g, "");
+  if (normalized.length > 4096 || normalized.includes(":")) throw new Error(`${label}包含不安全路径段：${value}`);
   if (!normalized || normalized === "." || path.posix.isAbsolute(normalized) || /^[A-Za-z]:/.test(normalized)) {
     throw new Error(`${label}必须是项目内相对文件路径：${value}`);
   }
@@ -2388,6 +2609,15 @@ function mappedDownloadMaxFileBytes(value) {
   const size = Number(value);
   if (!Number.isFinite(size) || size < 1 || size > 1024 * 1024 * 1024) {
     throw new Error("映射下载单文件上限必须在 1 字节到 1 GiB 之间。");
+  }
+  return Math.floor(size);
+}
+
+function mappedDownloadMaxBatchBytes(value) {
+  if (value == null || value === "") return MAPPED_DOWNLOAD_DEFAULT_MAX_BATCH_BYTES;
+  const size = Number(value);
+  if (!Number.isFinite(size) || size < 1 || size > MAPPED_DOWNLOAD_DEFAULT_MAX_BATCH_BYTES) {
+    throw new Error(`映射下载单批未压缩上限必须在 1 字节到 ${MAPPED_DOWNLOAD_DEFAULT_MAX_BATCH_BYTES} 字节之间。`);
   }
   return Math.floor(size);
 }
@@ -2420,6 +2650,7 @@ function normalizeMappedDownloadEntries(options = {}) {
     throw new Error(`映射下载一次最多 ${MAPPED_DOWNLOAD_MAX_ENTRIES} 个文件，当前 ${raw.length} 个。`);
   }
   const maxFileBytes = mappedDownloadMaxFileBytes(options.maxFileBytes);
+  const maxBatchBytes = mappedDownloadMaxBatchBytes(options.maxBatchBytes);
   const overwrite = options.overwrite === true;
   const seenRemote = new Map();
   const seenLocal = new Map();
@@ -2440,14 +2671,23 @@ function normalizeMappedDownloadEntries(options = {}) {
     if (declared != null && (!Number.isFinite(declared) || declared < 0 || declared > maxFileBytes)) {
       throw new Error(`映射下载条目超过单文件上限 ${maxFileBytes} 字节：${remotePath}`);
     }
-    return { remotePath, localRelativePath, bytes: declared == null ? null : Math.floor(declared), index };
+    if (declared != null && declared > maxBatchBytes) {
+      throw new Error(`映射下载条目超过单批上限 ${maxBatchBytes} 字节：${remotePath}`);
+    }
+    const sha256 = String(item.sha256 || "").trim().toLowerCase();
+    if (sha256 && !/^[a-f0-9]{64}$/.test(sha256)) throw new Error(`映射下载条目 SHA256 无效：${remotePath}`);
+    return { remotePath, localRelativePath, bytes: declared == null ? null : Math.floor(declared), sha256, index };
   });
+  const byteCount = entries.reduce((total, entry) => total + (entry.bytes || 0), 0);
+  if (byteCount > maxBatchBytes) throw new Error(`映射下载批次超过未压缩上限 ${maxBatchBytes} 字节。`);
   return {
     entries,
     maxFileBytes,
+    maxBatchBytes,
     overwrite,
-    compression: transferCompression({ compression: options.compression === undefined ? "none" : options.compression }),
-    byteCount: entries.reduce((total, entry) => total + (entry.bytes || 0), 0),
+    requestedCompression: requestedTransferCompression(options),
+    compression: transferCompression({ compression: options.compression === undefined ? "auto" : options.compression }),
+    byteCount,
   };
 }
 
@@ -3009,6 +3249,7 @@ function createTransferController({ id, operation, localPath, remotePath, host }
         return;
       }
       listeners.add(listener);
+      return { dispose() { listeners.delete(listener); } };
     },
     cancel(reason) {
       if (disposed || cancelled) return false;
@@ -3028,6 +3269,7 @@ function createTransferController({ id, operation, localPath, remotePath, host }
       if (disposed) return;
       disposed = true;
       idle.dispose();
+      parentCancellation?.dispose?.();
       listeners.clear();
       activeTransfers.delete(controller.id);
       void maybeSettleTransferOperation(controller.operationId);
@@ -3048,7 +3290,7 @@ function createTransferController({ id, operation, localPath, remotePath, host }
     return true;
   };
   const parentController = transferContext.getStore();
-  parentController?.onCancel((reason) => controller.cancel(reason));
+  const parentCancellation = parentController?.onCancel((reason) => controller.cancel(reason));
   activeTransfers.set(controller.id, controller);
   if (parentController?.status === "cancelled") controller.cancel("上层操作已取消");
   return controller;
@@ -3118,11 +3360,8 @@ function pruneTransferOperationLedger() {
 
 function persistTransferOperationLedger() {
   const context = extensionContext;
-  transferLedgerWrite = transferLedgerWrite.catch(() => undefined).then(() => {
-    if (!context?.globalState?.update) return;
-    const rows = [...transferOperationLedger.values()].slice(-MAX_TRANSFER_OPERATIONS).map(({ requestDone, outcomeUnknown, persisted, settling, ...row }) => row);
-    return context.globalState.update(TRANSFER_OPERATION_STATE, rows);
-  });
+  const rows = [...transferOperationLedger.values()].slice(-MAX_TRANSFER_OPERATIONS).map(({ requestDone, outcomeUnknown, persisted, settling, ...row }) => row);
+  transferLedgerWrite = transferLedgerWriter.enqueue({ context, rows });
   return transferLedgerWrite;
 }
 
@@ -3143,6 +3382,7 @@ function transferRequestKey(method, params) {
 }
 
 async function beginTransferOperation(operationId, requestedInstanceId, remoteMutation, requestKey) {
+  if (extensionDeactivating) throw new Error("SimpleSFTP 正在停用，未启动新传输。");
   loadTransferOperationLedger();
   pruneTransferOperationLedger();
   const id = String(operationId || "").trim();
@@ -3209,7 +3449,7 @@ function markTransferOperationUnknown(operationId, reason) {
   void persistTransferOperationLedger().catch(() => undefined);
 }
 
-function trackTransferResource(resource, operationId = transferContext.getStore()?.operationId) {
+function trackTransferResource(resource, operationId = transferContext.getStore()?.operationId, remoteMutation) {
   const id = String(operationId || "").trim();
   if (!id || !resource || typeof resource.once !== "function") return;
   let resources = activeTransferResources.get(id);
@@ -3220,7 +3460,7 @@ function trackTransferResource(resource, operationId = transferContext.getStore(
     resources.delete(resource);
     if (!resources.size) activeTransferResources.delete(id);
     const row = transferOperationLedger.get(id);
-    if (row?.remoteMutation && (code === null || code === undefined || signal || code === 255))
+    if ((remoteMutation ?? row?.remoteMutation) && (code === null || code === undefined || signal || code === 255))
       markTransferOperationUnknown(id, `process closed without authoritative remote exit status (${signal || code})`);
     void maybeSettleTransferOperation(id);
   });
@@ -3611,6 +3851,7 @@ function createLocalApiMethods() {
         remotePath: entry.remotePath,
         localRelativePath: entry.localRelativePath,
         bytes: entry.bytes,
+        sha256: entry.sha256,
       }));
       requireApiConfirmation({
         ...params,
@@ -3618,6 +3859,7 @@ function createLocalApiMethods() {
           fileCount: plan.entries.length,
           byteCount: plan.byteCount,
           maxFileBytes: plan.maxFileBytes,
+          maxBatchBytes: plan.maxBatchBytes,
           overwrite: plan.overwrite,
           entries: previewEntries,
         },
@@ -3635,11 +3877,13 @@ function createLocalApiMethods() {
         remotePath: sftp.remotePath,
         fileCount: result.fileCount,
         byteCount: result.byteCount,
+        maxBatchBytes: plan.maxBatchBytes,
       });
       return result;
     },
     "sync.planLogPaths": async (params = {}) => listPlanLogPaths(params),
     "sync.projectInventory": async (params = {}) => projectInventory(params),
+    "sync.projectFileStats": async (params = {}) => projectFileStats(params),
     "sync.projectTree": async (params = {}) => projectTree(params),
     "sync.deletePath": async (params = {}) => deleteProjectPath(params),
     "sync.serverToServerBatch": async (params = {}) => syncServerToServerBatch(params),
@@ -3797,7 +4041,7 @@ function createLocalApiMethods() {
       controller.operationId = operationId;
       try {
         if (cancelledTransferOperations.has(operationId)) throw new Error(cancelledTransferOperations.get(operationId));
-        const result = await transferContext.run(controller, () => method(params));
+        const result = await transferContext.run(controller, () => withTransferCapacity(params, () => method(params)));
         if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认");
         return result;
       } finally {
@@ -4102,14 +4346,20 @@ function getRemoteMarkerPath(remotePath, markerName) {
 }
 
 
-function watchTransferProcess(child, onIdle, fileStep = true, filenames = []) {
+function watchTransferProcess(child, onIdle, fileStep = true, filenames = [], remoteMutation) {
   const parent = transferContext.getStore();
-  trackTransferResource(child, parent?.operationId);
+  const apiContext = currentApiRequestContext();
+  trackTransferResource(child, parent?.operationId, apiContext?.readOnly ? false : remoteMutation);
   let buffer = "", bytes = 0, files = 0;
   const allowed = new Set(filenames), completed = new Set();
   const byteBase = parent?.transferredBytes || 0, fileBase = parent?.processedFiles || 0;
   const idle = new ProgressInactivity(fileStep ? 120000 : 30000, () => { child.kill(); onIdle(new Error(fileStep ? "文件步骤 120 秒无真实进展，已停止。" : "控制请求 30 秒无有效响应，执行结果待确认。")); });
-  parent?.onCancel((reason) => { child.kill(); idle.dispose(); onIdle(new Error(reason)); });
+  const cancellation = parent?.onCancel((reason) => { child.kill(); idle.dispose(); onIdle(new Error(reason)); });
+  const cancelledRead = () => { child.kill(); idle.dispose(); onIdle(apiContext.signal.reason); };
+  if (apiContext?.readOnly) {
+    apiContext.signal.addEventListener("abort", cancelledRead, { once: true });
+    if (apiContext.signal.aborted) cancelledRead();
+  }
   if (parent?.status === "cancelled") { child.kill(); idle.dispose(); throw new Error("传输已取消"); }
   const update = (evidence) => {
     evidence = { ...evidence, scope: String(child.pid || child) };
@@ -4129,7 +4379,7 @@ function watchTransferProcess(child, onIdle, fileStep = true, filenames = []) {
     if (buffer.length > 16384) buffer = buffer.slice(-16384);
   };
   child.stderr?.on("data", stderr);
-  child.once("close", () => idle.dispose());
+  child.once("close", () => { idle.dispose(); cancellation?.dispose?.(); child.stderr?.off?.("data", stderr); apiContext?.signal.removeEventListener("abort", cancelledRead); });
   child.once("error", () => idle.dispose());
   return { dispose: () => idle.dispose(), receive, update };
 }
@@ -4509,7 +4759,7 @@ function runLocalTarUpload(options) {
   const plan = options.uploadPlan || createWorkspaceUploadPlan(options.localPath, options.sftp);
   return withFileResourceLease(options.operation || "批量上传", options.sftp.remotePath,
     plan.files.map(file => file.relativePath), remoteResourceServer(options.sftp),
-    () => runLocalTarUploadCore({ ...options, uploadPlan: plan }));
+    () => withTransferCapacity({ server: options.sftp }, () => runLocalTarUploadCore({ ...options, uploadPlan: plan })));
 }
 function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, timeoutMs, token, transferId, progress }) {
   const remoteCommand = createRemoteExtractCommand(sftp.remotePath);
@@ -4657,11 +4907,18 @@ async function downloadMappedPaths(options = {}) {
 }
 
 async function downloadMappedPathsCore(options = {}) {
+  return withTransferCapacity(options, () => downloadMappedPathsInternal(options));
+}
+
+async function downloadMappedPathsInternal(options = {}) {
   const localPath = String(options.localPath || "").trim();
-  const plan = options.plan || normalizeMappedDownloadEntries(options);
+  let plan = options.plan || normalizeMappedDownloadEntries(options);
   const sftp = options.sftp || apiTransferSftp({ ...options, localPath });
   if (!sftp || !sftp.host || !sftp.remotePath) throw new Error("未配置可用的 SFTP 远端路径。");
   assertMappedLocalDestinations(localPath, plan);
+  const decision = await selectTransferCompression({ ...options, compression: plan.requestedCompression || options.compression || plan.compression }, sftp,
+    { host: "local", port: 0, username: "", remotePath: localPath }, plan.entries.map(item => item.remotePath), Object.fromEntries(plan.entries.map(item => [item.remotePath, item.bytes || 0])), true);
+  plan = { ...plan, compression: decision.compression };
   const archiveNames = plan.entries.map((_, index) => `mapped/${index}`);
   const byArchiveName = new Map(plan.entries.map((entry, index) => [archiveNames[index], entry]));
   const stage = { name: "validate", sshCount: 0 };
@@ -4676,7 +4933,7 @@ async function downloadMappedPathsCore(options = {}) {
     progressState.message = message;
     if (options.progress && typeof options.progress.report === "function") options.progress.report({ message });
   };
-  report(`校验 ${plan.entries.length} 个映射，准备一次${plan.compression === "gzip" ? "gzip 压缩" : "无压缩"}打包`);
+  report(`校验 ${plan.entries.length} 个映射，准备单批最多 ${plan.maxBatchBytes} 字节的${plan.compression === "gzip" ? "gzip 压缩" : "无压缩"}打包`);
   let stream;
   let sshExitSeen = null;
   const watchSshExit = () => {
@@ -4689,8 +4946,9 @@ async function downloadMappedPathsCore(options = {}) {
       stage.sshCount = 1;
       const transportResult = await Promise.resolve().then(() => mappedDownloadTransport({
         sftp,
-        entries: plan.entries.map((entry) => ({ remotePath: entry.remotePath, archiveName: `mapped/${entry.index}` })),
+        entries: plan.entries.map((entry) => ({ remotePath: entry.remotePath, archiveName: `mapped/${entry.index}`, bytes: entry.bytes, sha256: entry.sha256 })),
         maxFileBytes: plan.maxFileBytes,
+        maxBatchBytes: plan.maxBatchBytes,
         remoteCommand: createMappedDownloadCommand(sftp, plan),
         timeoutMs: transferTimeoutMs(sftp, options),
         transferId: options.transferId,
@@ -4719,6 +4977,7 @@ async function downloadMappedPathsCore(options = {}) {
       byArchiveName,
       localPath,
       maxFileBytes: plan.maxFileBytes,
+      maxBatchBytes: plan.maxBatchBytes,
       overwrite: plan.overwrite,
       shouldCancel: () => Boolean(options.token && options.token.isCancellationRequested || transferContext.getStore()?.status === "cancelled"),
       onFileBytes: (bytes) => {
@@ -4751,6 +5010,8 @@ async function downloadMappedPathsCore(options = {}) {
       completedFiles: written.length,
       streamCount: 1,
       compression: plan.compression || "none",
+      compressionDecision: decision,
+      wireBytes: stream.wireBytes || 0,
       sshCount: stage.sshCount,
       entries: written,
       phase: "complete",
@@ -4811,6 +5072,8 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
   let timer;
   let tokenDisposable;
   let lastProgressAt = 0;
+  output.wireBytes = 0;
+  const wireStartedAt = Date.now();
   const archiveDecoder = plan.compression === "gzip" ? require("node:zlib").createGunzip() : null;
   const finishFailure = (error) => {
     const classified = classifySftpFailure(error, sftp, {
@@ -4850,6 +5113,7 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
   }
   sshProc.stderr.on("data", (chunk) => { sshStderr = appendProcessOutput(sshStderr, chunk); });
   sshProc.stdout.on("data", (chunk) => {
+    output.wireBytes += chunk.length;
     controller.transferredBytes += chunk.length;
     const now = Date.now();
     if (progress && typeof progress.report === "function" && now - lastProgressAt >= 250) {
@@ -4889,6 +5153,7 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
       if (settled) return;
       settled = true;
       output.end();
+      compressionHistory.record(compressionHistory.key(sftp, { host: "local", port: 0, username: "", remotePath: localPath }), output.wireBytes, Date.now() - wireStartedAt);
       resolveExit({ sshCode: 0 });
     };
     if (archiveDecoder) { archiveDecoder.once("end", finish); archiveDecoder.end(); }
@@ -4904,8 +5169,9 @@ function createMappedDownloadCommand(sftp, plan) {
 
 function createMappedDownloadScript(remotePath, plan) {
   const payload = Buffer.from(JSON.stringify({
-    files: plan.entries.map((entry) => ({ remotePath: entry.remotePath, archiveName: `mapped/${entry.index}`, bytes: entry.bytes })),
+    files: plan.entries.map((entry) => ({ remotePath: entry.remotePath, archiveName: `mapped/${entry.index}`, bytes: entry.bytes, sha256: entry.sha256 })),
     maxFileBytes: plan.maxFileBytes,
+    maxBatchBytes: plan.maxBatchBytes,
     compression: plan.compression || "none",
   }), "utf8").toString("base64");
   return [
@@ -4914,6 +5180,7 @@ function createMappedDownloadScript(remotePath, plan) {
     `request=json.loads(base64.b64decode(${JSON.stringify(payload)}).decode('utf-8'))`,
     "files=request.get('files') or []",
     "limit=int(request.get('maxFileBytes') or 0)",
+    "batch_limit=int(request.get('maxBatchBytes') or 0)",
     "def fail(message):",
     "    sys.stderr.write(message+'\\n')",
     "    raise SystemExit(73)",
@@ -4921,6 +5188,7 @@ function createMappedDownloadScript(remotePath, plan) {
     "    try: return os.path.commonpath([root, value]) == root",
     "    except ValueError: return False",
     "selected=[]",
+    "total_size=0",
     "seen=set()",
     "for item in files:",
     "    rel=str(item.get('remotePath') or '').replace('\\\\','/').strip('/')",
@@ -4940,6 +5208,8 @@ function createMappedDownloadScript(remotePath, plan) {
     "    declared=item.get('bytes')",
     "    if size > limit: fail('remote file exceeds limit: '+rel)",
     "    if declared is not None and int(declared) != size: fail('remote size changed: '+rel)",
+    "    total_size += size",
+    "    if batch_limit > 0 and total_size > batch_limit: fail('mapped batch exceeds uncompressed byte limit: '+str(batch_limit))",
     "    selected.append((archive, full, size))",
     "sink=gzip.GzipFile(fileobj=sys.stdout.buffer,mode='wb',compresslevel=6) if request.get('compression') == 'gzip' else sys.stdout.buffer",
     "with tarfile.open(fileobj=sink, mode='w|', format=tarfile.GNU_FORMAT) as archive:",
@@ -4955,7 +5225,7 @@ function createMappedDownloadScript(remotePath, plan) {
 
 const MAPPED_TAR_BLOCK = 512;
 
-async function extractMappedTarStream({ stream, byArchiveName, localPath, maxFileBytes, overwrite, onFileBytes, onFile, shouldCancel }) {
+async function extractMappedTarStream({ stream, byArchiveName, localPath, maxFileBytes, maxBatchBytes = MAPPED_DOWNLOAD_DEFAULT_MAX_BATCH_BYTES, overwrite, onFileBytes, onFile, shouldCancel }) {
   const pending = new Map(byArchiveName);
   const written = [];
   const staged = [];
@@ -4963,6 +5233,7 @@ async function extractMappedTarStream({ stream, byArchiveName, localPath, maxFil
   const reader = createTarByteReader(stream);
   const root = path.resolve(localPath);
   let zeroBlocks = 0;
+  let archiveBytes = 0;
   const failExtract = (message, extra = {}) => {
     const error = new Error(`${message}。阶段：解包。下一步：已完成文件保留，未完成目标保持原内容；残留临时文件见 partialResiduals。`);
     error.stage = "extract";
@@ -4988,6 +5259,7 @@ async function extractMappedTarStream({ stream, byArchiveName, localPath, maxFil
       const parsed = parseMappedTarHeader(block);
       const padding = (MAPPED_TAR_BLOCK - (parsed.size % MAPPED_TAR_BLOCK)) % MAPPED_TAR_BLOCK;
       if (parsed.pax || parsed.typeflag === "5") {
+        if (parsed.size > 65536) throw failExtract("tar 元数据超过有界大小");
         await reader.discard(parsed.size + padding);
         continue;
       }
@@ -4995,6 +5267,8 @@ async function extractMappedTarStream({ stream, byArchiveName, localPath, maxFil
       if (!target || parsed.typeflag !== "0" && parsed.typeflag !== "\0" || parsed.size > maxFileBytes) {
         throw failExtract(`tar 条目未通过映射校验：${parsed.name || "(empty)"}`);
       }
+      archiveBytes += parsed.size;
+      if (archiveBytes > maxBatchBytes) throw failExtract("映射批次超过未压缩字节上限");
       const destination = target.localFullPath;
       const parent = path.dirname(destination);
       fs.mkdirSync(parent, { recursive: true });
@@ -5003,35 +5277,43 @@ async function extractMappedTarStream({ stream, byArchiveName, localPath, maxFil
       try { existing = fs.lstatSync(destination); }
       catch (error) { if (error.code !== "ENOENT") throw error; }
       if (existing) {
-        if (existing.isSymbolicLink() || !existing.isFile()) throw failExtract(`写入前本机目标不再是普通文件：${target.localRelativePath}`);
+        if (existing.isSymbolicLink() || !existing.isFile() || existing.nlink !== 1) throw failExtract(`写入前本机目标不再是独占普通文件：${target.localRelativePath}`);
         if (!overwrite) throw failExtract(`本机文件已存在，未确认覆盖：${target.localRelativePath}`);
       }
       const staging = mappedStagingPath(destination);
       residuals.push(staging);
-      const handle = fs.createWriteStream(staging, { flags: "wx" });
+      const handle = openMappedStagingStream(staging);
       trackTransferResource(handle);
       let received = 0;
+      const expectedSha256 = String(target.sha256 || "").toLowerCase();
+      const digest = expectedSha256 ? require("crypto").createHash("sha256") : null;
       try {
         while (received < parsed.size) {
           if (shouldCancel && shouldCancel()) throw failExtract("传输已取消");
           const piece = await reader.take(Math.min(64 * 1024, parsed.size - received));
           if (!piece) throw failExtract("tar 流在文件结束前中断");
           await writeStreamChunk(handle, piece);
+          if (digest) digest.update(piece);
           received += piece.length;
           if (onFileBytes) onFileBytes(piece.length);
         }
+        await new Promise((resolve, reject) => fs.fsync(handle.fd, error => error ? reject(error) : resolve()));
         await closeWriteStream(handle);
+        const actualSha256 = digest ? digest.digest("hex") : "";
+        if (expectedSha256 && actualSha256 !== expectedSha256) throw failExtract(`文件 SHA256 与权威结果不一致：${target.remotePath}`);
         if (padding) await reader.discard(padding);
         assertMappedAncestorChain(root, target.localRelativePath);
         if (existing && !overwrite) throw failExtract(`本机文件已存在，未确认覆盖：${target.localRelativePath}`);
-        staged.push({ staging, destination, target, size: parsed.size, existed: Boolean(existing) });
+        staged.push({ staging, destination, target, size: parsed.size, sha256: actualSha256, existed: Boolean(existing) });
       } catch (error) {
         handle.destroy();
+        if (!handle.closed) await new Promise((resolve) => handle.once("close", resolve));
         if (error && error.partialResiduals) throw error;
         throw failExtract(error && error.message || "映射写入失败");
       }
       pending.delete(parsed.name);
     }
+    if (zeroBlocks < 2 || pending.size) throw failExtract("映射归档缺少完整尾部或声明文件");
     if (stream && stream.sshExit && typeof stream.sshExit.then === "function") await stream.sshExit;
     for (const item of staged) {
       assertMappedAncestorChain(root, item.target.localRelativePath);
@@ -5043,20 +5325,43 @@ async function extractMappedTarStream({ stream, byArchiveName, localPath, maxFil
         localRelativePath: item.target.localRelativePath,
         localPath: item.destination,
         bytes: item.size,
+        sha256: item.sha256,
         ok: true,
       });
       if (onFile) onFile(item.target);
     }
   } catch (error) {
-    if (error && error.partialResiduals) throw error;
-    throw failExtract(error && error.message || "映射解包失败");
+    const original = error && error.partialResiduals ? error : failExtract(error && error.message || "映射解包失败");
+    const cleanupFailures = cleanupMappedStagingFiles(root, residuals);
+    original.partialResiduals = cleanupFailures;
+    if (cleanupFailures.length) original.message += ` 暂存保留供同目标重试复用：${cleanupFailures.map((item) => path.basename(item)).join("、")}`;
+    throw original;
   }
   return written;
 }
 
+// Compatibility entry: report recoverable slots; never delete incomplete data automatically.
+function cleanupMappedStagingFiles(root, paths) {
+  return paths.filter(candidate => fs.existsSync(candidate));
+}
+
 function mappedStagingPath(destination) {
-  const leaf = `.${path.basename(destination)}.simple-sftp-partial-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
-  return path.join(path.dirname(destination), leaf);
+  const identity = crypto.createHash("sha256").update(path.resolve(destination)).digest("hex").slice(0, 32);
+  return path.join(path.dirname(destination), `.${path.basename(destination)}.simple-sftp-partial-${identity}`);
+}
+
+function openMappedStagingStream(staging) {
+  let before;
+  try { before = fs.lstatSync(staging); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+  if (before && (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1)) throw new Error("暂存槽不是独占普通文件");
+  const fd = fs.openSync(staging, before ? fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0) : "wx");
+  try {
+    const opened = fs.fstatSync(fd), after = fs.lstatSync(staging);
+    if (!opened.isFile() || opened.nlink !== 1 || after.isSymbolicLink() || opened.dev !== after.dev || opened.ino !== after.ino || before && (before.dev !== opened.dev || before.ino !== opened.ino)) throw new Error("暂存槽身份发生变化");
+    fs.ftruncateSync(fd, 0);
+    return fs.createWriteStream(staging, { fd, autoClose: true });
+  } catch (error) { fs.closeSync(fd); throw error; }
 }
 
 function assertMappedAncestorChain(root, relativePath) {
@@ -5730,10 +6035,48 @@ function shellQuote(value) {
 }
 
 async function deactivate() {
+  extensionDeactivating = true;
+  for (const controller of [...activeTransfers.values()]) controller.cancel("插件停用");
+  for (const resources of activeTransferResources.values()) for (const resource of resources) {
+    try { resource.kill?.(); resource.destroy?.(); } catch { /* Keep unconfirmed receipts. */ }
+  }
+  const boundedWait = async promise => {
+    let timer;
+    try { await Promise.race([promise, new Promise(resolve => { timer = setTimeout(resolve, 5000); })]); }
+    finally { clearTimeout(timer); }
+  };
+  await boundedWait(Promise.all([...activeTransferResources.keys()].map(waitLocalTransferResources)));
+  await boundedWait(persistTransferOperationLedger());
   if (localApiServer) {
     await localApiServer.dispose().catch(() => undefined);
     localApiServer = undefined;
   }
+}
+
+function waitLocalTransferResources(operationId) {
+  const resources = [...(activeTransferResources.get(operationId) || [])];
+  return Promise.all(resources.map(resource => new Promise(resolve => {
+    if (resource.closed || resource.destroyed && typeof resource.kill !== "function") { resolve(); return; }
+    resource.once("close", resolve);
+  })));
+}
+
+async function withTransferCapacity(options, work) {
+  const parent = transferContext.getStore();
+  const abort = new AbortController();
+  const cancel = reason => abort.abort(new Error(reason || "传输已取消"));
+  const cancelSubscription = parent?.onCancel(cancel);
+  if (parent?.status === "cancelled" || options.token?.isCancellationRequested) cancel("传输已取消");
+  const tokenSubscription = options.token?.onCancellationRequested?.(() => cancel("传输已取消"));
+  const keys = [options.source, options.destination, options.server, options.sftp, options.target, options].filter(item => item?.host).map(item => String(item.host).toLowerCase() + ":" + normalizeSshPort(item.port, 22));
+  parent?.pause();
+  try {
+    return await transferCapacity.run(keys, abort.signal, async () => {
+      parent?.resume();
+      try { return await work(); }
+      finally { if (parent?.operationId) await waitLocalTransferResources(parent.operationId); }
+    });
+  } finally { parent?.resume(); cancelSubscription?.dispose?.(); tokenSubscription?.dispose?.(); }
 }
 
 module.exports = {
@@ -5763,9 +6106,15 @@ module.exports = {
     directTarBatchCommand,
     tarPackingCommand,
     tarUnpackingCommand,
+    stagedTarUnpackingCommand,
     transferCompression,
+    negotiateTransferCompression,
+    selectTransferCompression,
+    setCompressionProbeTransport,
+    compressionHistory,
     partitionTransferPaths,
     transferPartitionedTar,
+    transferChunkedServerFile,
     syncServerToServerFpsyncCore,
     setRemoteBatchTransport,
     batchFileHashScript,

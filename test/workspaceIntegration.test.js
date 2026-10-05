@@ -74,7 +74,7 @@ test("all transfer entry points confirm expected host and remote paths before si
     ["syncFromRemoteCore", "confirmTransferPath", "downloadRemoteToLocal"],
     ["markHandoffReadyCore", "confirmTransferPath", "writeRemoteHandoffMarker"],
     ["uploadWorkspaceCore", "confirmTransferPath", "readRemoteCodeManifest"],
-    ["uploadFilesCore", "confirmTransferPath", "fs.mkdtempSync"],
+    ["uploadFilesCore", "confirmTransferPath", "runUploadWithProgress"],
     ["uploadChangedLocalFilesCore", "confirmTransferPath", "findChangedLocalFiles"],
   ];
   for (const [name, gate, effect] of ordered) {

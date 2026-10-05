@@ -39,12 +39,39 @@ exports.resourceTargetsConflict = resourceTargetsConflict;
 const fs = __importStar(require("fs/promises"));
 const path = __importStar(require("path"));
 const crypto = __importStar(require("crypto"));
+const os = __importStar(require("os"));
+const fs_1 = require("fs");
 const async_hooks_1 = require("async_hooks");
+const StateStore_1 = require("./state-store");
 const poolKey = Symbol.for("simple-local.resource-leases.v2");
 const contextKey = Symbol.for("simple-local.resource-lease-context.v2");
 const globals = globalThis;
 const contexts = globals[contextKey] ||= new async_hooks_1.AsyncLocalStorage();
 const pools = globals[poolKey] ||= new Map();
+const LEASE_POLL_BASE_MS = 20;
+const LEASE_POLL_MAX_MS = 250;
+function waitForLeaseRetry(attempt, signal) {
+    if (signal?.aborted)
+        return Promise.reject(signal.reason || Object.assign(new Error("Operation aborted."), { name: "AbortError" }));
+    const backoff = Math.min(LEASE_POLL_MAX_MS, LEASE_POLL_BASE_MS * (2 ** Math.min(4, Math.max(0, attempt))));
+    const delay = backoff + Math.floor(Math.random() * Math.min(40, backoff / 4));
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (error) => {
+            if (settled)
+                return;
+            settled = true;
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", onAbort);
+            error ? reject(error) : resolve();
+        };
+        const onAbort = () => finish(signal?.reason || Object.assign(new Error("Operation aborted."), { name: "AbortError" }));
+        const timer = setTimeout(() => finish(), delay);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (signal?.aborted)
+            onAbort();
+    });
+}
 function normalizedPath(value) {
     if (!value || value.split(/[\\/]/).includes(".."))
         throw new Error("资源锁目标必须是明确路径，不能包含 ..。");
@@ -116,10 +143,12 @@ class ResourceOperationLeaseManager {
         this.processId = options.processId ?? process.pid;
         this.now = options.now || Date.now;
         this.directory = this.leasePath + ".resources-v2";
-        this.file = path.join(this.directory, crypto.createHash("sha256").update(this.windowId).digest("hex") + ".json");
+        const processOwner = `${os.hostname()}:${this.processId}`;
+        const stableOwner = this.windowId.startsWith(processOwner + ":") ? processOwner : this.windowId;
+        this.file = path.join(this.directory, crypto.createHash("sha256").update(stableOwner).digest("hex") + ".json");
         const key = this.file.toLowerCase();
         if (!pools.has(key))
-            pools.set(key, { queue: Promise.resolve(), registry: { schemaVersion: 2, windowId: this.windowId, ticket: 0, choosing: false, admissionExpiresAt: 0, leases: [] } });
+            pools.set(key, { queue: Promise.resolve(), registry: { schemaVersion: 2, windowId: this.windowId, processId: this.processId, ticket: 0, choosing: false, admissionExpiresAt: 0, leases: [] } });
         this.state = pools.get(key);
     }
     exclusive(operation) {
@@ -128,34 +157,99 @@ class ResourceOperationLeaseManager {
         return work;
     }
     async write() {
+        await this.reuseIdleRegistry();
+        const text = JSON.stringify(this.state.registry);
+        if (Buffer.byteLength(text, "utf8") > 8 * 1024 * 1024)
+            throw new Error("资源锁快照超过有界大小。");
+        // A second fixed slot preserves ownership if the main registry is damaged.
+        // Declaration precedes commit; business work begins only after the main commit succeeds.
+        await (0, StateStore_1.atomicWriteText)(this.file + ".ownership", text);
+        await (0, StateStore_1.atomicWriteText)(this.file, text);
+    }
+    async reuseIdleRegistry() {
+        try {
+            await fs.lstat(this.file);
+            return;
+        }
+        catch (error) {
+            if (error.code !== "ENOENT")
+                throw error;
+        }
         await fs.mkdir(this.directory, { recursive: true });
-        const temporary = this.file + ".writing-" + crypto.randomUUID();
-        await fs.writeFile(temporary, JSON.stringify(this.state.registry), "utf8");
-        // Windows readers or antivirus may briefly deny replacement. Keep the prior
-        // atomic record intact and retry only sharing violations, never publish a
-        // partially written JSON file or leave a choosing ticket stranded.
-        const started = Date.now();
-        for (;;) {
+        const names = (await fs.readdir(this.directory)).filter(name => /^[a-f0-9]{64}[.]json$/.test(name)).sort();
+        for (const name of names.slice(0, 512)) {
+            const source = path.join(this.directory, name);
             try {
-                await fs.rename(temporary, this.file);
-                break;
+                const row = await this.readRegistry(source);
+                const oldPid = row.processId ?? Number(row.windowId.split(":")[1]);
+                // Released registries only. Unknown or live owners and recovery records stay protected.
+                if (!Number.isInteger(oldPid) || oldPid <= 0 || oldPid === this.processId || row.leases.length || row.choosing || row.ticket ||
+                    row.admissionExpiresAt > this.now() || this.ownerAlive({ processId: oldPid }))
+                    continue;
+                // Atomic rename claims one idle slot: two new owners cannot both consume the source.
+                await fs.rename(source, this.file);
+                for (const suffix of [".ownership", ".writing", ".ownership.writing"]) {
+                    try {
+                        const side = await this.readRegistry(source + suffix);
+                        if (side.windowId === row.windowId && !side.leases.length && !side.choosing && !side.ticket)
+                            await fs.rename(source + suffix, this.file + suffix);
+                    }
+                    catch { /* Unknown sidecar is retained; new ownership is written to our fixed slots. */ }
+                }
+                return;
             }
-            catch (error) {
-                if (!["EPERM", "EACCES", "EBUSY"].includes(error.code) || Date.now() - started >= 30_000)
-                    throw error;
-                await new Promise(resolve => setTimeout(resolve, 10));
+            catch { /* Contested, damaged or unknown records are never reclaimed. */ }
+        }
+    }
+    async readRegistry(file) {
+        const handle = await fs.open(file, fs_1.constants.O_RDONLY | (fs_1.constants.O_NOFOLLOW || 0));
+        try {
+            const before = await handle.stat();
+            const current = await fs.lstat(file);
+            if (current.isSymbolicLink() || current.dev !== before.dev || current.ino !== before.ino)
+                throw new Error("资源锁路径身份无效。");
+            if (!before.isFile() || before.nlink > 1 || before.size > 8 * 1024 * 1024)
+                throw new Error("资源锁文件身份或大小无效。");
+            const bytes = Buffer.alloc(before.size);
+            let offset = 0;
+            while (offset < bytes.length) {
+                const result = await handle.read(bytes, offset, bytes.length - offset, offset);
+                if (!result.bytesRead)
+                    throw new Error("资源锁读取未前进。");
+                offset += result.bytesRead;
             }
+            const after = await handle.stat();
+            if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs)
+                throw new Error("资源锁读取期间发生变化。");
+            const row = JSON.parse(bytes.toString("utf8"));
+            if (row.schemaVersion !== 2 || !Array.isArray(row.leases) || !row.windowId || row.leases.some((lease) => !Array.isArray(lease.resources) || !lease.resources.length))
+                throw new Error("资源锁记录损坏。");
+            return row;
+        }
+        finally {
+            await handle.close();
         }
     }
     async rows() {
         await fs.mkdir(this.directory, { recursive: true });
         const names = (await fs.readdir(this.directory)).filter(name => /^[a-f0-9]{64}[.]json$/.test(name));
-        return Promise.all(names.map(async (name) => {
-            const row = JSON.parse(await fs.readFile(path.join(this.directory, name), "utf8"));
-            if (row.schemaVersion !== 2 || !Array.isArray(row.leases) || !row.windowId)
-                throw new Error("资源锁记录损坏，请重新加载持有窗口后重试。");
-            return row;
+        const rows = await Promise.all(names.map(async (name) => {
+            const file = path.join(this.directory, name);
+            try {
+                return await this.readRegistry(file);
+            }
+            catch (error) {
+                try {
+                    return await this.readRegistry(file + ".ownership");
+                }
+                catch (fallback) {
+                    if (error.code === "ENOENT" && fallback.code === "ENOENT")
+                        return undefined; // Atomically consumed idle slot.
+                    throw Object.assign(new Error("资源锁归属无法核实，记录已保留；请检查持有窗口，不能忽略未知活动锁。"), { code: "RESOURCE_LEASE_OWNER_UNKNOWN" });
+                }
+            }
         }));
+        return rows.filter((row) => row !== undefined);
     }
     async legacyGuard() {
         try {
@@ -190,7 +284,7 @@ class ResourceOperationLeaseManager {
                 own.choosing = false;
                 await this.write();
                 const started = Date.now();
-                let renewed = started;
+                let renewed = started, pollAttempt = 0;
                 for (;;) {
                     signal?.throwIfAborted();
                     const current = await this.rows();
@@ -210,7 +304,7 @@ class ResourceOperationLeaseManager {
                         await this.write();
                         renewed = Date.now();
                     }
-                    await new Promise(resolve => setTimeout(resolve, 10));
+                    await waitForLeaseRetry(pollAttempt++, signal);
                 }
             }
             finally {
@@ -249,6 +343,7 @@ class ResourceOperationLeaseManager {
         const record = { ...input, schemaVersion: 1, leaseId: crypto.randomUUID(), windowId: this.windowId, processId: this.processId, resourceFile: this.file,
             resources: targets, actionLabel: input.actionLabel || input.actionType, createdAt: new Date(time).toISOString(), heartbeatAt: new Date(time).toISOString(), expiresAt: new Date(time + this.ttlMs).toISOString() };
         const waitStarted = Date.now();
+        let conflictAttempt = 0;
         for (;;) {
             try {
                 await this.admission(async (rows) => {
@@ -272,7 +367,7 @@ class ResourceOperationLeaseManager {
                 if (!input.waitForConflict || error.code !== "RESOURCE_CONFLICT" || Date.now() - waitStarted >= 30_000)
                     throw error;
                 input.signal?.throwIfAborted();
-                await new Promise(resolve => setTimeout(resolve, 10));
+                await waitForLeaseRetry(conflictAttempt++, input.signal);
             }
         }
         let released = false, lost;

@@ -96,7 +96,7 @@ test("first packed group reports before the batch finishes and completion waits 
   assert.equal(reports[doneAt].increment > 0, true);
 });
 
-test("transfer keeps at most four live groups for 33 and 355 files", async () => {
+test("transfer keeps at most two live groups for 33 and 355 files", async () => {
   for (const count of [1, 33, 355]) {
     let live = 0;
     let maxLive = 0;
@@ -110,9 +110,9 @@ test("transfer keeps at most four live groups for 33 and 355 files", async () =>
     });
     const paths = Array.from({ length: count }, (_, index) => `runs/${index}.log`);
     const partitions = await __test.transferPartitionedTar(endpoint("source-a"), endpoint("target-b"), paths, 1000, (event) => events.push(event));
-    const expected = count <= 80 ? 1 : 4;
+    const expected = count <= 80 ? 1 : 2;
     assert.equal(partitions, expected);
-    assert.ok(maxLive >= 1 && maxLive <= 4);
+    assert.ok(maxLive >= 1 && maxLive <= 2);
     assert.equal(events[0].phase, "start");
     assert.equal(events.filter((event) => event.phase === "start").length, expected);
     assert.equal(events.some((event) => !event.groupFiles), false);
@@ -252,17 +252,17 @@ function probeHash(mode, script, args, stdin = "", cacheDir) {
 test("stable files hash without a per-file sleep and a changing file stays bounded", () => {
   const root = path.resolve(__dirname, "..");
   const names = ["package.json", "readme.md"];
-  const expected = Object.fromEntries(names.map((name) => [name, sha256(fs.readFileSync(path.join(root, name)))]));
+  const expected = Object.fromEntries(names.map((name) => [name, { sha256: sha256(fs.readFileSync(path.join(root, name))), size: fs.statSync(path.join(root, name)).size }]));
   const stable = probeHash("stable", __test.batchFileHashScript(), [root, "2", "0.01"], `${names.join("\n")}\n`);
   assert.deepEqual(JSON.parse(stable.stdout).files, expected);
   assert.match(stable.stderr, /sleeps=0/);
   const raced = probeHash("race-read", __test.batchFileHashScript(), [root, "2", "0.01"], "package.json\n");
-  assert.equal(JSON.parse(raced.stdout).files["package.json"], expected["package.json"]);
+  assert.deepEqual(JSON.parse(raced.stdout).files["package.json"], expected["package.json"]);
   assert.match(raced.stderr, /sleeps=[1-9]/);
   const changing = probeHash("changing-stat", __test.batchFileHashScript(), [root, "0.05", "0.01"], "package.json\n");
   assert.match(changing.stdout, /rejected ValueError: file changed during batch sync: package\.json/);
   assert.match(changing.stderr, /sleeps=[1-9]/);
   const scope = probeHash("stable", __test.scopeInventoryScript(), [root, "package.json", "0", "0", "2", "0.01"]);
-  assert.equal(JSON.parse(scope.stdout).files["package.json"].sha256, expected["package.json"]);
+  assert.equal(JSON.parse(scope.stdout).files["package.json"].sha256, expected["package.json"].sha256);
   assert.match(scope.stderr, /sleeps=0/);
 });

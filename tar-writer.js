@@ -12,8 +12,9 @@ async function writeTarEntriesToStream({ localPath, files, stream, onFileBytes }
 
   const seenDirectories = new Set(["."]);
   for (const file of files) {
-    const relativePath = toTarPath(file.relativePath);
-    if (!relativePath || relativePath === "." || relativePath.startsWith("../")) {
+    const rawPath = String(file.relativePath || "").replace(/\\/g, "/");
+    const relativePath = toTarPath(rawPath);
+    if (!relativePath || /[:\0\r\n]/.test(rawPath) || rawPath.startsWith("/") || rawPath.split("/").some(part => !part || part === "." || part === "..")) {
       throw new Error(`上传清单包含不安全路径：${file.relativePath}`);
     }
     for (const directory of ancestorPaths(relativePath)) {
@@ -21,20 +22,22 @@ async function writeTarEntriesToStream({ localPath, files, stream, onFileBytes }
       seenDirectories.add(directory);
       await writeLocalDirectoryEntry(stream, localPath, directory);
     }
-    await writeLocalFileEntry(stream, localPath, relativePath, file.fullPath || path.join(localPath, relativePath), onFileBytes);
+    if (Buffer.isBuffer(file.content)) {
+      if (file.content.length > 2 * 1024 * 1024) throw new Error("上传生成数据超过 2MiB 上限");
+      await write(stream, tarHeader({ path: relativePath, size: file.content.length }));
+      await write(stream, file.content);
+      if (onFileBytes) onFileBytes(file.content.length);
+      await write(stream, padBlock(file.content.length));
+    } else await writeLocalFileEntry(stream, localPath, relativePath, file.fullPath || path.join(localPath, relativePath), onFileBytes);
   }
   await write(stream, Buffer.alloc(BLOCK_SIZE * 2));
 }
 
 async function writeLocalDirectoryEntry(stream, localPath, relativePath) {
-  const fullPath = path.join(localPath, relativePath.replace(/\//g, path.sep));
-  const stat = await fs.promises.stat(fullPath);
-  if (!stat.isDirectory()) throw new Error(`上传父路径不是目录：${relativePath}`);
   const header = tarHeader({
     path: relativePath,
     typeflag: "5",
     mode: 0o755,
-    mtime: stat.mtimeMs / 1000,
   });
   await write(stream, header);
 }
@@ -52,15 +55,22 @@ async function writeLocalFileEntry(stream, localPath, relativePath, fullPath, on
   });
   await write(stream, header);
 
-  const input = fs.createReadStream(fullPath, { highWaterMark: 128 * 1024 });
+  const handle = await fs.promises.open(fullPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  const identity = info => [info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs].join(":");
+  let input;
+  let bytes = 0;
   try {
-    for await (const chunk of input) {
+    if (identity(await handle.stat()) !== identity(stat)) throw new Error("上传源身份发生变化");
+    input = handle.createReadStream({ highWaterMark: 128 * 1024, autoClose: false, end: Math.max(0, stat.size - 1) });
+    if (stat.size > 0) for await (const chunk of input) {
+      bytes += chunk.length;
       await write(stream, chunk);
       if (onFileBytes) onFileBytes(chunk.length);
     }
-  } catch (error) {
-    input.destroy();
-    throw error;
+    if (bytes !== stat.size || identity(await handle.stat()) !== identity(stat) || identity(await fs.promises.lstat(fullPath)) !== identity(stat)) throw new Error("上传源在读取期间发生变化");
+  } finally {
+    input?.destroy();
+    await handle.close();
   }
   const padding = (BLOCK_SIZE - (stat.size % BLOCK_SIZE)) % BLOCK_SIZE;
   if (padding) await write(stream, Buffer.alloc(padding));
@@ -192,12 +202,15 @@ async function write(stream, chunk) {
         cleanup();
         reject(error);
       };
+      const onClose = () => onError(new Error("tar 输出流已关闭"));
       const cleanup = () => {
         stream.off("drain", onDrain);
         stream.off("error", onError);
+        stream.off("close", onClose);
       };
       stream.once("drain", onDrain);
       stream.once("error", onError);
+      stream.once("close", onClose);
     });
   }
 }

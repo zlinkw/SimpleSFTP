@@ -2,7 +2,7 @@
 
 SimpleSFTP 是一个 Windows VS Code 扩展，用于在本地项目和远端 Linux 项目目录之间同步代码、轻量结果和 Agent runtime。本地与远端之间使用系统 `ssh` 和 `tar` 流传输，Worker 之间支持分区并行的 tar 流同步，也不会保存云凭据。
 
-`sync.serverToServerFpsync` 按 fpsync 的分区并行思路处理 Worker 间同步：先对指定文件计算两端 SHA256。稳定文件先取 size/mtime，立刻读内容并在读完后核对；只有发现变化才等待，首次 0.25 秒，之后加倍且不超过 1 秒，总时限 15 秒。到时仍不稳定则返回可重试错误，不报成功。不超过 80 个变化文件走一条无压缩 tar 流；更多文件按最多四路均分，例如 355 个文件为四路同时传输。任一路失败后不再启动新组，并等已启动的组结束，随后不进入目标校验、不报完成。通知在每组开始时标明正在传输，已完成的组按文件数推进进度条，校验阶段到 95，SHA256 通过后到 100。`sync.serverToServerBatch` 与 `sync.serverToServer` 的非删除传输也复用此路径。此模式使用内置 tar 传输，无需在 Worker 安装 fpsync，也不落盘中间包。目录中若有目标端独有的旧文件，会停止并要求单独进行双重确认清理。
+`sync.serverToServerFpsync` 按指定路径比较两端 SHA256，仅传变化文件。稳定文件先取 size/mtime，读完后核对身份；发现变化才退避等待，首次 0.25 秒、最多 1 秒，总时限 15 秒。普通批次同时限制为 80 文件、128 MiB 和命令元数据大小，最多两路流；全局最多两个传输，每个 Worker 最多一个，不同 Worker 可以独立推进。任一路失败后停止启动新组，等待已启动的资源结算，不报整批完成。`sync.serverToServerBatch` 与 `sync.serverToServer` 的非删除路径复用该实现。无需安装 fpsync，不落盘中间压缩包；目标端独有旧文件只提供精确清理预览，删除仍需单独两次确认。
 
 SimpleSFTP 与 [SimpleExperiment](https://github.com/zlinkw/SimpleExperiment) 配套使用。SimpleExperiment 负责服务器状态和实验调度；SimpleSFTP 只负责真实文件传输。
 
@@ -24,7 +24,7 @@ SimpleSFTP 与 [SimpleExperiment](https://github.com/zlinkw/SimpleExperiment) �
 3. 执行 **Developer: Reload Window**。
 
 ```powershell
-code --install-extension .\simple-sftp-<version>.vsix --force
+npm run install:latest
 ```
 
 ## 快速开始
@@ -158,9 +158,11 @@ simple-sftp-api upload.workspace --json upload.json
 
 公开方法以 `/api/v1/capabilities` 的实时返回为准。
 
-`sync.serverToServerFpsync` 支持跨 Plan 的精确文件数组。`compression` 默认为 `auto`，采用 gzip 压缩流；来源可用 pigz 时使用两个线程，否则使用 gzip。`none` 可显式关闭压缩。`singleStream: true` 将同一来源和目标的一批文件放入一个压缩流，不按 Plan 分包；单次上限仍为 5000 个安全相对路径。直接 Worker 传输和本机中继都保持压缩，传输后仍逐文件校验 SHA256，不删除旧文件。
+`sync.serverToServerFpsync` 支持跨 Plan 的精确文件数组，最多 5000 个安全相对路径。`compression: "auto"` 在源端只读采样最多 8 个文件的分散内容窗口、累计最多 256 KiB，SSH 采样最多 5 秒；比较实测样本压缩字节、CPU/耗时及近期链路吞吐，低收益或 CPU 成本过高时选择 `none`。gzip 总是兼容；zstd 只有两端均检测成功才参与选择，未安装时无需新增依赖。`singleStream: true` 不按 Plan 分包，但仍遵守字节与元数据边界。采样失败安全回退 gzip。吞吐摘要只在内存保留最近 64 个端点组合、15 分钟有效；尚无实测吞吐时使用明确标注的估计，估计耗时不等于实际提速。直接传输和本机中继都遵循同一策略，传后逐文件核对 SHA256。
 
-`sync.downloadMappedPaths` 一次接收多条源到目标映射。请求需要明确的 `server`、本机安全根 `localPath`，以及 `entries`：每项含远端项目相对路径 `remotePath` 和本机项目相对路径 `localRelativePath`。远端只生成一个 tar 流，SSH 接收一次，解包时按映射写到各自最终路径。`compression: "auto"` 或 `"gzip"` 启用 gzip，完整解压校验与 SSH 成功后才发布文件；省略或 `"none"` 保持旧版无压缩兼容。SimpleExperiment 结果批量下载请求压缩。它不扫描整个项目，也不对每个文件单独发起 SSH。`confirm: true` 和 `pathConfirmed: true` 都是必需的；预览里包含每条映射。`overwrite: true` 才覆盖已有普通文件。`maxFileBytes` 默认 128 MiB。`metricsOnly: true` 只接受 csv/json/md/txt/log，并拒绝权重和检查点。绝对路径、`..`、符号链接、越出项目根、重复目标、把目录当文件，都会在传输前拒绝。失败或取消不会报整批成功，也不会删除已有目标。`sync.downloadPaths` 仍然要求远端相对路径与本机相对路径相同。
+超过 128 MiB 的单文件独立传输，以 8 MiB SHA256 块连续流式接收，上限 64 GiB。重试先验证固定暂存槽中的已完成块，再从缺失位置继续；完整文件 hash 验证后才发布。普通 tar 批次也必须完整接收并验证所有文件后才替换最终路径。远端最多 32 个固定 `.simple-sftp-stage-*` 槽及锁文件；成功 `replace` 消耗数据暂存，保留小型归属/恢复记录并复用闲置槽。损坏、未知所有者和未结算槽不会自动删除或占用。失败/取消不把半成品发布为当前结果，无法证明远端结算时禁止并发重发。
+
+`sync.downloadMappedPaths` 一次接收多条源到目标映射。请求需要明确的 `server`、本机安全根 `localPath`，以及 `entries`：每项含远端项目相对路径 `remotePath` 和本机项目相对路径 `localRelativePath`。同一来源可跨 Plan 合并 tar 流，接收校验成功后按映射发布。`compression: "auto"` 在 gzip/none 中按样本选择，`"gzip"` 强制 gzip；省略或 `"none"` 保持无压缩兼容。它不扫描整个项目，也不对每个文件单独发起 SSH。`confirm: true` 和 `pathConfirmed: true` 都是必需的；预览里包含每条映射。`overwrite: true` 才覆盖已有普通文件。`maxFileBytes` 默认 128 MiB。`metricsOnly: true` 只接受 csv/json/md/txt/log，并拒绝权重和检查点。绝对路径、`..`、符号链接、越出项目根、重复目标、把目录当文件，都会在传输前拒绝。失败或取消不报整批成功，不删除已有目标。`sync.downloadPaths` 仍然要求远端相对路径与本机相对路径相同。
 
 指定文件上传时，`remotePath` 是实际目标目录。若同时传入 `server.remotePath`，两者必须一致；不一致时插件会拒绝上传。`target.show`、API 确认预览和实际传输使用同一目标解析逻辑。用服务器名称指定目标时，该名称必须匹配已保存的服务器配置；未知名称不会回退到当前活动服务器。上传前请核对预览中的主机、端口与远端目录。
 
