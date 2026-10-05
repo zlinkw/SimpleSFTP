@@ -59,7 +59,9 @@ function settlementProbeCommand(root, quote) {
   const source = fs.readFileSync(path.join(__dirname, "transfer-settlement-probe.py"), "utf8");
   const encoded = zlib.deflateSync(Buffer.from(source, "utf8")).toString("base64");
   const loader = "import base64,zlib,sys; code=zlib.decompress(base64.b64decode(sys.argv[1])); sys.argv=sys.argv[1:]; exec(compile(code,'simple_sftp_settlement_probe','exec'))";
-  return `python3 -B -c ${quote(loader)} ${quote(encoded)} ${quote(root)}`;
+  const receiverHash = require("node:crypto").createHash("sha256")
+    .update(fs.readFileSync(path.join(__dirname, "staged-tar-receive.py"))).digest("hex");
+  return `python3 -B -c ${quote(loader)} ${quote(encoded)} ${quote(root)} ${quote(receiverHash)}`;
 }
 
 module.exports = { clientRequestKey, retryIdentity, assertLocalProcessesIdle, localTransferExitProof, settlementProbeCommand };

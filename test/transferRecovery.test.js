@@ -33,6 +33,8 @@ function fixture(options = {}) {
     order.push(target.host); assert.equal(transport.remoteMutation, false); assert.deepEqual(paths, []);
     assert.match(command, /simple_sftp_settlement_probe/);
     if (options.remoteBusy && target.host === "dest-host") return JSON.stringify({ idle: false, reason: "REMOTE_TRANSFER_SLOT_BUSY" });
+    if (options.processBlocker && target.host === "dest-host") return JSON.stringify({ idle: false, reason: "REMOTE_TRANSFER_STILL_ACTIVE",
+      blocker: options.processBlocker });
     if (options.malformedProof) return JSON.stringify({ idle: true, root: target.remotePath });
     return JSON.stringify({ idle: true, root: target.remotePath, inspectedProcesses: 3, inspectedLocks: 1 });
   });
@@ -75,6 +77,25 @@ test("changed host, original instance, or unsupported method cannot unlock legac
   assert.equal((await f.reconcile({ retryParams: { ...params, destination: { ...params.destination, host: "other-host" } } })).status, "identityMismatch");
   assert.equal((await f.reconcile({ retryMethod: "sync.deletePath" })).settled, false);
   assert.deepEqual(f.order, []);
+});
+
+test("a real active remote process reports bounded endpoint identity without unlocking or exposing argv", async () => {
+  const f = fixture({ processBlocker: { pid: 345, name: "python3", state: "S", scope: "target-root", command: "password=secret" } });
+  const receipt = await f.reconcile();
+  assert.equal(receipt.settled, false);
+  assert.deepEqual(receipt.blocker, { role: "destination", pid: 345, name: "python3", state: "S", scope: "target-root" });
+  assert.match(receipt.reason, /destination:dest-host pid=345 python3 state=S scope=target-root/);
+  assert.doesNotMatch(JSON.stringify(receipt), /password|secret/);
+  await assert.rejects(__test.beginTransferOperation("new-op", "456:new", true, key), /未确认的旧请求/);
+  assert.equal((await __test.listTransferOperationState()).settledOperations.length, 0);
+});
+
+test("untrusted blocker fields cannot enter diagnostics and never count as exit evidence", async () => {
+  const f = fixture({ processBlocker: { pid: "bad", name: "secret", state: "Z", scope: "anything" } });
+  const receipt = await f.reconcile();
+  assert.equal(receipt.settled, false); assert.equal(receipt.blocker, undefined);
+  assert.match(receipt.reason, /REMOTE_TRANSFER_STILL_ACTIVE destination:dest-host/);
+  assert.doesNotMatch(receipt.reason, /secret/);
 });
 
 test("live same-instance request with no child count is not proof of exit", async () => {

@@ -3597,8 +3597,9 @@ async function reconcileTransferOperation(params = {}) {
 async function reconcileTransferOperationCore(params) {
   await transferLedgerWrite.catch(() => undefined);
   const operationId = String(params.operationId || ""), row = transferOperationLedger.get(operationId);
+  let blocker;
   const receipt = (status, reason) => ({ ok: true, operationId, operationInstanceId: row?.operationInstanceId || "",
-    instanceId: currentTransferApiInstanceId(), status, settled: status === "settled", reason });
+    instanceId: currentTransferApiInstanceId(), status, settled: status === "settled", reason, ...(blocker ? { blocker } : {}) });
   if (!row) return receipt("notFound", "缺少原始传输身份");
   if (!params.operationInstanceId || params.operationInstanceId !== row.operationInstanceId) return receipt("identityMismatch", "旧传输实例不匹配");
   if (row.status === "settled" && row.persisted) return receipt("settled");
@@ -3637,6 +3638,17 @@ async function reconcileTransferOperationCore(params) {
         { remoteMutation: false, stage: "旧传输退出核实" });
       if (String(text).length > 4096) throw new Error("INVALID_REMOTE_EXIT_PROOF");
       const proof = JSON.parse(text);
+      if (proof.idle === false && proof.reason === "REMOTE_TRANSFER_STILL_ACTIVE") {
+        const detail = proof.blocker;
+        const role = target === source ? "source" : "destination";
+        if (Number.isSafeInteger(detail?.pid) && detail.pid > 0 && detail.pid <= 2147483647
+            && typeof detail.name === "string" && /^[A-Za-z0-9_.-]{1,32}$/.test(detail.name)
+            && typeof detail.state === "string" && /^[RSDTtKWPI]$/.test(detail.state)
+            && ["target-root", "unscoped"].includes(detail.scope))
+          blocker = { role, pid: detail.pid, name: detail.name, state: detail.state, scope: detail.scope };
+        const description = blocker ? ` pid=${blocker.pid} ${blocker.name} state=${blocker.state} scope=${blocker.scope}` : "";
+        throw new Error(`REMOTE_TRANSFER_STILL_ACTIVE ${role}:${target.host}${description}`);
+      }
       if (proof.idle !== true || proof.root !== target.remotePath || !Number.isSafeInteger(proof.inspectedProcesses)
           || proof.inspectedProcesses < 0 || proof.inspectedProcesses > 8192 || !Number.isSafeInteger(proof.inspectedLocks)
           || proof.inspectedLocks < 0 || proof.inspectedLocks > 32) throw new Error(proof.reason || "INVALID_REMOTE_EXIT_PROOF");
