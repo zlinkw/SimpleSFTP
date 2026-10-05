@@ -14,6 +14,9 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
+const { clientRequestKey, retryIdentity, localTransferExitProof, settlementProbeCommand } = require("./transfer-settlement");
+let transferRecoveryTestHooks = null;
+const transferRecoveries = new Map();
 const { execFile, spawn } = require("child_process");
 const { resolveWorkspaceLocation } = require("./workspace-path.js");
 const { toTarPath: tarEntryPath, writeTarEntriesToStream } = require("./tar-writer.js");
@@ -3418,6 +3421,8 @@ function loadTransferOperationLedger() {
       reason: String(row.reason || ""),
       remoteMutation: row.remoteMutation === true,
       requestKey: String(row.requestKey || ""),
+      recoveryContext: row.recoveryContext,
+      recovery: row.recovery,
       requestDone: false,
       outcomeUnknown: row.status !== "settled",
       persisted: row.status === "settled",
@@ -3431,11 +3436,11 @@ function loadTransferOperationLedger() {
 function pruneTransferOperationLedger() {
   const now = Date.now();
   for (const [id, row] of transferOperationLedger) {
-    if (row.status === "settled" && now - Date.parse(row.settledAt || "") >= SETTLED_TRANSFER_TTL_MS)
+    if (row.status === "settled" && row.persisted && now - Date.parse(row.settledAt || "") >= SETTLED_TRANSFER_TTL_MS)
       transferOperationLedger.delete(id);
   }
   while (transferOperationLedger.size >= MAX_TRANSFER_OPERATIONS) {
-    const settledId = [...transferOperationLedger].find(([, row]) => row.status === "settled")?.[0];
+    const settledId = [...transferOperationLedger].find(([, row]) => row.status === "settled" && row.persisted)?.[0];
     if (!settledId) throw new Error("SimpleSFTP 有过多尚未确认退出的传输，未启动新传输。");
     transferOperationLedger.delete(settledId);
   }
@@ -3464,7 +3469,7 @@ function transferRequestKey(method, params) {
   return crypto.createHash("sha256").update(JSON.stringify(identity)).digest("hex");
 }
 
-async function beginTransferOperation(operationId, requestedInstanceId, remoteMutation, requestKey) {
+async function beginTransferOperation(operationId, requestedInstanceId, remoteMutation, requestKey, recoveryContext) {
   if (extensionDeactivating) throw new Error("SimpleSFTP 正在停用，未启动新传输。");
   loadTransferOperationLedger();
   pruneTransferOperationLedger();
@@ -3475,16 +3480,23 @@ async function beginTransferOperation(operationId, requestedInstanceId, remoteMu
     throw new Error("SimpleSFTP 实例已变化，未启动旧身份传输。");
   if (transferOperationLedger.has(id)) throw new Error("SimpleSFTP 请求身份已使用，未重复启动传输。");
   const targetKey = /^[a-f0-9]{64}$/i.test(String(requestKey || "")) ? String(requestKey).toLowerCase() : transferRequestKey("unknown", {});
-  const blocker = [...transferOperationLedger.values()].find((row) => row.status !== "settled" && row.requestKey === targetKey);
+  const blocker = [...transferOperationLedger.values()].find((row) => (row.status !== "settled" || !row.persisted) && row.requestKey === targetKey);
   if (blocker) {
     const error = new Error("相同传输目标仍有未确认的旧请求，未启动并发传输。");
-    error.apiData = { blockedOperationId: blocker.operationId, operationInstanceId: blocker.operationInstanceId };
+    error.apiData = { blockedOperationId: blocker.operationId, operationInstanceId: blocker.operationInstanceId, notStarted: true };
     throw error;
   }
-  const row = { operationId: id, operationInstanceId: instanceId, requestKey: targetKey, status: "running", startedAt: new Date().toISOString(), settledAt: "", cancelRequestedAt: "", reason: "", remoteMutation: remoteMutation === true, requestDone: false, outcomeUnknown: false, persisted: false, settling: false };
+  const row = { operationId: id, operationInstanceId: instanceId, requestKey: targetKey, recoveryContext, status: "running", startedAt: new Date().toISOString(), settledAt: "", cancelRequestedAt: "", reason: "", remoteMutation: remoteMutation === true, requestDone: false, outcomeUnknown: false, persisted: false, settling: false };
   transferOperationLedger.set(id, row);
   try { await persistTransferOperationLedger(); row.persisted = true; }
-  catch (error) { row.status = "outcomeUnknown"; row.outcomeUnknown = true; row.reason = "could not persist transfer start receipt"; throw error; }
+  catch (error) {
+    // The business method has not been dispatched. Retain the failed receipt,
+    // but do not misclassify this as an unfinished local request forever.
+    row.status = "outcomeUnknown"; row.outcomeUnknown = true; row.requestDone = true;
+    row.reason = "could not persist transfer start receipt";
+    if (error && typeof error === "object") error.apiData = { notStarted: true };
+    throw error;
+  }
 }
 
 function transferOperationResourceCount(operationId) {
@@ -3561,6 +3573,7 @@ async function listTransferOperationState() {
   const rows = [...transferOperationLedger.values()].slice(-MAX_TRANSFER_OPERATIONS).map((row) => ({
     operationId: row.operationId, operationInstanceId: row.operationInstanceId, status: row.status,
     startedAt: row.startedAt, settledAt: row.settledAt || undefined, reason: row.reason || undefined,
+    recovery: row.recovery,
     childCount: transferOperationResourceCount(row.operationId),
   }));
   return {
@@ -3568,6 +3581,87 @@ async function listTransferOperationState() {
     operations: [...activeUploadOperations.values(), ...rows.filter((row) => row.status !== "settled").map((row) => ({ id: row.operationId, ...row }))],
     settledOperations: rows.filter((row) => row.status === "settled" && row.settledAt && transferOperationLedger.get(row.operationId)?.persisted),
   };
+}
+
+async function reconcileTransferOperation(params = {}) {
+  loadTransferOperationLedger();
+  const operationId = String(params.operationId || "");
+  const existing = transferRecoveries.get(operationId);
+  if (existing) return existing;
+  if (transferRecoveries.size >= 8) throw new Error("TRANSFER_RECONCILIATION_BUSY");
+  const work = reconcileTransferOperationCore(params);
+  transferRecoveries.set(operationId, work);
+  try { return await work; } finally { if (transferRecoveries.get(operationId) === work) transferRecoveries.delete(operationId); }
+}
+
+async function reconcileTransferOperationCore(params) {
+  await transferLedgerWrite.catch(() => undefined);
+  const operationId = String(params.operationId || ""), row = transferOperationLedger.get(operationId);
+  const receipt = (status, reason) => ({ ok: true, operationId, operationInstanceId: row?.operationInstanceId || "",
+    instanceId: currentTransferApiInstanceId(), status, settled: status === "settled", reason });
+  if (!row) return receipt("notFound", "缺少原始传输身份");
+  if (!params.operationInstanceId || params.operationInstanceId !== row.operationInstanceId) return receipt("identityMismatch", "旧传输实例不匹配");
+  if (row.status === "settled" && row.persisted) return receipt("settled");
+  const hasLocalWork = () => transferOperationResourceCount(operationId) > 0 || activeUploadOperations.has(operationId)
+    || [...activeTransfers.values()].some(transfer => transfer.operationId === operationId)
+    || (row.operationInstanceId === currentTransferApiInstanceId() && !row.requestDone);
+  if (hasLocalWork()) return receipt("outcomeUnknown", "旧传输本地请求/进程尚未退出");
+  const method = String(params.retryMethod || "");
+  if (method !== "sync.serverToServerFpsync") return receipt("outcomeUnknown", "该传输协议尚不支持自动核实退出");
+  let identity, source, destination;
+  try {
+    identity = retryIdentity(params.retryParams || {});
+    if (params.requestKey !== row.requestKey || ![clientRequestKey(method, identity), transferRequestKey(method, identity)].includes(row.requestKey))
+      return receipt("identityMismatch", "重试目标与旧传输身份不匹配");
+    if (row.recoveryContext && JSON.stringify(row.recoveryContext) !== JSON.stringify({ method, params: identity }))
+      return receipt("identityMismatch", "持久化传输目标不匹配");
+    source = directSyncTarget(identity.source, "旧传输来源");
+    destination = directSyncTarget(identity.destination, "旧传输目标");
+  } catch { return receipt("identityMismatch", "无法证明旧传输的来源和目标"); }
+  const resources = [source, destination].map(target => ({ server: remoteResourceServer(target), project: target.remotePath, target: target.remotePath }));
+  let handle;
+  const signal = currentApiRequestContext()?.signal;
+  try {
+    signal?.throwIfAborted();
+    handle = transferRecoveryTestHooks?.acquire
+      ? await transferRecoveryTestHooks.acquire(resources)
+      : await hostOperationLease.acquire({ pluginId: "simple-local.simple-sftp", workspaceUri: "file://" + destination.remotePath,
+        hostProjectPath: destination.remotePath, actionType: "transfer-reconcile", actionLabel: "核实旧传输退出", resources });
+    await handle.assertHeld();
+    const localProof = transferRecoveryTestHooks?.localProof || localTransferExitProof;
+    await localProof(row.operationInstanceId, row.operationInstanceId === currentTransferApiInstanceId());
+    const proofs = [];
+    for (const target of [source, destination]) {
+      signal?.throwIfAborted();
+      const text = await runRemoteBatchSsh(target, settlementProbeCommand(target.remotePath, shellQuote), [], 20000,
+        { remoteMutation: false, stage: "旧传输退出核实" });
+      if (String(text).length > 4096) throw new Error("INVALID_REMOTE_EXIT_PROOF");
+      const proof = JSON.parse(text);
+      if (proof.idle !== true || proof.root !== target.remotePath || !Number.isSafeInteger(proof.inspectedProcesses)
+          || proof.inspectedProcesses < 0 || proof.inspectedProcesses > 8192 || !Number.isSafeInteger(proof.inspectedLocks)
+          || proof.inspectedLocks < 0 || proof.inspectedLocks > 32) throw new Error(proof.reason || "INVALID_REMOTE_EXIT_PROOF");
+      proofs.push({ inspectedProcesses: proof.inspectedProcesses, inspectedLocks: proof.inspectedLocks });
+    }
+    // The probes themselves use SSH. Check again only after both have closed.
+    await localProof(row.operationInstanceId, row.operationInstanceId === currentTransferApiInstanceId());
+    await handle.assertHeld();
+    signal?.throwIfAborted();
+    if (hasLocalWork() || transferOperationLedger.get(operationId) !== row) throw new Error("TRANSFER_IDENTITY_CHANGED");
+    row.status = "settled"; row.settledAt = new Date().toISOString(); row.persisted = false;
+    row.recovery = { kind: "verified-writer-exit", verifiedAt: row.settledAt, originalOutcome: "outcomeUnknown", proofs };
+    try {
+      await persistTransferOperationLedger();
+      row.persisted = true;
+      row.outcomeUnknown = false;
+      return receipt("settled");
+    } catch {
+      row.status = "outcomeUnknown"; row.settledAt = ""; row.persisted = false; row.outcomeUnknown = true; row.recovery = undefined;
+      await persistTransferOperationLedger().catch(() => undefined);
+      throw new Error("EXIT_RECEIPT_PERSISTENCE_FAILED");
+    }
+  } catch (error) {
+    return receipt("outcomeUnknown", String(error?.message || error).slice(0, 200));
+  } finally { await handle?.release().catch(() => undefined); }
 }
 
 function transferTimeoutMs(sftp, options = {}) { return 120000; }
@@ -3984,6 +4078,7 @@ function createLocalApiMethods() {
       const operationState = await listTransferOperationState();
       return { ok: true, instanceId: operationState.instanceId, transfers: listActiveTransfers(), operations: operationState.operations, settledOperations: operationState.settledOperations };
     },
+    "transfers.reconcile": async (params = {}) => reconcileTransferOperation(params),
     "transfers.cancel": async (params = {}) => {
       const id = String(params.transferId || params.id || "").trim();
       const operationId = String(params.operationId || "").trim();
@@ -4119,7 +4214,8 @@ function createLocalApiMethods() {
       const controllerId = nextTransferId(name);
       const operationId = String(params._operationId || controllerId);
       const remoteMutation = /^(upload[.]|handoff[.]|sync[.](?:serverToServer|deletePath)|remote[.])/.test(name);
-      await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, params._requestKey || transferRequestKey(name, params));
+      const recoveryContext = name === "sync.serverToServerFpsync" ? { method: name, params: retryIdentity(params) } : undefined;
+      await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, params._requestKey || transferRequestKey(name, params), recoveryContext);
       const controller = createTransferController({ id: controllerId, operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "" });
       controller.operationId = operationId;
       try {
@@ -6234,6 +6330,8 @@ module.exports = {
     createTransferController,
     createLocalApiMethods,
     setTransferSettlementTestContext(options = {}) {
+      transferRecoveryTestHooks = options.recoveryHooks || null;
+      transferRecoveries.clear();
       extensionContext = { globalState: options.globalState };
       localApiServer = { instanceId: () => String(options.instanceId || "test-instance") };
       if (options.reset !== false) {

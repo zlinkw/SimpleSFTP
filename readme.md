@@ -162,6 +162,8 @@ simple-sftp-api upload.workspace --json upload.json
 
 超过 128 MiB 的单文件独立传输，以 8 MiB SHA256 块连续流式接收，上限 64 GiB。重试先验证固定暂存槽中的已完成块，再从缺失位置继续；完整文件 hash 验证后才发布。普通 tar 批次也必须完整接收并验证所有文件后才替换最终路径。远端最多 32 个固定 `.simple-sftp-stage-*` 槽及锁文件；成功 `replace` 消耗数据暂存，保留小型归属/恢复记录并复用闲置槽。损坏、未知所有者和未结算槽不会自动删除或占用。失败/取消不把半成品发布为当前结果，无法证明远端结算时禁止并发重发。
 
+`transfers.reconcile` 核实旧 `sync.serverToServerFpsync` 请求是否已退出。需要原 `operationId/operationInstanceId/requestKey`、相同 `retryMethod` 和只含端点身份的 `retryParams`；capabilities 公布 `transferSettlementReconciliation`。核对本地原实例、传输进程、两端同用户进程和固定接收槽锁，并同时持有两端项目资源租约；权限不足、连接失败、活动进程或锁、身份不符均保持阻止。只有退出证据完整且回执持久化成功才返回 `settled:true`，原失败原因继续保留。该回执只证明旧 writer 已退出，不能证明旧传输成功；后续新请求仍须重新核验 SHA256。核实不删除数据、不发送 kill、不生成远端临时文件，用户无须手工清空未知回执。
+
 `sync.downloadMappedPaths` 一次接收多条源到目标映射。请求需要明确的 `server`、本机安全根 `localPath`，以及 `entries`：每项含远端项目相对路径 `remotePath` 和本机项目相对路径 `localRelativePath`。同一来源可跨 Plan 合并 tar 流，接收校验成功后按映射发布。`compression: "auto"` 在 gzip/none 中按样本选择，`"gzip"` 强制 gzip；省略或 `"none"` 保持无压缩兼容。它不扫描整个项目，也不对每个文件单独发起 SSH。`confirm: true` 和 `pathConfirmed: true` 都是必需的；预览里包含每条映射。`overwrite: true` 才覆盖已有普通文件。`maxFileBytes` 默认 128 MiB。`metricsOnly: true` 只接受 csv/json/md/txt/log，并拒绝权重和检查点。绝对路径、`..`、符号链接、越出项目根、重复目标、把目录当文件，都会在传输前拒绝。失败或取消不报整批成功，不删除已有目标。`sync.downloadPaths` 仍然要求远端相对路径与本机相对路径相同。
 
 指定文件上传时，`remotePath` 是实际目标目录。若同时传入 `server.remotePath`，两者必须一致；不一致时插件会拒绝上传。`target.show`、API 确认预览和实际传输使用同一目标解析逻辑。用服务器名称指定目标时，该名称必须匹配已保存的服务器配置；未知名称不会回退到当前活动服务器。上传前请核对预览中的主机、端口与远端目录。

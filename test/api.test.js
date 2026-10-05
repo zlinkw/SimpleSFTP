@@ -156,7 +156,7 @@ test("disposal preserves a newer discovery and consumes its own fixed writing sl
 
 test("disconnected readers cancel while writes remain owned by durable operations", async () => {
   const { EventEmitter } = require("node:events");
-  for (const [method, readOnly] of [["project.inventory", true], ["upload.start", false]]) {
+  for (const [method, readOnly] of [["project.inventory", true], ["transfers.reconcile", true], ["upload.start", false]]) {
     let entered, release, captured;
     const ready = new Promise(resolve => { entered = resolve; });
     const server = new LocalApiServer({ methods: { [method]: async (_params, _server, context) => {
@@ -210,7 +210,8 @@ test("local API handles malformed JSON-RPC and unknown methods", async () => {
 
 test("local API exposes health, compression capabilities and loadable OpenAPI", async () => {
   const methodOptions = { "sync.serverToServerFpsync": { compression: ["auto", "gzip", "none"], singleStream: "boolean" } };
-  const f = await startServer({ "status": async () => ({ ok: true }), "upload.workspace": async () => ({ ok: true }) }, { methodOptions });
+  const f = await startServer({ "status": async () => ({ ok: true }), "upload.workspace": async () => ({ ok: true }),
+    "transfers.reconcile": async () => ({ ok: true }) }, { methodOptions });
   try {
     const health = await request(f.server.port, {
       method: "GET",
@@ -229,6 +230,7 @@ test("local API exposes health, compression capabilities and loadable OpenAPI", 
     assert.equal(capabilityBody.confirmation.required, true);
     assert.match(capabilityBody.instanceId, /^\d+:/);
     assert.equal(capabilityBody.features.transferSettlementReceipts, true);
+    assert.equal(capabilityBody.features.transferSettlementReconciliation, true);
     assert.deepEqual(capabilityBody.methodOptions, methodOptions);
 
     const openapi = await request(f.server.port, {
@@ -379,6 +381,7 @@ test("SimpleSFTP exposes the planned public API methods", () => {
     "sync.downloadMappedPaths",
     "transfers.list",
     "transfers.cancel",
+    "transfers.reconcile",
     "upload.workspace",
     "upload.files",
     "handoff.markReady",
