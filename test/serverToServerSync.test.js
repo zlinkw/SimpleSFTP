@@ -196,6 +196,10 @@ test("inventory keeps stable hashes when another file changes during hashing", (
     const root = path.join(parent, "project");
     fs.mkdirSync(root);
     fs.writeFileSync(path.join(root, "steady.bin"), "stable");
+    fs.mkdirSync(path.join(root, ".simple-sftp-stage-00"));
+    fs.writeFileSync(path.join(root, ".simple-sftp-stage-00", "0.part"), "unpublished");
+    fs.writeFileSync(path.join(root, ".simple-sftp-stage-00.lock"), "owned");
+    fs.writeFileSync(path.join(root, ".model.csv.simple-sftp-partial-checkpoint"), "unpublished");
     fs.writeFileSync(path.join(root, "volatile.bin"), "changing");
     fs.mkdirSync(path.join(root, "code"));
     fs.writeFileSync(path.join(root, "code", "nested.py"), "nested");
@@ -226,6 +230,10 @@ test("inventory keeps stable hashes when another file changes during hashing", (
     const run = spawnSync(python, [script, root, ".", "1"], { encoding: "utf8", timeout: 10000, windowsHide: true });
     assert.equal(run.status, 0, run.stderr);
     const result = JSON.parse(run.stdout);
+    assert.ok(!Object.keys(result.files).some(name=>name.includes(".simple-sftp-stage-")||name.includes(".simple-sftp-partial-")));
+    assert.equal(__test.projectTreePathAllowed(".simple-sftp-stage-00/0.part"),false);
+    assert.equal(__test.projectTreePathAllowed(".simple-sftp-stage-00.lock"),false);
+    assert.equal(__test.projectTreePathAllowed("outputs/.model.csv.simple-sftp-partial-checkpoint"),false);
     assert.equal(result.files["steady.bin"] && result.files["steady.bin"].sha256.length, 64, JSON.stringify(result));
     assert.equal(result.files["volatile.bin"], undefined);
     assert.match(result.unverifiedFiles["volatile.bin"], /变化/);
