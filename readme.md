@@ -166,6 +166,12 @@ simple-sftp-api upload.workspace --json upload.json
 
 指定文件上传时，`remotePath` 是实际目标目录。若同时传入 `server.remotePath`，两者必须一致；不一致时插件会拒绝上传。`target.show`、API 确认预览和实际传输使用同一目标解析逻辑。用服务器名称指定目标时，该名称必须匹配已保存的服务器配置；未知名称不会回退到当前活动服务器。上传前请核对预览中的主机、端口与远端目录。
 
+### 清单校验与进度
+
+`sync.projectInventory` 的精确 `scopePaths` 通过 SSH stdin 发送，每次最多 5000 路径、1 MiB；能力 `projectInventoryStdinScopes` 由 live capabilities 公布，旧客户端参数仍兼容。目录遍历只进入请求范围的祖先和子树；SQLite 分批索引读取本次范围的缓存，不载入整个项目历史。复用 SHA256 前核对 dev/ino/size/mtime/ctime、打开的文件身份和最终路径身份；内容或身份变化时重新哈希，缺失与未验证文件不能冒充成功。
+
+清单、哈希、打包、网络传输、解包、复核、发布分别上报进度。`transferredBytes` 只统计实际流字节，控制 JSON、心跳和读取校验字节不混入；本机中继两端共用一个流身份避免重复计数。压缩流在 EOF 前持续转发并报告字节，哈希进度最多每 250ms 更新及阶段结束时补最终计数。既有 gzip/pigz/zstd 自动协商、SHA256 差异同步、背压与断点恢复继续使用，不新增必须安装的工具包，不生成落盘压缩包。
+
 ## 故障排查
 
 | 问题 | 处理 |

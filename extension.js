@@ -266,6 +266,7 @@ function startLocalApiServer(context) {
     discoveryPath: path.join(APPDATA, "SimpleSFTP", "api.json"),
     methods: createLocalApiMethods(),
     methodOptions: {
+      "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576 },
       "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024 },
       "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number" },
     },
@@ -915,8 +916,9 @@ function relayTarFilesCore(source, destination, paths, timeoutMs, options = {}) 
       if (error) { reader.kill(); writer.kill(); reject(error); } else { options.onWireBytes?.(wireBytes); resolve(); }
     };
     const timer = null;
-    const monitor = watchTransferProcess(reader, finish, true, paths);
-    const destinationMonitor = watchTransferProcess(writer, finish, true, paths);
+    const wireScope = `relay-${reader.pid}`;
+    const monitor = watchTransferProcess(reader, finish, true, paths, undefined, { wireScope });
+    const destinationMonitor = watchTransferProcess(writer, finish, true, paths, undefined, { wireScope, filenamePhase: "unpacking" });
     reader.stdout.on("data", (chunk) => { wireBytes += chunk.length; monitor.receive(chunk); destinationMonitor.receive(chunk); });
     reader.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
     writer.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
@@ -990,12 +992,16 @@ async function projectInventory(options = {}) {
   const recursive = options.recursive !== false;
   if (options.scopePaths !== undefined && !Array.isArray(options.scopePaths)) throw new Error("清单范围必须是路径数组。");
   const scopePaths = options.scopePaths === undefined ? null : options.scopePaths.map((item) => String(item) === "." ? "." : directSyncRelativePath(item));
+  if (scopePaths && scopePaths.length > 5000) throw new Error("一次清单最多 5000 个范围路径。");
+  if (scopePaths && Buffer.byteLength(JSON.stringify(scopePaths), "utf8") > 1048576) throw new Error("清单范围超过 1 MiB。");
   if (relativePath !== "." && !projectTreePathAllowed(relativePath)) throw new Error("清单目录属于机器状态。");
   const script = projectInventoryScript();
-  const output = await runSsh(source, `python3 -c ${shellQuote(script)} ${shellQuote(source.remotePath)} ${shellQuote(relativePath)} ${recursive ? "1" : "0"} ${shellQuote(JSON.stringify(scopePaths))}`, transferTimeoutMs(source, options));
+  const command = `python3 -c ${shellQuote(script)} ${shellQuote(source.remotePath)} ${shellQuote(relativePath)} ${recursive ? "1" : "0"} ${shellQuote(scopePaths ? "@stdin" : "null")}`;
+  const output = scopePaths ? await runRemoteBatchSsh(source, command, scopePaths, transferTimeoutMs(source, options), { remoteMutation: false, stage: "产物清单校验" })
+    : await runSsh(source, command, transferTimeoutMs(source, options));
   const result = JSON.parse(output);
   if (!result.files || typeof result.files !== "object" || Array.isArray(result.files)) throw new Error("远端项目清单无效。");
-  return { ok: true, files: result.files, unverifiedFiles: result.unverifiedFiles || {}, hashedFiles: result.hashedFiles, reusedFiles: result.reusedFiles };
+  return { ok: true, files: result.files, unverifiedFiles: result.unverifiedFiles || {}, hashedFiles: result.hashedFiles, reusedFiles: result.reusedFiles, cacheRows: result.cacheRows };
 }
 
 async function projectFileStats(options = {}) {
@@ -1033,7 +1039,7 @@ async function projectFileStats(options = {}) {
 
 function projectInventoryScript() {
   return [
-    "import hashlib,json,os,sqlite3,stat as statmod,sys",
+    "import hashlib,json,os,sqlite3,stat as statmod,sys,time,threading",
     "SQLITE_INT64_SPAN=1<<64",
     "def sql_int(value):",
     " value=int(value)",
@@ -1042,7 +1048,24 @@ function projectInventoryScript() {
     "def content_identity(st): return (int(st.st_size),int(st.st_mtime_ns))",
     "def cache_identity(st): return (sql_int(st.st_dev),sql_int(st.st_ino),int(st.st_size),int(st.st_mtime_ns),sql_int(st.st_ctime_ns))",
     "from concurrent.futures import ThreadPoolExecutor",
-    "root=os.path.realpath(sys.argv[1]); relroot=sys.argv[2]; recursive=sys.argv[3]=='1'; scopes=json.loads(sys.argv[4]) if len(sys.argv)>4 else None; found={}; unverified={}; updates=[]; hashed=0; reused=0",
+    "root=os.path.realpath(sys.argv[1]); relroot=sys.argv[2]; recursive=sys.argv[3]=='1'; found={}; unverified={}; updates=[]; hashed=0; reused=0",
+    "if len(sys.argv)>4 and sys.argv[4]=='@stdin':",
+    " raw=sys.stdin.buffer.read(1048577)",
+    " if len(raw)>1048576: raise ValueError('inventory scopes exceed 1 MiB')",
+    " scopes=[item.decode('utf-8') for item in raw.split(b'\\0') if item]",
+    " if len(scopes)>5000: raise ValueError('inventory scopes exceed 5000 paths')",
+    "else: scopes=json.loads(sys.argv[4]) if len(sys.argv)>4 else None",
+    "if scopes is not None and any(scope!='.' and (scope.startswith('/') or any(part in ('','.','..') for part in scope.split('/'))) for scope in scopes): raise ValueError('unsafe inventory scope')",
+    "scope_set=set(scopes or []); scope_ancestors=set()",
+    "for scope in scope_set:",
+    " parts=scope.split('/')",
+    " for index in range(1,len(parts)): scope_ancestors.add('/'.join(parts[:index]))",
+    "progress_lock=threading.Lock(); progress={'bytes':0,'files':0,'at':0}",
+    "def report_progress(byte_count=0,file_count=0,force=False):",
+    " with progress_lock:",
+    "  progress['bytes']+=byte_count; progress['files']+=file_count; now=time.monotonic()",
+    "  if force or now-progress['at']>=0.25:",
+    "   sys.stderr.write('SIMPLE_PROGRESS '+json.dumps({'phase':'hashing','processedBytes':progress['bytes'],'processedFiles':progress['files']})+chr(10)); sys.stderr.flush(); progress['at']=now",
     "blocked={'.git','.vscode','.codex','.agents','.coding-tools','.local-gpt','.runtime','clean_dir','zlk_cluster','.venv','venv','env','node_modules','__pycache__','.cache','.pytest_cache','.mypy_cache','.ruff_cache','.tox'}",
     "def allowed(rel,isdir=False):",
     " parts=rel.replace(os.sep,'/').lower().split('/')",
@@ -1059,7 +1082,9 @@ function projectInventoryScript() {
     " if parts[1]=='tmp' and len(parts)>2 and parts[2]=='cluster_scheduler': return (len(parts)==3 and isdir) or (len(parts)>3 and parts[3]=='logs') or (len(parts)==4 and parts[-1].endswith('.log'))",
     " return False",
     "def in_scope(rel,isdir=False):",
-    " return scopes is None or any(scope=='.' or rel==scope or rel.startswith(scope+'/') or (isdir and scope.startswith(rel+'/')) for scope in scopes)",
+    " if scopes is None or '.' in scope_set: return True",
+    " parts=rel.split('/')",
+    " return (isdir and rel in scope_ancestors) or any('/'.join(parts[:index]) in scope_set for index in range(1,len(parts)+1))",
     "parts=[] if relroot=='.' else relroot.split('/')",
     "if any(p in ('','.','..') for p in parts): raise ValueError('unsafe inventory path')",
     "if any(os.path.islink(os.path.join(root,*parts[:i])) for i in range(1,len(parts)+1)): raise ValueError('symlink inventory path')",
@@ -1072,7 +1097,6 @@ function projectInventoryScript() {
     " os.makedirs(cache_dir,mode=0o700,exist_ok=True)",
     " db=sqlite3.connect(os.path.join(cache_dir,'project-inventory.sqlite3'),timeout=5)",
     " db.execute('CREATE TABLE IF NOT EXISTS hashes (root TEXT NOT NULL, path TEXT NOT NULL, dev INTEGER NOT NULL, ino INTEGER NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY(root,path))')",
-    " cache={row[0]:tuple(int(part) if isinstance(part,int) else part for part in row[1:]) for row in db.execute('SELECT path,dev,ino,size,mtime_ns,ctime_ns,sha256 FROM hashes WHERE root=?',(cache_root,))}",
     "except (OSError,sqlite3.Error):",
     " if db is not None: db.close()",
     " db=None; cache={}",
@@ -1083,6 +1107,12 @@ function projectInventoryScript() {
     " for name in files:",
     "  full=os.path.join(current,name); rel=os.path.relpath(full,root).replace(os.sep,'/')",
     "  if allowed(rel) and in_scope(rel): names.append((rel,full))",
+    "if db is not None:",
+    " try:",
+    "  for offset in range(0,len(names),512):",
+    "   wanted=[item[0] for item in names[offset:offset+512]]",
+    "   for row in db.execute('SELECT path,dev,ino,size,mtime_ns,ctime_ns,sha256 FROM hashes WHERE root=? AND path IN ('+','.join('?' for _ in wanted)+')',(cache_root,*wanted)): cache[row[0]]=tuple(row[1:])",
+    " except sqlite3.Error: cache={}",
     "def inspect(item):",
     " rel,full=item",
     " try:",
@@ -1092,10 +1122,14 @@ function projectInventoryScript() {
     "  identity=cache_identity(stat)",
     "  cached=cache.get(rel)",
     "  if cached is not None and cached[:5]==identity:",
-    "   return (rel,{'sha256':cached[5],'size':stat.st_size,'modifiedAtMs':stat.st_mtime_ns//1000000},None,None)",
+    "   flags=os.O_RDONLY|getattr(os,'O_NOFOLLOW',0); descriptor=os.open(full,flags)",
+    "   try: opened=os.fstat(descriptor)",
+    "   finally: os.close(descriptor)",
+    "   closed=os.lstat(full)",
+    "   if statmod.S_ISREG(opened.st_mode) and not statmod.S_ISLNK(closed.st_mode) and identity[:4]==cache_identity(opened)[:4] and identity==cache_identity(closed): return (rel,{'sha256':cached[5],'size':stat.st_size,'modifiedAtMs':stat.st_mtime_ns//1000000},None,None)",
     "  with open(full,'rb') as stream:",
     "   before=os.fstat(stream.fileno()); h=hashlib.sha256()",
-    "   for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk)",
+    "   for chunk in iter(lambda:stream.read(1048576),b''): h.update(chunk); report_progress(len(chunk))",
     "   after=os.fstat(stream.fileno())",
     "  closed=os.lstat(full)",
     "  if content_identity(stat)!=content_identity(before) or content_identity(before)!=content_identity(after) or content_identity(after)!=content_identity(closed) or cache_identity(stat)[:2]!=cache_identity(before)[:2] or cache_identity(before)[:2]!=cache_identity(after)[:2] or cache_identity(after)[:2]!=cache_identity(closed)[:2] or cache_identity(stat)!=cache_identity(closed):",
@@ -1106,6 +1140,7 @@ function projectInventoryScript() {
     "  return (rel,None,None,type(exc).__name__)",
     "with ThreadPoolExecutor(max_workers=8) as pool:",
     " for rel,entry,update,error in pool.map(inspect,names):",
+    "  report_progress(file_count=1)",
     "  if error: unverified[rel]=error",
     "  elif entry:",
     "   found[rel]=entry",
@@ -1122,7 +1157,8 @@ function projectInventoryScript() {
     "   db.commit()",
     " except (OSError,sqlite3.Error): pass",
     " finally: db.close()",
-    "print(json.dumps({'files':found,'unverifiedFiles':unverified,'hashedFiles':hashed,'reusedFiles':reused},separators=(',',':')))",
+    "report_progress(force=True)",
+    "print(json.dumps({'files':found,'unverifiedFiles':unverified,'hashedFiles':hashed,'reusedFiles':reused,'cacheRows':len(cache)},separators=(',',':')))",
   ].join("\n");
 }
 
@@ -1199,7 +1235,8 @@ function runRemoteBatchSsh(source, command, paths, timeoutMs, options = {}) {
       if (error) reject(error); else { options.onWireBytes?.(wireBytes); resolve(value); }
     };
     const timer = null;
-    const monitor = watchTransferProcess(child, finish, true, paths, options.remoteMutation);
+    const monitor = watchTransferProcess(child, finish, true, paths, options.remoteMutation,
+      { stdoutBytesArePayload: false, filenamePhase: /内容清单|清单校验|分块检查点/.test(stage) ? "hashing" : "packing" });
     child.stdout.on("data", (chunk) => {
       monitor.receive(chunk);
       stdout += chunk.toString("utf8");
@@ -1235,6 +1272,10 @@ function hashQuiescenceHelpers() {
     " return value",
     "def content_identity(st): return (int(st.st_size),int(st.st_mtime_ns))",
     "def cache_identity(st): return (sql_int(st.st_dev),sql_int(st.st_ino),int(st.st_size),int(st.st_mtime_ns),sql_int(st.st_ctime_ns))",
+    "def hash_progress(force=False):",
+    " now=time.monotonic()",
+    " if force or now-hash_stats.get('progressAt',0)>=0.25:",
+    "  sys.stderr.write('SIMPLE_PROGRESS '+json.dumps({'phase':'hashing','processedBytes':hash_stats.get('processedBytes',0),'processedFiles':hash_stats.get('processedFiles',0)})+chr(10)); sys.stderr.flush(); hash_stats['progressAt']=now",
     "def hash_current(full):",
     " global hash_stats",
     " hash_stats['digestReads']+=1",
@@ -1249,7 +1290,7 @@ function hashQuiescenceHelpers() {
     "   if not chunk: break",
     "   h.update(chunk)",
     "   hash_stats['processedBytes']=hash_stats.get('processedBytes',0)+len(chunk)",
-    "   sys.stderr.write('SIMPLE_PROGRESS '+json.dumps({'phase':'hashing','processedBytes':hash_stats['processedBytes']})+chr(10)); sys.stderr.flush()",
+    "   hash_progress()",
     "  closed=os.fstat(descriptor)",
     " finally:",
     "  os.close(descriptor)",
@@ -1356,13 +1397,15 @@ function batchFileHashScript() {
     " cached=lookup_cached(rel,full,stat)",
     " if cached is not None:",
     "  found[rel]={'sha256':cached[0],'size':cached[1]}",
-    "  sys.stderr.write('SIMPLE_PROGRESS '+json.dumps({'phase':'hashing','processedFiles':len(found)})+chr(10)); sys.stderr.flush()",
+    "  hash_stats['processedFiles']=len(found); hash_progress()",
     "  continue",
     " hashed=stable_digest(full,time.monotonic()+quiet_s,poll_s)",
     " if hashed is None: unstable.append(rel)",
     " else:",
     "  remember_hash(rel,hashed[2],hashed[0])",
     "  found[rel]={'sha256':hashed[0],'size':hashed[1]}",
+    " hash_stats['processedFiles']=len(found); hash_progress()",
+    "hash_progress(True)",
     "flush_hash_cache()",
     "if unstable: raise ValueError('file changed during batch sync: '+', '.join(unstable))",
     "print(json.dumps({'files':found,'cacheHits':cache_hits,'cacheRehash':cache_rehash,'digestReads':hash_stats['digestReads'],'cacheQueries':cache_queries},separators=(',',':')))",
@@ -1392,12 +1435,15 @@ function scopeInventoryScript() {
     " if os.path.islink(full) or not os.path.isfile(full): raise ValueError('unsafe file in Plan scope')",
     " stat=os.lstat(full)",
     " cached=lookup_cached(relpath,full,stat)",
-    " if cached is not None: found[relpath]={'sha256':cached[0],'size':cached[1]}; continue",
+    " if cached is not None:",
+    "  found[relpath]={'sha256':cached[0],'size':cached[1]}; hash_stats['processedFiles']=len(found); hash_progress(); continue",
     " hashed=stable_digest(full,time.monotonic()+quiet_s,poll_s)",
     " if hashed is None: unstable.append(relpath)",
     " else:",
     "  remember_hash(relpath,hashed[2],hashed[0])",
     "  found[relpath]={'sha256':hashed[0],'size':hashed[1]}",
+    " hash_stats['processedFiles']=len(found); hash_progress()",
+    "hash_progress(True)",
     "flush_hash_cache()",
     "if unstable: raise ValueError('file changed during Plan sync: '+', '.join(unstable))",
     "print(json.dumps({'files':found,'cacheHits':cache_hits,'cacheRehash':cache_rehash,'digestReads':hash_stats['digestReads'],'cacheQueries':cache_queries},separators=(',',':')))",
@@ -1566,7 +1612,7 @@ function tarPackingCommand(compression, telemetry = false) {
 function compressionStreamCommand(compression, telemetry = false) {
   // Bound compressor CPU even when several transfers share the same Worker.
   const compressor = compression === "zstd" ? "zstd -T2 -6 -c" : "if command -v pigz >/dev/null 2>&1; then pigz -p 2 -6 -c; else gzip -6 -c; fi";
-  const counter = "import sys; n=0\nwhile True:\n b=sys.stdin.buffer.read(65536)\n if not b: break\n sys.stdout.buffer.write(b); n+=len(b)\nsys.stdout.buffer.flush(); sys.stderr.write('SIMPLE_COMPRESSION_WIRE '+str(n)+'\\n')";
+  const counter = "import sys,time; n=0; at=0\nwhile True:\n b=sys.stdin.buffer.read1(65536)\n if not b: break\n sys.stdout.buffer.write(b); sys.stdout.buffer.flush(); n+=len(b); now=time.monotonic()\n if now-at>=0.25:\n  sys.stderr.write('SIMPLE_COMPRESSION_WIRE '+str(n)+'\\n'); sys.stderr.flush(); at=now\nsys.stderr.write('SIMPLE_COMPRESSION_WIRE '+str(n)+'\\n'); sys.stderr.flush()";
   return `${compression === "none" ? "" : ` | (${compressor})`}${telemetry ? ` | python3 -c ${shellQuote(counter)}` : ""}`;
 }
 
@@ -1740,6 +1786,15 @@ async function syncServerToServerFpsync(options = {}) {
 }
 
 async function syncServerToServerFpsyncCore(options = {}, progress) {
+  const notifyStartedAt = Date.now();
+  const phaseLabels = { preparing: "准备清单", hashing: "SHA256 校验", packing: "打包", transferring: "网络传输",
+    unpacking: "解包", verifying: "内容复核", publishing: "发布文件", distributing: "本地分发" };
+  const notification = transferContext.getStore()?.onProgress?.((snapshot) => {
+    const label = phaseLabels[snapshot.phase] || "处理文件";
+    const bytes = Number(snapshot.phase === "transferring" ? snapshot.transferredBytes : snapshot.processedBytes) || 0;
+    progress.report({ message: `${label} · ${snapshot.processedFiles || 0} 个文件 · ${Math.round(bytes / 1024)} KiB${snapshot.phase === "transferring" ? " 实际流字节" : " 已处理"} · 已耗时 ${Math.floor((Date.now() - notifyStartedAt) / 1000)} 秒` });
+  });
+  try {
   const requestedCompression = requestedTransferCompression(options);
   const source = directSyncTarget(options.source, "来源");
   const destination = directSyncTarget(options.destination, "目标");
@@ -1785,6 +1840,8 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   const digest = (entry) => typeof entry === "string" ? entry : entry && entry.sha256;
   const fileSizes = Object.fromEntries(paths.map((name) => [name, Number(sourceHashes[name]?.size) || 0]));
   const changed = paths.filter((name) => digest(sourceHashes[name]) !== digest(destinationHashes[name]));
+  const transferController = transferContext.getStore();
+  if (transferController) transferController.totalBytes = changed.reduce((sum, name) => sum + fileSizes[name], 0);
   const compressionDecision = changed.length
     ? await selectTransferCompression({ ...options, compression: requestedCompression }, source, destination, changed, fileSizes)
     : { compression: requestedCompression === "none" ? "none" : requestedCompression === "zstd" ? "zstd" : "gzip", reason: "no-changed-files", sampleBytes: 0 };
@@ -1833,6 +1890,7 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   return { ok: true, paths: paths.length, transferredFiles: changed.length, partitions,
     verification: "sha256", transport: "partitioned-tar", compression, singleStream: options.singleStream === true,
     directory, relativePath, timing, hashCache, compressionDecision, wireBytes };
+  } finally { notification?.dispose?.(); }
 }
 
 async function syncFromRemoteCore(options = {}) {
@@ -2420,8 +2478,8 @@ function inspectRemoteManagedFiles(sftp, manifest, timeoutMs) {
       throw new Error(`代码 manifest 路径或 SHA256 无效：${relativePath}`);
   }
   const script = [
-    "import hashlib,json,os,sys",
-    "root=os.path.realpath(sys.argv[1]); files=json.load(sys.stdin); bad=[]; processed=0",
+    "import hashlib,json,os,sys,time",
+    "root=os.path.realpath(sys.argv[1]); files=json.load(sys.stdin); bad=[]; processed=0; progress_at=0",
     "for rel,item in files.items():",
     " parts=rel.split('/')",
     " if not rel or any(p in ('','.','..') for p in parts): raise ValueError('unsafe path')",
@@ -2433,8 +2491,11 @@ function inspectRemoteManagedFiles(sftp, manifest, timeoutMs) {
     " with open(target,'rb') as stream:",
     "  for chunk in iter(lambda:stream.read(1048576),b''):",
     "   h.update(chunk); processed+=len(chunk)",
-    "   print('SIMPLE_PROGRESS '+json.dumps({'phase':'verifying','processedBytes':processed}),file=sys.stderr,flush=True)",
+    "   now=time.monotonic()",
+    "   if now-progress_at>=0.25:",
+    "    print('SIMPLE_PROGRESS '+json.dumps({'phase':'verifying','processedBytes':processed}),file=sys.stderr,flush=True); progress_at=now",
     " if h.hexdigest()!=str(item.get('sha256','')).lower(): bad.append(rel)",
+    "print('SIMPLE_PROGRESS '+json.dumps({'phase':'verifying','processedBytes':processed}),file=sys.stderr,flush=True)",
     "print(json.dumps({'mismatches':bad}))",
   ].join("\n");
   const command = `python3 -c ${shellQuote(script)} ${shellQuote(String(sftp.remotePath).replace(/\/+$/, ""))}`;
@@ -3225,6 +3286,7 @@ function nextTransferId(operation) {
 
 function createTransferController({ id, operation, localPath, remotePath, host }) {
   const listeners = new Set();
+  const progressListeners = new Set();
   let cancelled = false;
   let cancelReason = "";
   let disposed = false;
@@ -3253,6 +3315,7 @@ function createTransferController({ id, operation, localPath, remotePath, host }
       listeners.add(listener);
       return { dispose() { listeners.delete(listener); } };
     },
+    onProgress(listener) { progressListeners.add(listener); return { dispose() { progressListeners.delete(listener); } }; },
     cancel(reason) {
       if (disposed || cancelled) return false;
       cancelled = true;
@@ -3273,21 +3336,39 @@ function createTransferController({ id, operation, localPath, remotePath, host }
       idle.dispose();
       parentCancellation?.dispose?.();
       listeners.clear();
+      progressListeners.clear();
       activeTransfers.delete(controller.id);
       void maybeSettleTransferOperation(controller.operationId);
     },
   };
-  const idle = new ProgressInactivity(120000, () => controller.cancel("文件步骤 120 秒无真实进展，已取消。请重新连接后检查目标文件，再重试。"));
+  const idle = new ProgressInactivity(120000, () => controller.cancel(`文件步骤（${controller.phase}）120 秒无真实进展，已取消。请检查该阶段日志和目标状态后重试。`));
   let transferredBytes = 0;
-  Object.defineProperty(controller, "transferredBytes", { enumerable: true, get: () => transferredBytes, set: (value) => { if (disposed || cancelled) return; transferredBytes = value; controller.updateProgress({ processedBytes: value, phase: "transferring" }); } });
+  const wireScopes = new Map();
+  let lastEventAt = 0;
+  Object.defineProperty(controller, "transferredBytes", { enumerable: true, get: () => transferredBytes, set: (value) => { if (disposed || cancelled) return; transferredBytes = Math.max(transferredBytes, Number(value) || 0); controller.updateProgress({ processedBytes: transferredBytes, phase: "transferring" }); } });
   controller.updateProgress = (evidence) => {
     if (disposed || cancelled || !idle.update(evidence)) return false;
+    const phaseChanged = Boolean(evidence.phase && evidence.phase !== controller.phase);
+    if (evidence.metric === "wire") {
+      const scope = String(evidence.scope || id), count = Math.max(0, Number(evidence.processedBytes) || 0);
+      const previous = wireScopes.get(scope) || 0;
+      transferredBytes += Math.max(0, count - previous);
+      wireScopes.set(scope, Math.max(previous, count));
+      while (wireScopes.size > 128) wireScopes.delete(wireScopes.keys().next().value);
+    }
     if (evidence.phase) controller.phase = evidence.phase;
     controller.progressScope = evidence.scope || id;
     if (evidence.processedBytes !== undefined) controller.processedBytes = evidence.processedBytes;
-    if (evidence.processedFiles !== undefined) controller.processedFiles = Math.max(controller.processedFiles, evidence.processedFiles);
+    if (evidence.processedFiles !== undefined) controller.processedFiles = evidence.processedFiles;
     controller.lastProgressAt = new Date(idle.lastProgressAt).toISOString();
-    localApiServer?.publish({ type: "transfer_progress", data: { id, operationId: controller.operationId, phase: controller.phase, processedBytes: controller.processedBytes, progressScope: controller.progressScope, processedFiles: controller.processedFiles, lastProgressAt: controller.lastProgressAt, status: controller.status } });
+    if (phaseChanged || Date.now() - lastEventAt >= 200 || evidence.status) {
+      lastEventAt = Date.now();
+      const snapshot = { id, operationId: controller.operationId, phase: controller.phase, processedBytes: controller.processedBytes,
+        transferredBytes, totalBytes: controller.totalBytes, progressScope: controller.progressScope, processedFiles: controller.processedFiles,
+        lastProgressAt: controller.lastProgressAt, status: controller.status };
+      localApiServer?.publish({ type: "transfer_progress", data: snapshot });
+      for (const listener of progressListeners) { try { listener(snapshot); } catch {} }
+    }
     if (parentController && parentController !== controller) parentController.updateProgress(evidence);
     return true;
   };
@@ -4348,13 +4429,12 @@ function getRemoteMarkerPath(remotePath, markerName) {
 }
 
 
-function watchTransferProcess(child, onIdle, fileStep = true, filenames = [], remoteMutation) {
+function watchTransferProcess(child, onIdle, fileStep = true, filenames = [], remoteMutation, options = {}) {
   const parent = transferContext.getStore();
   const apiContext = currentApiRequestContext();
   trackTransferResource(child, parent?.operationId, apiContext?.readOnly ? false : remoteMutation);
-  let buffer = "", bytes = 0, files = 0;
+  let buffer = "", bytes = 0, wireBytes = 0;
   const allowed = new Set(filenames), completed = new Set();
-  const byteBase = parent?.transferredBytes || 0, fileBase = parent?.processedFiles || 0;
   const idle = new ProgressInactivity(fileStep ? 120000 : 30000, () => { child.kill(); onIdle(new Error(fileStep ? "文件步骤 120 秒无真实进展，已停止。" : "控制请求 30 秒无有效响应，执行结果待确认。")); });
   const cancellation = parent?.onCancel((reason) => { child.kill(); idle.dispose(); onIdle(new Error(reason)); });
   const cancelledRead = () => { child.kill(); idle.dispose(); onIdle(apiContext.signal.reason); };
@@ -4364,19 +4444,35 @@ function watchTransferProcess(child, onIdle, fileStep = true, filenames = [], re
   }
   if (parent?.status === "cancelled") { child.kill(); idle.dispose(); throw new Error("传输已取消"); }
   const update = (evidence) => {
-    evidence = { ...evidence, scope: String(child.pid || child) };
+    evidence = { ...evidence, scope: String(evidence.metric === "wire" && options.wireScope || child.pid || child) };
     idle.update(evidence);
-    parent?.updateProgress({ ...evidence, processedBytes: byteBase + (evidence.processedBytes || 0), processedFiles: fileBase + (evidence.processedFiles || 0) });
+    parent?.updateProgress(evidence);
   };
-  const receive = (chunk) => { bytes += chunk.length; update({ processedBytes: bytes }); };
+  const receive = (chunk) => {
+    if (options.stdoutBytesArePayload === false || (!fileStep && options.stdoutBytesArePayload !== true)) return;
+    bytes += chunk.length; update({ phase: "transferring", processedBytes: bytes, metric: "wire" });
+  };
   const stderr = (chunk) => {
     buffer += chunk.toString("utf8");
     let index;
     while ((index = buffer.indexOf("\n")) >= 0) {
       const line = buffer.slice(0, index); buffer = buffer.slice(index + 1);
-      if (allowed.has(line) && !completed.has(line)) { completed.add(line); update({ phase: "packing", processedFiles: completed.size }); }
+      if (allowed.has(line) && !completed.has(line)) { completed.add(line); update({ phase: options.filenamePhase || "packing", processedFiles: completed.size }); }
+      const wirePrefix = "SIMPLE_COMPRESSION_WIRE ";
+      if (line.startsWith(wirePrefix)) {
+        const count = Number(line.slice(wirePrefix.length));
+        if (Number.isSafeInteger(count) && count > wireBytes) { wireBytes = count; update({ phase: "transferring", metric: "wire", processedBytes: count }); }
+      }
       if (!line.startsWith("SIMPLE_PROGRESS ")) continue;
-      try { const item = JSON.parse(line.slice(16)); update(item); } catch {}
+      try {
+        const item = JSON.parse(line.slice(16));
+        if (!["preparing", "hashing", "packing", "transferring", "unpacking", "verifying", "publishing", "distributing"].includes(item.phase)) continue;
+        const evidence = { phase: item.phase };
+        const keys = ["processedBytes", "processedFiles"];
+        if (keys.some(key => item[key] !== undefined && (!Number.isSafeInteger(item[key]) || item[key] < 0))) continue;
+        for (const key of keys) if (item[key] !== undefined) evidence[key] = item[key];
+        if (keys.some(key => evidence[key] !== undefined)) update(evidence);
+      } catch {}
     }
     if (buffer.length > 16384) buffer = buffer.slice(-16384);
   };
@@ -4401,7 +4497,7 @@ function runSsh(sftp, command, timeout) {
       }
       resolve(stdout);
     });
-    const monitor = watchTransferProcess(child, reject, Boolean(transferContext.getStore()));
+    const monitor = watchTransferProcess(child, reject, Boolean(transferContext.getStore()), [], undefined, { stdoutBytesArePayload: false });
     child.stdout?.on("data", monitor.receive);
   });
 }

@@ -21,11 +21,12 @@ Module._load = originalLoad;
 
 const python = process.platform === "win32" ? "python" : "python3";
 const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-hash-cache-"));
+let lastStderr = "";
 
 function runPython(script, args, env, stdin) {
   const file = path.join(fixtureRoot, `run-${process.hrtime.bigint().toString()}.py`);
   fs.writeFileSync(file, script, "utf8");
-  const run = spawnSync(python, [file, ...args], {
+  const run = spawnSync(python, ["-B", "-X", "utf8", file, ...args], {
     input: stdin,
     encoding: "utf8",
     timeout: 10000,
@@ -33,6 +34,7 @@ function runPython(script, args, env, stdin) {
     env: { ...process.env, ...env },
   });
   assert.equal(run.status, 0, `${run.stderr}\n${run.stdout}`);
+  lastStderr = run.stderr;
   return JSON.parse(run.stdout);
 }
 
@@ -64,6 +66,10 @@ test("cold warm and one-change hashes share one five-field cache", () => {
   const warmBatch = runPython(__test.batchFileHashScript(), [root, "2", "0.01"], env, Buffer.from(names.map((name) => `${name}\0`).join(""), "utf8"));
   assert.equal(warmBatch.digestReads, 0);
   assert.equal(warmBatch.cacheHits, 81);
+  const telemetry = lastStderr.split("\n").filter(line => line.startsWith("SIMPLE_PROGRESS ")).map(line => JSON.parse(line.slice(16)));
+  assert.ok(telemetry.length <= 4, "warm cache verification must not emit one event per file");
+  assert.equal(telemetry.at(-1).processedFiles, 81);
+  assert.equal(telemetry.at(-1).processedBytes, 0);
   for (const name of names) assert.equal(warmBatch.files[name].sha256, digests[name]);
   const changed = names[7];
   const changedPath = path.join(root, changed);
@@ -176,6 +182,22 @@ test("signed sqlite integers keep all five identity fields compatible", () => {
   assert.equal(parts[1], signed);
   assert.equal(parts[4], signed);
   assert.equal(parts[2], 4n);
+});
+
+test("stdin scopes load only requested cached rows and preserve missing/empty scope semantics", () => {
+  const root = path.join(fixtureRoot, "scope-stdin");
+  const env = { SIMPLE_SFTP_HASH_CACHE_DIR: path.join(fixtureRoot, "cache-scope-stdin") };
+  const names = writeTree(root, 120);
+  runPython(__test.projectInventoryScript(), [root, ".", "1", "null"], env);
+  const scoped = runPython(__test.projectInventoryScript(), [root, ".", "1", "@stdin"], env,
+    Buffer.from([names[0], names[119], "batch/missing.bin"].join("\0") + "\0", "utf8"));
+  assert.equal(scoped.cacheRows, 2);
+  assert.equal(scoped.reusedFiles, 2);
+  assert.equal(scoped.hashedFiles, 0);
+  assert.deepEqual(Object.keys(scoped.files).sort(), [names[0], names[119]].sort());
+  const empty = runPython(__test.projectInventoryScript(), [root, ".", "1", "@stdin"], env, Buffer.alloc(0));
+  assert.deepEqual(empty.files, {});
+  assert.equal(empty.cacheRows, 0);
 });
 
 test("final lstat ctime-only change rejects a cached batch digest", () => {

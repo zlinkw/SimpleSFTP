@@ -30,3 +30,18 @@ test('transfer list and events expose true counters and phases; cancellation rea
   assert.equal(c.updateProgress({status:'completed'}),false);
   c.dispose(); assert.equal(f.list().length,0);
 });
+
+test('parallel wire scopes aggregate once, hash bytes never inflate network totals',()=>{
+  const f=fixture();const c=f.create({id:'t',operation:'sync'});
+  c.updateProgress({phase:'transferring',metric:'wire',scope:'one',processedBytes:100});
+  c.updateProgress({phase:'transferring',metric:'wire',scope:'two',processedBytes:50});
+  c.updateProgress({phase:'transferring',metric:'wire',scope:'one',processedBytes:100});
+  c.updateProgress({phase:'hashing',scope:'hash',processedBytes:9999,processedFiles:3});
+  assert.equal(c.transferredBytes,150);
+  assert.equal(f.list()[0].phase,'hashing');
+  let notified=0;
+  const subscription=c.onProgress(()=>notified++);
+  c.updateProgress({phase:'publishing',scope:'receiver',processedFiles:1});
+  assert.equal(notified,1);
+  subscription.dispose();c.dispose();
+});

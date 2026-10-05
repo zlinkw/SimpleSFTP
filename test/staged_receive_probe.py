@@ -110,7 +110,15 @@ with patch.object(receiver.os, "open", fs.open), patch.object(receiver.os, "mkdi
     assert fs.nodes["/project/results/first.csv"]["data"] == b"old first"
     assert fs.nodes["/project/results/second.csv"]["data"] == b"old second"
     assert not fs.fds
-    receiver.receive("/project", identity, entries(files), io.BytesIO(archive(files)))
+    telemetry = io.StringIO()
+    receiver._progress.clear()
+    with patch.object(receiver.sys, "stderr", telemetry):
+        receiver.receive("/project", identity, entries(files), io.BytesIO(archive(files)))
+    progress = [json.loads(line[16:]) for line in telemetry.getvalue().splitlines() if line.startswith("SIMPLE_PROGRESS ")]
+    unpacked = [row for row in progress if row["phase"] == "unpacking"][-1]
+    published = [row for row in progress if row["phase"] == "publishing"][-1]
+    assert unpacked["processedBytes"] == sum(map(len, files.values()))
+    assert unpacked["processedFiles"] == published["processedFiles"] == len(files)
     assert fs.nodes["/project/results/first.csv"]["data"] == b"new first"
     assert fs.nodes["/project/results/second.csv"]["data"] == b"new second"
     assert not fs.fds
@@ -133,6 +141,7 @@ with patch.object(receiver.os, "open", fs.open), patch.object(receiver.os, "mkdi
     assert fs.nodes[chosen + "/manifest.json"]["data"] == b"broken"
     assert not fs.fds
     # Small block size exercises the real resumable algorithm without a giant fixture.
+    receiver._progress.clear()
     receiver.LARGE_CHUNK = 8
     data = b"12345678abcdefghLAST"
     fs.put("/project/large.bin", b"old complete file")
@@ -157,6 +166,7 @@ with patch.object(receiver.os, "open", fs.open), patch.object(receiver.os, "mkdi
     assert receiver.chunk_state(request)["offset"] == 16
     result = receiver.chunk_state(dict(request, offset=16), block(16))
     assert result["completed"] and result["offset"] == len(data)
+    assert receiver._progress["unpacking"]["files"] == 1, "chunk count must not masquerade as file count"
     assert fs.nodes["/project/large.bin"]["data"] == data
     source_request = dict(request, entries=entries({"source.bin": data}), offset=8)
     produced = io.BytesIO()

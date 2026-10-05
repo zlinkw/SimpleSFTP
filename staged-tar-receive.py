@@ -9,6 +9,7 @@ import json
 import os
 import stat
 import sys
+import time
 import zlib
 
 BLOCK = 512
@@ -17,6 +18,18 @@ MAX_METADATA = 65536
 MAX_JOURNAL = 1024 * 1024
 LARGE_CHUNK = 8 * 1024 * 1024
 MAX_LARGE_FILE = LARGE_CHUNK * 8192
+
+_progress = {}
+
+def report_progress(phase, byte_count=0, file_count=0, force=False):
+    row = _progress.setdefault(phase, {"bytes": 0, "files": 0, "at": 0})
+    row["bytes"] += byte_count
+    row["files"] += file_count
+    now = time.monotonic()
+    if force or now - row["at"] >= 0.25:
+        sys.stderr.write("SIMPLE_PROGRESS " + json.dumps({"phase": phase, "processedBytes": row["bytes"], "processedFiles": row["files"]}) + "\n")
+        sys.stderr.flush()
+        row["at"] = now
 
 def ordinary(fd):
     value = os.fstat(fd)
@@ -189,15 +202,18 @@ def receive(root, identity, entries, stream):
                     remaining -= len(block)
                     digest.update(block)
                     output.write(block)
+                    report_progress("unpacking", len(block))
                 output.flush()
                 os.fsync(output.fileno())
             exactly(stream, (-size) % BLOCK)
             if digest.hexdigest() != item["sha256"]:
                 raise ValueError("staged SHA256 mismatch")
             seen.add(name)
+            report_progress("unpacking", file_count=1)
         if seen != set(expected):
             raise ValueError("incomplete archive manifest")
         state["status"] = "publishing"
+        report_progress("unpacking", force=True)
         journal(slot_fd, state)
         for name, item in expected.items():
             parent_fd = os.dup(root_fd)
@@ -215,9 +231,11 @@ def receive(root, identity, entries, stream):
                     pass
                 os.replace(str(item["index"]) + ".part", parts[-1], src_dir_fd=slot_fd, dst_dir_fd=parent_fd)
                 os.fsync(parent_fd)
+                report_progress("publishing", file_count=1)
             finally:
                 os.close(parent_fd)
         journal(slot_fd, {"identity": identity, "status": "committed", "count": len(expected)})
+        report_progress("publishing", force=True)
         sys.stderr.write("SIMPLE_STAGE_COMMITTED " + leaf + "\n")
     except BaseException as exc:
         if slot_fd is not None:
@@ -262,6 +280,7 @@ def source_chunk(request, output):
             handle.seek(offset)
             # A single bounded block allows hash-before-write, without a temporary archive.
             data = exactly(handle, length)
+            report_progress("packing", len(data))
             if identity(os.fstat(handle.fileno())) != identity(before):
                 raise ValueError("source changed while reading chunk")
             header = json.dumps({"offset": offset, "size": length, "sha256": hashlib.sha256(data).hexdigest()}, separators=(",", ":")).encode()
@@ -293,6 +312,7 @@ def chunk_state(request, stream=None):
             if stream is None:
                 for index, digest in enumerate(blocks):
                     data = exactly(handle, min(LARGE_CHUNK, size - index * LARGE_CHUNK))
+                    report_progress("verifying", len(data))
                     if hashlib.sha256(data).hexdigest() != digest:
                         raise ValueError("verified checkpoint block changed")
                 if offset == size and blocks:
@@ -320,6 +340,7 @@ def chunk_state(request, stream=None):
                 remaining -= len(data)
                 digest.update(data)
                 handle.write(data)
+                report_progress("unpacking", len(data))
             if (not request.get("multiple") or offset + length == size) and stream.read(1):
                 raise ValueError("unexpected chunk trailer")
             if digest.hexdigest() != header.get("sha256"):
@@ -327,6 +348,7 @@ def chunk_state(request, stream=None):
             handle.flush()
             os.fsync(handle.fileno())
             blocks.append(digest.hexdigest())
+            report_progress("unpacking", file_count=int(offset + length == size), force=True)
             journal(slot_fd, state)
             offset += length
             if offset < size:
@@ -335,6 +357,7 @@ def chunk_state(request, stream=None):
             complete = hashlib.sha256()
             for data in iter(lambda: handle.read(CHUNK), b""):
                 complete.update(data)
+                report_progress("verifying", len(data))
             if complete.hexdigest() != request["entries"][0]["sha256"]:
                 # Keep the last good target; this different source cannot be resumed as valid.
                 state["blocks"] = []
@@ -357,6 +380,7 @@ def chunk_state(request, stream=None):
         finally:
             os.close(parent)
         journal(slot_fd, {"identity": request["identity"], "status": "committed", "count": 1})
+        report_progress("verifying", file_count=1, force=True)
         return {"offset": offset, "completed": True}
     finally:
         for fd in (slot_fd, lock_fd, root_fd):
