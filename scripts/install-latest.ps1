@@ -6,7 +6,7 @@ $packageInfo = Get-Content -Encoding UTF8 -Raw -LiteralPath (Join-Path $projectR
 $extensionId = "$($packageInfo.publisher).$($packageInfo.name)"
 $targetVersion = [version]$packageInfo.version
 $targetPackage = Join-Path $projectRoot "simple-sftp-$targetVersion.vsix"
-$temporaryRoot = (Resolve-Path -LiteralPath ([System.IO.Path]::GetTempPath())).ProviderPath
+$temporaryRoot = [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath ([System.IO.Path]::GetTempPath())).ProviderPath))
 $lockPath = Join-Path $temporaryRoot 'simple-sftp-install.lock'
 if ((Split-Path -Parent $lockPath) -ne $temporaryRoot) { throw 'Unsafe install lock parent' }
 if (Test-Path -LiteralPath $lockPath) {
