@@ -3707,7 +3707,7 @@ async function reconcileTransferOperationCore(params) {
     || (row.operationInstanceId === currentTransferApiInstanceId() && !row.requestDone);
   if (hasLocalWork()) return receipt("outcomeUnknown", "旧传输本地请求/进程尚未退出");
   const method = String(params.retryMethod || "");
-  if (method !== "sync.serverToServerFpsync") return receipt("outcomeUnknown", "该传输协议尚不支持自动核实退出");
+  if (!["sync.serverToServerFpsync", "sync.downloadMappedPaths"].includes(method)) return receipt("outcomeUnknown", "该传输协议尚不支持自动核实退出");
   let identity, source, destination;
   try {
     identity = retryIdentity(params.retryParams || {});
@@ -3715,9 +3715,40 @@ async function reconcileTransferOperationCore(params) {
       return receipt("identityMismatch", "重试目标与旧传输身份不匹配");
     if (row.recoveryContext && JSON.stringify(row.recoveryContext) !== JSON.stringify({ method, params: identity }))
       return receipt("identityMismatch", "持久化传输目标不匹配");
-    source = directSyncTarget(identity.source, "旧传输来源");
-    destination = directSyncTarget(identity.destination, "旧传输目标");
+    if (method === "sync.serverToServerFpsync") {
+      source = directSyncTarget(identity.source, "旧传输来源");
+      destination = directSyncTarget(identity.destination, "旧传输目标");
+    }
   } catch { return receipt("identityMismatch", "无法证明旧传输的来源和目标"); }
+  const commitExitProof = async (kind, proofs) => {
+    if (hasLocalWork() || transferOperationLedger.get(operationId) !== row) throw new Error("TRANSFER_IDENTITY_CHANGED");
+    row.status = "settled"; row.settledAt = new Date().toISOString(); row.persisted = false;
+    row.recovery = { kind, verifiedAt: row.settledAt, originalOutcome: "outcomeUnknown", proofs };
+    try {
+      await persistTransferOperationLedger();
+      row.persisted = true;
+      row.outcomeUnknown = false;
+      return receipt("settled");
+    } catch {
+      row.status = "outcomeUnknown"; row.settledAt = ""; row.persisted = false; row.outcomeUnknown = true; row.recovery = undefined;
+      await persistTransferOperationLedger().catch(() => undefined);
+      throw new Error("EXIT_RECEIPT_PERSISTENCE_FAILED");
+    }
+  };
+  if (method === "sync.downloadMappedPaths") {
+    if (row.remoteMutation !== false) return receipt("outcomeUnknown", "旧请求无法确认为只读下载，保留退出保护");
+    // This protocol only reads remote files. After the old local owner and all
+    // transports have exited, there is no remote writer or local file handle to unlock.
+    const signal = currentApiRequestContext()?.signal;
+    try {
+      signal?.throwIfAborted();
+      const localProof = transferRecoveryTestHooks?.localProof || localTransferExitProof;
+      await localProof(row.operationInstanceId, row.operationInstanceId === currentTransferApiInstanceId());
+      await localProof(row.operationInstanceId, row.operationInstanceId === currentTransferApiInstanceId());
+      signal?.throwIfAborted();
+      return await commitExitProof("verified-read-transfer-exit", []);
+    } catch (error) { return receipt("outcomeUnknown", String(error?.message || error).slice(0, 200)); }
+  }
   const resources = [source, destination].map(target => ({ server: remoteResourceServer(target), project: target.remotePath, target: target.remotePath }));
   let handle;
   const signal = currentApiRequestContext()?.signal;
@@ -3763,19 +3794,7 @@ async function reconcileTransferOperationCore(params) {
     await localProof(row.operationInstanceId, row.operationInstanceId === currentTransferApiInstanceId());
     await handle.assertHeld();
     signal?.throwIfAborted();
-    if (hasLocalWork() || transferOperationLedger.get(operationId) !== row) throw new Error("TRANSFER_IDENTITY_CHANGED");
-    row.status = "settled"; row.settledAt = new Date().toISOString(); row.persisted = false;
-    row.recovery = { kind: "verified-writer-exit", verifiedAt: row.settledAt, originalOutcome: "outcomeUnknown", proofs };
-    try {
-      await persistTransferOperationLedger();
-      row.persisted = true;
-      row.outcomeUnknown = false;
-      return receipt("settled");
-    } catch {
-      row.status = "outcomeUnknown"; row.settledAt = ""; row.persisted = false; row.outcomeUnknown = true; row.recovery = undefined;
-      await persistTransferOperationLedger().catch(() => undefined);
-      throw new Error("EXIT_RECEIPT_PERSISTENCE_FAILED");
-    }
+    return await commitExitProof("verified-writer-exit", proofs);
   } catch (error) {
     return receipt("outcomeUnknown", String(error?.message || error).slice(0, 200));
   } finally { await handle?.release().catch(() => undefined); }
@@ -4331,7 +4350,7 @@ function createLocalApiMethods() {
       const controllerId = nextTransferId(name);
       const operationId = String(params._operationId || controllerId);
       const remoteMutation = /^(upload[.]|handoff[.]|sync[.](?:serverToServer|deletePath)|remote[.])/.test(name);
-      const recoveryContext = name === "sync.serverToServerFpsync" ? { method: name, params: retryIdentity(params) } : undefined;
+      const recoveryContext = ["sync.serverToServerFpsync", "sync.downloadMappedPaths"].includes(name) ? { method: name, params: retryIdentity(params) } : undefined;
       await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, params._requestKey || transferRequestKey(name, params), recoveryContext);
       const controller = createTransferController({ id: controllerId, operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "" });
       controller.operationId = operationId;

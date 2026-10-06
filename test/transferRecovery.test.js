@@ -15,6 +15,50 @@ const params = { source: { id: "source", host: "source-host", username: "tester"
   destination: { id: "destination", host: "dest-host", username: "tester", port: 2223, remotePath: "/projects/example" } };
 const key = clientRequestKey(method, params), ledgerKey = "simple-sftp-transfer-settlement.v1";
 
+function downloadFixture(options = {}) {
+  const downloadMethod = "sync.downloadMappedPaths";
+  const retryParams = { localPath: "C:/projects/example", server: { id: "source", host: "source-host", username: "tester", port: 2222, remotePath: "/projects/example" } };
+  const requestKey = clientRequestKey(downloadMethod, retryParams), order = [];
+  const values = new Map([[ledgerKey, [{ operationId: "old-download", operationInstanceId: "123:old", status: "outcomeUnknown",
+    startedAt: new Date().toISOString(), remoteMutation: options.remoteMutation === true, requestKey }]]]);
+  const globalState = { get: (name, fallback) => values.get(name) || fallback,
+    async update(name, value) { if (options.failPersistence) throw Error("disk locked"); values.set(name, structuredClone(value)); } };
+  __test.setTransferSettlementTestContext({ globalState, instanceId: "456:new", recoveryHooks: {
+    async localProof() { order.push("local"); if (options.localBusy) throw Error("LOCAL_TRANSFER_OR_OWNER_STILL_ACTIVE"); },
+    async acquire() { throw Error("read-only recovery must not lock remote writers"); },
+  } });
+  __test.setRemoteBatchTransport(() => { throw Error("read-only recovery must not run remote writer probes"); });
+  const reconcile = (overrides = {}) => __test.createLocalApiMethods()["transfers.reconcile"]({ operationId: "old-download", operationInstanceId: "123:old",
+    requestKey, retryMethod: downloadMethod, retryParams, ...overrides });
+  return { values, order, requestKey, retryParams, reconcile };
+}
+
+test("legacy read-only download is settled only after local exit proof and permits a fresh request", async () => {
+  const f = downloadFixture();
+  await assert.rejects(__test.beginTransferOperation("too-early", "456:new", false, f.requestKey), /未确认的旧请求/);
+  assert.equal((await f.reconcile()).settled, true);
+  assert.deepEqual(f.order, ["local", "local"]);
+  assert.equal(f.values.get(ledgerKey)[0].recovery.kind, "verified-read-transfer-exit");
+  await __test.beginTransferOperation("fresh-read", "456:new", false, f.requestKey);
+  await __test.finishTransferOperation("fresh-read");
+});
+
+for (const option of ["localBusy", "remoteMutation", "failPersistence"]) {
+  test(`read-only recovery refuses uncertain evidence (${option})`, async () => {
+    const f = downloadFixture({ [option]: true });
+    assert.equal((await f.reconcile()).settled, false);
+    await assert.rejects(__test.beginTransferOperation("blocked-read", "456:new", false, f.requestKey), /未确认的旧请求/);
+  });
+}
+
+test("changed read target or a live child cannot be cleared by read-only recovery", async () => {
+  const f = downloadFixture();
+  assert.equal((await f.reconcile({ retryParams: { ...f.retryParams, localPath: "C:/projects/other" } })).status, "identityMismatch");
+  __test.trackTransferResource({ once() { return this; } }, "old-download");
+  assert.equal((await f.reconcile()).settled, false);
+  assert.deepEqual(f.order, []);
+});
+
 function fixture(options = {}) {
   const values = new Map([[ledgerKey, options.noLegacy ? [] : [{ operationId: "legacy-op", operationInstanceId: "123:old", status: "outcomeUnknown",
     startedAt: new Date().toISOString(), reason: "process closed without authoritative remote exit status (SIGTERM)",
