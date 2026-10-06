@@ -271,7 +271,7 @@ function startLocalApiServer(context) {
     methodOptions: {
       "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576 },
       "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
-      "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, maxMemoryBytes: 4 * 1024 * 1024 },
+      "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024 },
     },
   });
   localApiServer = server;
@@ -5345,7 +5345,9 @@ async function downloadMappedPathsInternal(options = {}) {
     const wrapped = error instanceof Error ? error : new Error(String(error || "映射下载失败"));
     wrapped.stage = wrapped.stage || stage.name;
     if (!wrapped.nextStep) {
-      wrapped.nextStep = stage.name === "transfer"
+      wrapped.nextStep = plan.memoryOnly
+        ? "指标批次未完整核验，未发布本批指标且未写入原始文件；核对 SSH 后重试整批。"
+        : stage.name === "transfer"
         ? "传输未完成，已写入的文件保留；核对 SSH 后重试整批，不要逐文件下载。"
         : "解包未完成，已写入的文件保留；核对映射和远端文件后重试整批。";
     }
@@ -5358,6 +5360,7 @@ async function downloadMappedPathsInternal(options = {}) {
 
 function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, transferId, onSpawn, progress, spawnImpl }) {
   const remoteCommand = createMappedDownloadCommand(sftp, plan);
+  const remoteRequest = createMappedDownloadRequest(sftp, plan);
   const { PassThrough } = require("stream");
   const output = new PassThrough();
   let resolveExit;
@@ -5376,10 +5379,19 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
   });
   controller.totalBytes = plan.byteCount || 0;
   const launch = spawnImpl || spawn;
-  const sshProc = launch("ssh", getSshArgs(sftp, remoteCommand), {
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  let sshProc;
+  try {
+    sshProc = launch("ssh", getSshArgs(sftp, remoteCommand), {
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch (error) {
+    // No child exists: do not retain a phantom active transfer after spawn fails.
+    controller.dispose();
+    rejectExit(error);
+    output.destroy();
+    throw error;
+  }
   trackTransferResource(sshProc, controller.operationId);
   if (onSpawn) onSpawn(sshProc);
   let sshStderr = "";
@@ -5474,25 +5486,38 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
     if (archiveDecoder) { archiveDecoder.once("end", finish); archiveDecoder.end(); }
     else finish();
   });
+  sshProc.stdin.on("error", fail);
+  if (!settled) {
+    try { sshProc.stdin.end(remoteRequest); } catch (error) { fail(error); }
+  }
   return output;
 }
 
 function createMappedDownloadCommand(sftp, plan) {
-  const remotePath = String(sftp.remotePath).replace(/\/+$/, "");
-  return `python3 -c ${shellQuote(createMappedDownloadScript(remotePath, plan))}`;
+  return `python3 -c ${shellQuote(createMappedDownloadScript())}`;
 }
 
-function createMappedDownloadScript(remotePath, plan) {
+function createMappedDownloadRequest(sftp, plan) {
   const payload = Buffer.from(JSON.stringify({
+    root: String(sftp.remotePath).replace(/\/+$/, ""),
     files: plan.entries.map((entry) => ({ remotePath: entry.remotePath, archiveName: `mapped/${entry.index}`, bytes: entry.bytes, sha256: entry.sha256 })),
     maxFileBytes: plan.maxFileBytes,
     maxBatchBytes: plan.maxBatchBytes,
     compression: plan.compression || "none",
-  }), "utf8").toString("base64");
+  }), "utf8");
+  if (payload.length > 1024 * 1024) throw new Error("映射下载请求超过 1 MiB 上限，未启动 SSH。");
+  return payload;
+}
+
+function createMappedDownloadScript() {
   return [
-    "import base64,gzip,json,os,sys,tarfile",
-    `root=os.path.realpath(${JSON.stringify(remotePath)})`,
-    `request=json.loads(base64.b64decode(${JSON.stringify(payload)}).decode('utf-8'))`,
+    "import gzip,json,os,sys,tarfile",
+    "payload=sys.stdin.buffer.read(1048577)",
+    "if len(payload) > 1048576: raise SystemExit('mapped request exceeds byte limit')",
+    "request=json.loads(payload.decode('utf-8'))",
+    "root_path=str(request.get('root') or '')",
+    "if not os.path.isabs(root_path): raise SystemExit('mapped root must be absolute')",
+    "root=os.path.realpath(root_path)",
     "files=request.get('files') or []",
     "limit=int(request.get('maxFileBytes') or 0)",
     "batch_limit=int(request.get('maxBatchBytes') or 0)",

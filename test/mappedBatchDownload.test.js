@@ -26,6 +26,58 @@ Module._load = originalLoad;
 
 const BLOCK = 512;
 
+test("large memory metric batches keep SSH arguments bounded and send the manifest via stdin", async () => {
+  const body = "case,seed,value\nA,42,0.9\n";
+  const sha256 = require("crypto").createHash("sha256").update(body).digest("hex");
+  const entries = Array.from({ length: 128 }, (_, index) => ({
+    remotePath: `work_dirs/${"long-experiment-name-".repeat(10)}/${index}/attempts/run-b/test_results/formal_result_rows.csv`,
+    localRelativePath: `unused/${index}.csv`, bytes: Buffer.byteLength(body), sha256,
+  }));
+  const plan = __test.normalizeMappedDownloadEntries({ entries, memoryOnly: true, metricsOnly: true, compression: "none" });
+  let request;
+  const output = __test.openMappedDownloadStream({ sftp: server(), plan, localPath: "C:/workspace",
+    spawnImpl: (_command, args, options) => {
+      assert.ok(args.join(" ").length < 16000, "Windows SSH command must not grow with the file manifest");
+      assert.equal(options.stdio[0], "pipe");
+      const proc = fakeSsh([Buffer.alloc(1024)], 0);
+      proc.stdin.on("data", chunk => { request = JSON.parse(chunk.toString("utf8")); });
+      return proc;
+    },
+  });
+  for await (const _chunk of output) { /* consume the transport */ }
+  await output.sshExit;
+  assert.equal(request.root, server().remotePath);
+  assert.equal(request.files.length, 128);
+  assert.deepEqual(request.files.map(file => file.remotePath), entries.map(file => file.remotePath));
+  assert.ok(request.files.every(file => file.sha256 === sha256));
+});
+
+test("synchronous SSH spawn failure releases the controller and permits a fresh attempt", async () => {
+  const plan = __test.normalizeMappedDownloadEntries({ compression: "none", entries: [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv" }] });
+  assert.throws(() => __test.openMappedDownloadStream({ sftp: server(), plan, transferId: "spawn-failed-regression",
+    spawnImpl: () => { throw Object.assign(new Error("spawn ENAMETOOLONG"), { code: "ENAMETOOLONG" }); },
+  }), /ENAMETOOLONG/);
+  const status = await __test.createLocalApiMethods()["transfers.list"]();
+  assert.equal(status.transfers.some(transfer => transfer.id === "spawn-failed-regression"), false);
+  const retry = __test.openMappedDownloadStream({ sftp: server(), plan, transferId: "spawn-fresh-regression",
+    spawnImpl: () => fakeSsh([Buffer.alloc(1024)], 0),
+  });
+  for await (const _chunk of retry) { /* drain the fresh attempt */ }
+  await retry.sshExit;
+});
+
+test("oversized mapped manifests are refused before allocating a controller or launching SSH", async () => {
+  const plan = __test.normalizeMappedDownloadEntries({ entries: [{ remotePath: "results/a.csv", localRelativePath: "out/a.csv" }] });
+  const huge = { ...plan, entries: [{ ...plan.entries[0], remotePath: "x".repeat(1024 * 1024) + ".csv" }] };
+  let launches = 0;
+  assert.throws(() => __test.openMappedDownloadStream({ sftp: server(), plan: huge, transferId: "manifest-limit-regression",
+    spawnImpl: () => { launches++; },
+  }), /1 MiB/);
+  assert.equal(launches, 0);
+  const status = await __test.createLocalApiMethods()["transfers.list"]();
+  assert.equal(status.transfers.some(transfer => transfer.id === "manifest-limit-regression"), false);
+});
+
 test("memory-only metrics return verified bytes without raw files or staging directories", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mapped-memory-"));
   const body = "case,seed,value\n样例,42,0.91\n";
@@ -135,6 +187,7 @@ function fakeSsh(chunks, exitCode, { holdClose = false, stderr = "", onSpawn } =
   const stderrStream = new PassThrough();
   const handlers = {};
   const proc = {
+    stdin: new PassThrough(),
     stdout,
     stderr: stderrStream,
     killed: false,
@@ -352,6 +405,7 @@ test("interrupted SSH stream settles while the reader is waiting for bytes", asy
         setTimeout(() => { if (handlers.close) handlers.close(73, null); }, 30);
       });
       return {
+        stdin: new PassThrough(),
         stdout,
         stderr: new PassThrough(),
         kill() {},
@@ -487,6 +541,7 @@ test("API cancel during the real SSH stream kills that one child", async () => {
       sshCalls += 1;
       const handlers = new Map();
       sshProc = {
+        stdin: new PassThrough(),
         stdout,
         stderr: new PassThrough(),
         kill() { killed += 1; },
