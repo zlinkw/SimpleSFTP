@@ -271,7 +271,7 @@ function startLocalApiServer(context) {
     methodOptions: {
       "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576 },
       "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
-      "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number" },
+      "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, maxMemoryBytes: 4 * 1024 * 1024 },
     },
   });
   localApiServer = server;
@@ -2797,8 +2797,10 @@ function normalizeMappedDownloadEntries(options = {}) {
   if (raw.length > MAPPED_DOWNLOAD_MAX_ENTRIES) {
     throw new Error(`映射下载一次最多 ${MAPPED_DOWNLOAD_MAX_ENTRIES} 个文件，当前 ${raw.length} 个。`);
   }
-  const maxFileBytes = mappedDownloadMaxFileBytes(options.maxFileBytes);
-  const maxBatchBytes = mappedDownloadMaxBatchBytes(options.maxBatchBytes);
+  const memoryOnly = options.memoryOnly === true;
+  if (memoryOnly && options.metricsOnly !== true) throw new Error("内存下载只允许明确的指标文件。");
+  const maxFileBytes = Math.min(mappedDownloadMaxFileBytes(options.maxFileBytes), memoryOnly ? 4 * 1024 * 1024 : Infinity);
+  const maxBatchBytes = Math.min(mappedDownloadMaxBatchBytes(options.maxBatchBytes), memoryOnly ? 4 * 1024 * 1024 : Infinity);
   const overwrite = options.overwrite === true;
   const seenRemote = new Map();
   const seenLocal = new Map();
@@ -2824,6 +2826,7 @@ function normalizeMappedDownloadEntries(options = {}) {
     }
     const sha256 = String(item.sha256 || "").trim().toLowerCase();
     if (sha256 && !/^[a-f0-9]{64}$/.test(sha256)) throw new Error(`映射下载条目 SHA256 无效：${remotePath}`);
+    if (memoryOnly && (!sha256 || declared == null || !Number.isSafeInteger(declared))) throw new Error(`内存指标下载必须提供大小和 SHA256：${remotePath}`);
     return { remotePath, localRelativePath, bytes: declared == null ? null : Math.floor(declared), sha256, index };
   });
   const byteCount = entries.reduce((total, entry) => total + (entry.bytes || 0), 0);
@@ -2833,6 +2836,7 @@ function normalizeMappedDownloadEntries(options = {}) {
     maxFileBytes,
     maxBatchBytes,
     overwrite,
+    memoryOnly,
     requestedCompression: requestedTransferCompression(options),
     compression: transferCompression({ compression: options.compression === undefined ? "auto" : options.compression }),
     byteCount,
@@ -4155,7 +4159,7 @@ function createLocalApiMethods() {
         },
       }, {
         method: "sync.downloadMappedPaths",
-        operation: `一次打包下载 ${plan.entries.length} 个映射文件到本机不同路径`,
+        operation: plan.memoryOnly ? `一次打包接收 ${plan.entries.length} 个指标文件到内存，仅校验不落盘` : `一次打包下载 ${plan.entries.length} 个映射文件到本机不同路径`,
         sftp,
         localPath,
         pathRequired: true,
@@ -5223,7 +5227,7 @@ async function downloadMappedPathsInternal(options = {}) {
   let plan = options.plan || normalizeMappedDownloadEntries(options);
   const sftp = options.sftp || apiTransferSftp({ ...options, localPath });
   if (!sftp || !sftp.host || !sftp.remotePath) throw new Error("未配置可用的 SFTP 远端路径。");
-  assertMappedLocalDestinations(localPath, plan);
+  if (!plan.memoryOnly) assertMappedLocalDestinations(localPath, plan);
   const decision = await selectTransferCompression({ ...options, compression: plan.requestedCompression || options.compression || plan.compression }, sftp,
     { host: "local", port: 0, username: "", remotePath: localPath }, plan.entries.map(item => item.remotePath), Object.fromEntries(plan.entries.map(item => [item.remotePath, item.bytes || 0])), true);
   plan = { ...plan, compression: decision.compression };
@@ -5280,7 +5284,7 @@ async function downloadMappedPathsInternal(options = {}) {
       watchSshExit();
     }
     stage.name = "extract";
-    const written = await withFileResourceLease("指标文件分发", localPath, plan.entries.map(entry => entry.localRelativePath), "local", () => extractMappedTarStream({
+    const extract = () => (plan.memoryOnly ? extractMappedMetricsToMemory : extractMappedTarStream)({
       stream,
       byArchiveName,
       localPath,
@@ -5291,10 +5295,11 @@ async function downloadMappedPathsInternal(options = {}) {
       onFileBytes: (bytes) => {
         progressState.transferredBytes += bytes;
         transferContext.getStore()?.updateProgress({ phase: "distributing", processedBytes: progressState.transferredBytes });
-        report(`已接收 ${progressState.transferredBytes} 字节，正在按映射写入`);
+        report(`已接收 ${progressState.transferredBytes} 字节，${plan.memoryOnly ? "正在核验指标（不落盘）" : "正在按映射写入"}`);
       },
       onFile: () => { progressState.completedFiles += 1; transferContext.getStore()?.updateProgress({ phase: "distributing", processedFiles: progressState.completedFiles }); },
-    }));
+    });
+    const written = plan.memoryOnly ? await extract() : await withFileResourceLease("指标文件分发", localPath, plan.entries.map(entry => entry.localRelativePath), "local", extract);
     if (written.length !== plan.entries.length) {
       const missing = plan.entries.filter((entry) => !written.some((item) => item.remotePath === entry.remotePath));
       const error = new Error(`映射下载未完成：缺少 ${missing.map((entry) => entry.remotePath).join("、") || "未知条目"}。阶段：解包。下一步：核对远端文件是否仍是普通文件后重试这一批。`);
@@ -5309,6 +5314,7 @@ async function downloadMappedPathsInternal(options = {}) {
     }
     return {
       ok: true,
+      ...(plan.memoryOnly ? { memoryOnly: true } : {}),
       localPath,
       remotePath: sftp.remotePath,
       host: sftp.host,
@@ -5334,6 +5340,7 @@ async function downloadMappedPathsInternal(options = {}) {
         throw exit.error;
       }
     }
+    if (plan.memoryOnly && error) { delete error.partial; delete error.partialResiduals; }
     if (error && error.stage) throw error;
     const wrapped = error instanceof Error ? error : new Error(String(error || "映射下载失败"));
     wrapped.stage = wrapped.stage || stage.name;
@@ -5532,6 +5539,39 @@ function createMappedDownloadScript(remotePath, plan) {
 }
 
 const MAPPED_TAR_BLOCK = 512;
+
+async function extractMappedMetricsToMemory({ stream, byArchiveName, maxFileBytes, maxBatchBytes, onFileBytes, onFile, shouldCancel }) {
+  const pending = new Map(byArchiveName), written = [];
+  const reader = createTarByteReader(stream);
+  let total = 0, zeros = 0;
+  for (;;) {
+    if (shouldCancel?.()) throw new Error("指标下载已取消");
+    const header = await reader.take(512);
+    if (!header) throw new Error("指标 tar 流缺少完整尾部");
+    if (header.every(byte => byte === 0)) { if (++zeros === 2) break; continue; }
+    if (zeros) throw new Error("指标 tar 尾部不连续");
+    const parsed = parseMappedTarHeader(header), target = pending.get(parsed.name);
+    if (!target || !["0", "\0"].includes(parsed.typeflag) || parsed.size !== target.bytes || parsed.size > maxFileBytes) throw new Error("指标 tar 条目或大小不符合声明");
+    total += parsed.size;
+    if (total > maxBatchBytes || total > 4 * 1024 * 1024) throw new Error("内存指标下载超过批次上限");
+    const body = Buffer.alloc(parsed.size), digest = crypto.createHash("sha256");
+    for (let received = 0; received < body.length;) {
+      if (shouldCancel?.()) throw new Error("指标下载已取消");
+      const piece = await reader.take(Math.min(65536, body.length - received));
+      if (!piece) throw new Error("指标 tar 文件中断");
+      piece.copy(body, received); received += piece.length; digest.update(piece); onFileBytes?.(piece.length);
+    }
+    const sha256 = digest.digest("hex");
+    if (sha256 !== target.sha256) throw new Error(`文件 SHA256 与权威结果不一致：${target.remotePath}`);
+    const padding = (512 - parsed.size % 512) % 512;
+    if (padding) await reader.discard(padding);
+    written.push({ remotePath: target.remotePath, bytes: body.length, sha256, dataBase64: body.toString("base64"), ok: true });
+    pending.delete(parsed.name); onFile?.(target);
+  }
+  if (pending.size) throw new Error("指标 tar 缺少声明文件");
+  if (stream.sshExit) await stream.sshExit;
+  return written;
+}
 
 async function extractMappedTarStream({ stream, byArchiveName, localPath, maxFileBytes, maxBatchBytes = MAPPED_DOWNLOAD_DEFAULT_MAX_BATCH_BYTES, overwrite, onFileBytes, onFile, shouldCancel }) {
   const pending = new Map(byArchiveName);

@@ -26,6 +26,92 @@ Module._load = originalLoad;
 
 const BLOCK = 512;
 
+test("memory-only metrics return verified bytes without raw files or staging directories", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mapped-memory-"));
+  const body = "case,seed,value\n样例,42,0.91\n";
+  const sha256 = require("crypto").createHash("sha256").update(body).digest("hex");
+  __test.setMappedDownloadTransport(() => tarStream([{ name: "mapped/0", body }]));
+  try {
+    const result = await __test.createLocalApiMethods()["sync.downloadMappedPaths"](baseParams(root, [
+      { remotePath: "work_dirs/run-b/test_results/formal_result_rows.csv", localRelativePath: "unused/raw.csv", bytes: Buffer.byteLength(body), sha256 },
+    ], { memoryOnly: true, metricsOnly: true, compression: "none" }));
+    assert.equal(result.memoryOnly, true);
+    assert.equal(Buffer.from(result.entries[0].dataBase64, "base64").toString("utf8"), body);
+    assert.equal(result.entries[0].sha256, sha256);
+    assert.deepEqual(fs.readdirSync(root), []);
+  } finally { __test.setMappedDownloadTransport(null); }
+});
+
+test("memory-only metrics reject missing evidence and oversized batches before transport", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mapped-memory-limit-"));
+  let calls = 0;
+  __test.setMappedDownloadTransport(() => { calls++; return tarStream([]); });
+  try {
+    const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+    const base = { remotePath: "metrics.csv", localRelativePath: "unused/raw.csv", bytes: 5, sha256: "a".repeat(64) };
+    for (const fault of [{ sha256: "" }, { bytes: null }, { bytes: 4 * 1024 * 1024 + 1 }, { remotePath: "weights.pth" }]) {
+      await assert.rejects(method(baseParams(root, [{ ...base, ...fault }], { memoryOnly: true, metricsOnly: true, compression: "none" })), /指标|上限|SHA256|大小|权重|检查点/);
+    }
+    await assert.rejects(method(baseParams(root, [{ ...base, bytes: 3 * 1024 * 1024 }, { ...base, remotePath: "other.csv", localRelativePath: "unused/other.csv", bytes: 3 * 1024 * 1024 }], { memoryOnly: true, metricsOnly: true })), /批次|总大小|上限/);
+    assert.equal(calls, 0); assert.deepEqual(fs.readdirSync(root), []);
+  } finally { __test.setMappedDownloadTransport(null); }
+});
+
+test("memory-only cross-Plan metrics use one gzip stream without publishing raw files", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mapped-memory-gzip-"));
+  const bodies = ["case,seed,value\n样例,42,0.9\n", "case,seed,value\n另一个,43,0.8\n"];
+  const entries = bodies.map((body, index) => ({ remotePath: `work_dirs/plan-${index}/test_results/metrics.csv`, localRelativePath: `unused/${index}.csv`,
+    bytes: Buffer.byteLength(body), sha256: require("crypto").createHash("sha256").update(body).digest("hex") }));
+  const params = baseParams(root, entries, { memoryOnly: true, metricsOnly: true, compression: "auto" });
+  const plan = __test.normalizeMappedDownloadEntries(params);
+  let streams = 0;
+  try {
+    __test.setMappedDownloadTransport(async () => {
+      streams++;
+      const chunks = [];
+      for await (const chunk of tarStream(bodies.map((body, index) => ({ name: `mapped/${index}`, body })))) chunks.push(chunk);
+      return __test.openMappedDownloadStream({ sftp: server(), plan, localPath: root,
+        spawnImpl: () => fakeSsh([require("node:zlib").gzipSync(Buffer.concat(chunks))], 0) });
+    });
+    const result = await __test.createLocalApiMethods()["sync.downloadMappedPaths"](params);
+    assert.equal(streams, 1); assert.equal(result.compression, "gzip");
+    assert.deepEqual(result.entries.map(file => Buffer.from(file.dataBase64, "base64").toString("utf8")), bodies);
+    assert.deepEqual(fs.readdirSync(root), []);
+  } finally { __test.setMappedDownloadTransport(null); }
+});
+
+test("memory-only metrics reject corrupt content, incomplete tar and failed SSH without publishing bytes", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mapped-memory-failure-"));
+  const method = __test.createLocalApiMethods()["sync.downloadMappedPaths"];
+  const body = "metric,value\nAUC,0.9\n";
+  const entry = { remotePath: "metrics.csv", localRelativePath: "unused/raw.csv", bytes: Buffer.byteLength(body), sha256: require("crypto").createHash("sha256").update(body).digest("hex") };
+  try {
+    __test.setMappedDownloadTransport(() => tarStream([{ name: "mapped/0", body: body.replace("0.9", "0.1") }]));
+    await assert.rejects(method(baseParams(root, [entry], { memoryOnly: true, metricsOnly: true, compression: "none" })), /SHA256/);
+    __test.setMappedDownloadTransport(() => Readable.from([tarHeader("mapped/0", entry.bytes), Buffer.from(body)]));
+    await assert.rejects(method(baseParams(root, [entry], { memoryOnly: true, metricsOnly: true, compression: "none" })), /尾部|中断|tar/);
+    __test.setMappedDownloadTransport(() => { const stream = tarStream([{ name: "mapped/0", body }]); stream.sshExit = Promise.resolve().then(() => { throw new Error("SSH failed"); }); stream.sshExit.catch(() => {}); return stream; });
+    await assert.rejects(method(baseParams(root, [entry], { memoryOnly: true, metricsOnly: true, compression: "none" })), /SSH failed/);
+    assert.deepEqual(fs.readdirSync(root), []);
+  } finally { __test.setMappedDownloadTransport(null); }
+});
+
+test("cancelled memory-only metrics release the stream and never create a raw cache", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mapped-memory-cancel-"));
+  const body = "metric,value\nAUC,0.9\n";
+  const token = { isCancellationRequested: false, onCancellationRequested(fn) { this.listener = fn; } };
+  try {
+    __test.setMappedDownloadTransport(() => {
+      token.isCancellationRequested = true; token.listener?.();
+      return tarStream([{ name: "mapped/0", body }]);
+    });
+    await assert.rejects(__test.createLocalApiMethods()["sync.downloadMappedPaths"](baseParams(root, [{ remotePath: "metrics.csv", localRelativePath: "unused/raw.csv",
+      bytes: Buffer.byteLength(body), sha256: require("crypto").createHash("sha256").update(body).digest("hex") }], { memoryOnly: true, metricsOnly: true, compression: "none", token })), /取消/);
+    assert.deepEqual(fs.readdirSync(root), []);
+    assert.equal(__test.listActiveTransfers().some(transfer => transfer.operation === "映射批量下载"), false);
+  } finally { __test.setMappedDownloadTransport(null); }
+});
+
 function keep(dir) {
   fs.writeFileSync(path.join(dir, "KEEP.txt"), "mapped-batch-download fixture; left in place\n");
 }
