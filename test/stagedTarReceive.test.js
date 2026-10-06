@@ -17,3 +17,11 @@ test("receiver bounds metadata, protects unknown owners and consumes staging fil
   assert.match(source, /os\.replace\(/);
   assert.doesNotMatch(source, /os\.unlink\(|rmtree\(|os\.rmdir\(/);
 });
+for (const scenario of ["resume-slot", "continuous-chunks", "continuous-interruption"]) {
+  test(`large-file receiver preserves checkpoint identity: ${scenario}`, () => {
+    const run = spawnSync("python", ["-B", "-X", "utf8", path.join(__dirname, "staged_receive_probe.py"), scenario],
+      { encoding: "utf8", timeout: 10000, windowsHide: true });
+    assert.equal(run.status, 0, (run.stderr || run.stdout || run.error?.message || "").slice(-2000));
+    assert.match(run.stdout, /staged receiver verified/);
+  });
+}

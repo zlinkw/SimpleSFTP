@@ -197,6 +197,19 @@ test("verification mismatch and persistent checkpoint change do not report succe
   assert.equal(messages.some((message) => message.includes("正在流处理（打包、传输与解包）")), false);
 });
 
+test("diagnostic ring handles split UTF-8, malformed telemetry and unterminated bounded errors", () => {
+  const log = __test.transferErrorLog(["work/latest/model.pth"]);
+  const input = Buffer.from('work/latest/model.pth\nSIMPLE_PROGRESS {"phase":"unpacking","processedBytes":10}\nValueError: 检查点偏移无效\nSIMPLE_COMPRESSION_WIRE 10\nSIMPLE_PROGRESS broken\n', "utf8");
+  for (const byte of input) log.receive(Buffer.from([byte]));
+  assert.equal(log.text(), "ValueError: 检查点偏移无效\nSIMPLE_PROGRESS broken");
+  const oversized = __test.transferErrorLog();
+  oversized.receive(Buffer.from("x".repeat(100000)));
+  assert.ok(oversized.text().length <= 4096);
+  const progressOnly = __test.transferErrorLog();
+  progressOnly.receive(Buffer.from("SIMPLE_CHUNK_VERIFIED 10\nSIMPLE_STAGE_COMMITTED .simple-sftp-stage-0f\n"));
+  assert.equal(progressOnly.text(), "");
+});
+
 test("nonzero pack exit keeps the stage, stderr, and exit code", async () => {
   const childProcess = require("node:child_process");
   const realSpawn = childProcess.spawn;
@@ -206,7 +219,10 @@ test("nonzero pack exit keeps the stage, stderr, and exit code", async () => {
     return Object.assign(child, {
       stdout: { on() {} },
       stderr: { on(event, fn) { if (event === "data") handlers.stderr = fn; } },
-      stdin: { on() {}, end() { queueMicrotask(() => { if (handlers.stderr) handlers.stderr(Buffer.from("tar: refused\n")); child.emit("close", 23); }); } },
+      stdin: { on() {}, end() { queueMicrotask(() => { if (handlers.stderr) {
+        handlers.stderr(Buffer.from("tar: refused\n"));
+        for (let index = 0; index < 1000; index++) handlers.stderr(Buffer.from(`SIMPLE_PROGRESS {"phase":"unpacking","processedBytes":${index},"processedFiles":0}\nSIMPLE_CHUNK_VERIFIED ${index}\nSIMPLE_COMPRESSION_WIRE ${index}\n`));
+      } child.emit("close", 23); }); } },
       kill() {},
     });
   };
@@ -223,6 +239,8 @@ test("nonzero pack exit keeps the stage, stderr, and exit code", async () => {
   try {
     const fresh = require("../extension.js");
     await assert.rejects(fresh.__test.transferPartitionedTar(endpoint("source-a"), endpoint("target-b"), ["runs/steady.bin"], 0, () => {}), (error) => {
+      assert.doesNotMatch(error.message + error.stderr, /SIMPLE_PROGRESS|SIMPLE_CHUNK_VERIFIED|SIMPLE_COMPRESSION_WIRE/);
+      assert.ok(error.message.length < 5000);
       return error.exitCode === 23 && error.stage === "压缩打包传输" && /tar: refused/.test(error.stderr) && /压缩打包传输失败（退出码 23）/.test(error.message);
     });
   } finally {

@@ -43,6 +43,23 @@ test("auto negotiates zstd only with destination support and real sample benefit
   api.setCompressionProbeTransport(async (_endpoint, command) => command.startsWith("command -v") ? "unavailable" : JSON.stringify(sample));
   assert.equal((await api.selectTransferCompression({}, source, target, ["one.csv"], {})).compression, "gzip");
 });
+test("large-file failure preserves checkpoint rejection, exit code and exact endpoint/file identity", async () => {
+  let streams = 0;
+  const name = "work/latest/model.pth";
+  api.setRemoteBatchTransport(async (endpoint) => {
+    if (endpoint.host === target.host) return JSON.stringify({ offset: 8 * 1024 * 1024, chunkBytes: 8 * 1024 * 1024 });
+    streams++;
+    throw Object.assign(new Error("ValueError: stale or invalid chunk offset"), { exitCode: 1, stage: "压缩分块传输" });
+  });
+  await assert.rejects(api.transferChunkedServerFile(source, target, name, 5000,
+    { compression: "gzip", expectedFiles: { [name]: { size: 256 * 1024 * 1024, sha256: "a".repeat(64) } } }), error => {
+      assert.equal(error.exitCode, 1);
+      assert.equal(error.stage, "压缩分块传输");
+      assert.match(error.message, /work\/latest\/model\.pth.*source → target.*stale or invalid chunk offset/);
+      return true;
+    });
+  assert.equal(streams, 1, "checkpoint failure must not replay or bypass the rejected receiver");
+});
 test("explicit choices bypass sampling, but explicit zstd still requires both peers", async () => {
   api.setCompressionProbeTransport(() => { throw new Error("no tools"); });
   assert.equal((await api.selectTransferCompression({ compression: "none" }, source, target, ["one.bin"], {})).compression, "none");

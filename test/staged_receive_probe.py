@@ -173,4 +173,77 @@ with patch.object(receiver.os, "open", fs.open), patch.object(receiver.os, "mkdi
     receiver.source_chunk(source_request, produced)
     assert produced.getvalue().split(b"\n", 1)[1] == data[8:16]
     assert not fs.fds
+    if len(sys.argv) > 1 and sys.argv[1] == "resume-slot":
+        # An earlier slot is occupied when the checkpoint starts, then becomes reusable.
+        # Resuming must find this identity's existing slot before accepting that empty slot.
+        preferred = "/project/.simple-sftp-stage-0c"
+        if preferred not in fs.nodes:
+            fs.mkdir(preferred)
+        fs.put(preferred + "/manifest.json", json.dumps({"identity": "other", "status": "chunked"}).encode())
+        resume = dict(request, identity="0000000c" + "d" * 56, entries=entries({"resume.bin": data}))
+        assert receiver.chunk_state(resume)["offset"] == 0
+        receiver.chunk_state(dict(resume, offset=0), block(0))
+        fs.put(preferred + "/manifest.json", json.dumps({"identity": "other", "status": "committed"}).encode())
+        assert receiver.chunk_state(resume)["offset"] == 8, "checkpoint moved into an unrelated reusable slot"
+        receiver.chunk_state(dict(resume, offset=8), block(8))
+        assert receiver.chunk_state(dict(resume, offset=16), block(16))["completed"]
+        assert fs.nodes["/project/resume.bin"]["data"] == data
+        assert not fs.fds
+    if len(sys.argv) > 1 and sys.argv[1] == "continuous-chunks":
+        continuous = dict(request, identity="e" * 64, entries=entries({"continuous.bin": data}))
+        receiver.chunk_state(continuous)
+        held = {}
+        close = fs.close
+        def unlock_close(fd):
+            if held.get(fs.fds[fd]) == fd:
+                held.pop(fs.fds[fd])
+            close(fd)
+        def lock(fd, flags):
+            name = fs.fds[fd]
+            if name in held:
+                raise BlockingIOError("slot already held")
+            held[name] = fd
+        class Frames(io.BytesIO):
+            checked_rival = False
+            def readline(self, length):
+                if self.tell() and not self.checked_rival:
+                    self.checked_rival = True
+                    # A second receiver must not allocate another slot for this live identity.
+                    try:
+                        receiver.chunk_state(continuous)
+                    except ValueError as error:
+                        assert "TRANSFER_STAGE_BUSY" in str(error)
+                    else:
+                        raise AssertionError("live checkpoint owner was bypassed")
+                return super().readline(length)
+        payload = Frames(b"".join(block(offset).getvalue() for offset in range(0, len(data), 8)))
+        with patch.object(receiver.fcntl, "flock", lock), patch.object(receiver.os, "close", unlock_close):
+            result = receiver.chunk_state(dict(continuous, offset=0, multiple=True), payload)
+        assert result["completed"] and result["offset"] == len(data), "continuous receive released its slot between frames"
+        assert payload.checked_rival and not held
+        assert fs.nodes["/project/continuous.bin"]["data"] == data
+        assert not fs.fds
+    if len(sys.argv) > 1 and sys.argv[1] == "continuous-interruption":
+        interrupted = dict(request, identity="f" * 64, entries=entries({"interrupted.bin": data}))
+        fs.put("/project/interrupted.bin", b"old complete file")
+        receiver.chunk_state(interrupted)
+        for damaged in (block(8).getvalue()[:-1], block(8).getvalue()[:-1] + b"X"):
+            payload = io.BytesIO(block(0).getvalue() + damaged)
+            # The second attempt resumes after the first verified block.
+            offset = receiver.chunk_state(interrupted)["offset"]
+            if offset:
+                payload = io.BytesIO(damaged)
+            try:
+                receiver.chunk_state(dict(interrupted, offset=offset, multiple=True), payload)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("truncated or corrupt continuous stream accepted")
+            assert fs.nodes["/project/interrupted.bin"]["data"] == b"old complete file"
+            assert receiver.chunk_state(interrupted)["offset"] == 8
+            assert not fs.fds
+        result = receiver.chunk_state(dict(interrupted, offset=8, multiple=True),
+            io.BytesIO(block(8).getvalue() + block(16).getvalue()))
+        assert result["completed"] and fs.nodes["/project/interrupted.bin"]["data"] == data
+        assert not fs.fds
 print("staged receiver verified")

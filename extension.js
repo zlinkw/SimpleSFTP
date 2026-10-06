@@ -909,7 +909,7 @@ function relayTarFilesCore(source, destination, paths, timeoutMs, options = {}) 
     const writer = spawn("ssh", getSshArgs(destination, destinationCommand), { windowsHide: true, stdio: ["pipe", "ignore", "pipe"] });
     let sourceCode;
     let destinationCode;
-    let stderr = "";
+    const sourceErrors = transferErrorLog(paths), destinationErrors = transferErrorLog(paths);
     let settled = false;
     let wireBytes = 0;
     const finish = (error) => {
@@ -923,12 +923,13 @@ function relayTarFilesCore(source, destination, paths, timeoutMs, options = {}) 
     const monitor = watchTransferProcess(reader, finish, true, paths, undefined, { wireScope });
     const destinationMonitor = watchTransferProcess(writer, finish, true, paths, undefined, { wireScope, filenamePhase: "unpacking" });
     reader.stdout.on("data", (chunk) => { wireBytes += chunk.length; monitor.receive(chunk); destinationMonitor.receive(chunk); });
-    reader.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
-    writer.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
+    reader.stderr.on("data", (chunk) => sourceErrors.receive(chunk));
+    writer.stderr.on("data", (chunk) => destinationErrors.receive(chunk));
     reader.on("error", (error) => finish(error));
     writer.on("error", (error) => finish(error));
-    reader.on("close", (code) => { sourceCode = code; if (destinationCode !== undefined) finish(sourceCode === 0 && destinationCode === 0 ? null : new Error(`内存转发失败：${stderr || `${sourceCode}/${destinationCode}`}`)); });
-    writer.on("close", (code) => { destinationCode = code; if (sourceCode !== undefined) finish(sourceCode === 0 && destinationCode === 0 ? null : new Error(`内存转发失败：${stderr || `${sourceCode}/${destinationCode}`}`)); });
+    const failure = () => new Error(`内存转发失败（来源退出码 ${sourceCode} / 目标退出码 ${destinationCode}）：${[sourceErrors.text(), destinationErrors.text()].filter(Boolean).join("\n") || "SSH 不可用"}`);
+    reader.on("close", (code) => { sourceCode = code; if (destinationCode !== undefined) finish(sourceCode === 0 && destinationCode === 0 ? null : failure()); });
+    writer.on("close", (code) => { destinationCode = code; if (sourceCode !== undefined) finish(sourceCode === 0 && destinationCode === 0 ? null : failure()); });
     reader.stdout.pipe(writer.stdin);
     writer.stdin.on("error", () => {});
     reader.stdin.on("error", () => {});
@@ -1222,13 +1223,41 @@ function setRemoteBatchTransport(fn) {
   remoteBatchTransport = typeof fn === "function" ? fn : null;
 }
 
+function transferErrorLog(paths = []) {
+  const decoder = new (require("node:string_decoder").StringDecoder)("utf8");
+  const filenames = new Set(paths.flatMap(name => [name, `./${name}`]));
+  let pending = "", errors = "";
+  const append = line => {
+    const text = line.trim();
+    if (!text || filenames.has(text) || /^SIMPLE_(?:CHUNK_VERIFIED|COMPRESSION_WIRE) \d+$/.test(text)
+      || /^SIMPLE_STAGE_COMMITTED \.simple-sftp-stage-[0-9a-f]{2}$/.test(text)) return;
+    if (text.startsWith("SIMPLE_PROGRESS ")) {
+      try {
+        const row = JSON.parse(text.slice(16));
+        if (["preparing", "hashing", "packing", "transferring", "unpacking", "verifying", "publishing", "distributing"].includes(row.phase)
+          && ["processedFiles", "processedBytes"].every(key => row[key] === undefined || Number.isSafeInteger(row[key]) && row[key] >= 0)) return;
+      } catch { /* Malformed protocol data remains diagnostic evidence. */ }
+    }
+    errors = (errors + (errors ? "\n" : "") + text).slice(-4096);
+  };
+  return {
+    receive(chunk) {
+      pending += decoder.write(chunk);
+      let end;
+      while ((end = pending.indexOf("\n")) >= 0) { append(pending.slice(0, end)); pending = pending.slice(end + 1); }
+      if (pending.length > 8192) { append(pending.slice(0, 4096)); pending = pending.slice(-4096); }
+    },
+    text() { if (pending) { append(pending); pending = ""; } return errors; },
+  };
+}
+
 function runRemoteBatchSsh(source, command, paths, timeoutMs, options = {}) {
   if (remoteBatchTransport) return Promise.resolve().then(() => remoteBatchTransport(source, command, paths, timeoutMs, options));
   const stage = options.stage || remoteBatchStage(command);
   return new Promise((resolve, reject) => {
     const child = spawn("ssh", ["-A", "-o", "BatchMode=yes", ...getSshArgs(source, command)], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
-    let stderr = "";
+    const errors = transferErrorLog(paths);
     let wireBuffer = "", wireBytes = 0;
     let settled = false;
     const finish = (error, value) => {
@@ -1246,7 +1275,7 @@ function runRemoteBatchSsh(source, command, paths, timeoutMs, options = {}) {
       if (stdout.length > 4 * 1024 * 1024) { child.kill(); finish(new Error("远端批量清单超过 4 MB。")); }
     });
     child.stderr.on("data", (chunk) => {
-      stderr = (stderr + chunk.toString("utf8")).slice(-16384);
+      errors.receive(chunk);
       wireBuffer += chunk.toString("utf8");
       let end;
       while ((end = wireBuffer.indexOf("\n")) >= 0) {
@@ -1258,9 +1287,11 @@ function runRemoteBatchSsh(source, command, paths, timeoutMs, options = {}) {
       wireBuffer = wireBuffer.slice(-1024);
     });
     child.on("error", (error) => finish(error));
-    child.on("close", (code) => code === 0
-      ? finish(null, stdout.trim())
-      : finish(Object.assign(new Error(`跨 Worker ${stage}失败（退出码 ${code}）：${stderr.trim() || stdout.trim() || "SSH 不可用"}`), { exitCode: code, stage, stderr: stderr.trim() })));
+    child.on("close", (code) => {
+      if (code === 0) return finish(null, stdout.trim());
+      const stderr = errors.text();
+      finish(Object.assign(new Error(`跨 Worker ${stage}失败（退出码 ${code}）：${stderr || stdout.trim().slice(-4096) || "SSH 不可用"}`), { exitCode: code, stage, stderr }));
+    });
     child.stdin.on("error", () => {});
     child.stdin.end(Buffer.from(paths.map((name) => `${name}\0`).join(""), "utf8"));
   });
@@ -1666,19 +1697,19 @@ function remoteTransferOutcomeUnknown() {
 }
 
 async function transferChunkedServerFile(source, destination, name, timeoutMs, options) {
-  const entry = options.expectedFiles?.[name];
-  if (!entry || !Number.isSafeInteger(entry.size) || entry.size > 64 * 1024 * 1024 * 1024 || !/^[a-f0-9]{64}$/.test(entry.sha256 || "")) throw new Error("大文件分块需要完整 SHA256/size，单文件上限 64GiB。");
-  const entries = [{ path: name, sha256: entry.sha256, size: entry.size }];
-  const identity = crypto.createHash("sha256").update(JSON.stringify([destination.remotePath, entries])).digest("hex");
-  const request = { identity, entries };
-  // Checkpoint reconciliation can create/truncate an owned staging file and write its journal.
-  // A disconnected status request therefore requires the same settlement protection as writes.
-  const reply = await runRemoteBatchSsh(destination, chunkTransferCommand(destination, { ...request, mode: "chunkStatus" }), [], timeoutMs, { remoteMutation: true, stage: "核验分块检查点" });
-  const status = JSON.parse(reply);
-  const chunkBytes = 8 * 1024 * 1024;
-  if (!Number.isSafeInteger(status.offset) || status.offset < 0 || status.offset >= entry.size || status.offset % chunkBytes || status.chunkBytes !== chunkBytes) throw new Error("大文件恢复检查点无效。");
-  if (options.token?.isCancellationRequested || remoteTransferOutcomeUnknown()) throw new Error("旧传输未确认退出，未重发大文件分块。");
-  {
+  try {
+    const entry = options.expectedFiles?.[name];
+    if (!entry || !Number.isSafeInteger(entry.size) || entry.size > 64 * 1024 * 1024 * 1024 || !/^[a-f0-9]{64}$/.test(entry.sha256 || "")) throw new Error("大文件分块需要完整 SHA256/size，单文件上限 64GiB。");
+    const entries = [{ path: name, sha256: entry.sha256, size: entry.size }];
+    const identity = crypto.createHash("sha256").update(JSON.stringify([destination.remotePath, entries])).digest("hex");
+    const request = { identity, entries };
+    // Checkpoint reconciliation can create/truncate an owned staging file and write its journal.
+    // A disconnected status request therefore requires the same settlement protection as writes.
+    const reply = await runRemoteBatchSsh(destination, chunkTransferCommand(destination, { ...request, mode: "chunkStatus" }), [], timeoutMs, { remoteMutation: true, stage: "核验分块检查点" });
+    const status = JSON.parse(reply);
+    const chunkBytes = 8 * 1024 * 1024;
+    if (!Number.isSafeInteger(status.offset) || status.offset < 0 || status.offset >= entry.size || status.offset % chunkBytes || status.chunkBytes !== chunkBytes) throw new Error("大文件恢复检查点无效。");
+    if (options.token?.isCancellationRequested || remoteTransferOutcomeUnknown()) throw new Error("旧传输未确认退出，未重发大文件分块。");
     const offset = status.offset;
     const read = chunkTransferCommand(source, { ...request, mode: "readChunks", offset }) + compressionStreamCommand(options.compression, options.wireTelemetry === true);
     const decode = options.compression === "zstd" ? "zstd -dc | " : options.compression === "none" ? "" : "gzip -dc | ";
@@ -1691,6 +1722,9 @@ async function transferChunkedServerFile(source, destination, name, timeoutMs, o
       if (remoteTransferOutcomeUnknown() || !/host key verification failed|no .* host key|permission denied|connect to host|network is unreachable|could not resolve hostname|connection refused/i.test(formatError(error))) throw error;
       await relayTarFilesCore(source, destination, [name], timeoutMs, { ...options, sourceCommand, destinationCommand });
     }
+  } catch (error) {
+    if (error instanceof Error) error.message = `大文件 ${name}（${source.host} → ${destination.host}）同步失败：${error.message}`;
+    throw error;
   }
 }
 
@@ -6358,6 +6392,7 @@ module.exports = {
     partitionTransferPaths,
     transferPartitionedTar,
     transferChunkedServerFile,
+    transferErrorLog,
     syncServerToServerFpsyncCore,
     syncServerToServerFpsync,
     setRemoteBatchTransport,

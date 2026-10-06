@@ -84,7 +84,8 @@ def journal(slot_fd, data):
 
 def claim(root_fd, identity):
     start = int(identity[:8], 16) % 32
-    for offset in range(32):
+    # Find an existing checkpoint before recycling a slot that became free later.
+    for matching_only, offset in ((matching, index) for matching in (True, False) for index in range(32)):
         leaf = ".simple-sftp-stage-" + format((start + offset) % 32, "02x")
         lock_fd = open_file(root_fd, leaf + ".lock", os.O_RDWR | os.O_CREAT)
         slot_fd = None
@@ -93,12 +94,22 @@ def claim(root_fd, identity):
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
+                if matching_only:
+                    try:
+                        slot_fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+                        previous = read_journal(slot_fd)
+                    except (ValueError, OSError):
+                        previous = None
+                    if previous and previous.get("identity") == identity:
+                        raise ValueError("TRANSFER_STAGE_BUSY: checkpoint owner still active")
                 continue
             try:
-                slot_fd = folder(root_fd, leaf)
+                slot_fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd) if matching_only else folder(root_fd, leaf)
                 previous = read_journal(slot_fd)
             except (ValueError, OSError):
                 # Corrupt/unowned slots stay protected; an unrelated idle slot can still progress.
+                continue
+            if matching_only and (not previous or previous.get("identity") != identity):
                 continue
             if previous and previous.get("status") != "committed" and previous.get("identity") != identity:
                 continue
@@ -324,35 +335,41 @@ def chunk_state(request, stream=None):
                 return {"offset": offset, "chunkBytes": LARGE_CHUNK}
             if int(request["offset"]) != offset or offset >= size:
                 raise ValueError("stale or invalid chunk offset")
-            raw = stream.readline(513)
-            if len(raw) > 512 or not raw.endswith(b"\n"):
-                raise ValueError("invalid chunk header")
-            header = json.loads(raw)
-            length = min(LARGE_CHUNK, size - offset)
-            if header.get("offset") != offset or header.get("size") != length:
-                raise ValueError("chunk range mismatch")
-            handle.seek(offset)
-            handle.truncate(offset)
-            digest = hashlib.sha256()
-            remaining = length
-            while remaining:
-                data = exactly(stream, min(CHUNK, remaining))
-                remaining -= len(data)
-                digest.update(data)
-                handle.write(data)
-                report_progress("unpacking", len(data))
-            if (not request.get("multiple") or offset + length == size) and stream.read(1):
-                raise ValueError("unexpected chunk trailer")
-            if digest.hexdigest() != header.get("sha256"):
-                raise ValueError("chunk SHA256 mismatch")
-            handle.flush()
-            os.fsync(handle.fileno())
-            blocks.append(digest.hexdigest())
-            report_progress("unpacking", file_count=int(offset + length == size), force=True)
             journal(slot_fd, state)
-            offset += length
-            if offset < size:
-                return {"offset": offset, "completed": False}
+            # One receive stream owns the slot and lock until EOF/publication.
+            while offset < size:
+                raw = stream.readline(513)
+                if len(raw) > 512 or not raw.endswith(b"\n"):
+                    raise ValueError("invalid chunk header")
+                header = json.loads(raw)
+                length = min(LARGE_CHUNK, size - offset)
+                if header.get("offset") != offset or header.get("size") != length:
+                    raise ValueError("chunk range mismatch")
+                handle.seek(offset)
+                handle.truncate(offset)
+                digest = hashlib.sha256()
+                remaining = length
+                while remaining:
+                    data = exactly(stream, min(CHUNK, remaining))
+                    remaining -= len(data)
+                    digest.update(data)
+                    handle.write(data)
+                    report_progress("unpacking", len(data))
+                if (not request.get("multiple") or offset + length == size) and stream.read(1):
+                    raise ValueError("unexpected chunk trailer")
+                if digest.hexdigest() != header.get("sha256"):
+                    raise ValueError("chunk SHA256 mismatch")
+                handle.flush()
+                os.fsync(handle.fileno())
+                blocks.append(digest.hexdigest())
+                journal(slot_fd, state)
+                offset += length
+                report_progress("unpacking", file_count=int(offset == size), force=True)
+                if request.get("multiple"):
+                    sys.stderr.write("SIMPLE_CHUNK_VERIFIED " + str(offset) + "\n")
+                    sys.stderr.flush()
+                elif offset < size:
+                    return {"offset": offset, "completed": False}
             handle.seek(0)
             complete = hashlib.sha256()
             for data in iter(lambda: handle.read(CHUNK), b""):
@@ -403,14 +420,7 @@ if __name__ == "__main__":
         else:
             source_chunk(request, sys.stdout.buffer)
     elif request.get("mode") == "receiveChunks":
-        offset = int(request["offset"])
-        size = int(request["entries"][0]["size"])
-        while offset < size:
-            result = chunk_state(dict(request, offset=offset, multiple=True), sys.stdin.buffer)
-            offset = result["offset"]
-            sys.stderr.write("SIMPLE_CHUNK_VERIFIED " + str(offset) + "\n")
-            sys.stderr.flush()
-        print(json.dumps(result))
+        print(json.dumps(chunk_state(dict(request, multiple=True), sys.stdin.buffer)))
     elif request.get("mode") in ("chunkStatus", "receiveChunk"):
         print(json.dumps(chunk_state(request, sys.stdin.buffer if request["mode"] == "receiveChunk" else None)))
     else:
