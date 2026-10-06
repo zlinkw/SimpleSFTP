@@ -1005,7 +1005,7 @@ async function projectInventory(options = {}) {
     : await runSsh(source, command, transferTimeoutMs(source, options));
   const result = JSON.parse(output);
   if (!result.files || typeof result.files !== "object" || Array.isArray(result.files)) throw new Error("远端项目清单无效。");
-  return { ok: true, files: result.files, unverifiedFiles: result.unverifiedFiles || {}, hashedFiles: result.hashedFiles, reusedFiles: result.reusedFiles, cacheRows: result.cacheRows };
+  return { ok: true, files: result.files, unverifiedFiles: result.unverifiedFiles || {}, hashedFiles: result.hashedFiles, reusedFiles: result.reusedFiles, cacheRows: result.cacheRows, cacheStatus: result.cacheStatus };
 }
 
 async function projectFileStats(options = {}) {
@@ -1051,7 +1051,7 @@ function projectInventoryScript() {
     " return value",
     "def content_identity(st): return (int(st.st_size),int(st.st_mtime_ns))",
     "def cache_identity(st): return (sql_int(st.st_dev),sql_int(st.st_ino),int(st.st_size),int(st.st_mtime_ns),sql_int(st.st_ctime_ns))",
-    "from concurrent.futures import ThreadPoolExecutor",
+    "from concurrent.futures import ThreadPoolExecutor,wait,FIRST_COMPLETED",
     "root=os.path.realpath(sys.argv[1]); relroot=sys.argv[2]; recursive=sys.argv[3]=='1'; found={}; unverified={}; updates=[]; hashed=0; reused=0",
     "if len(sys.argv)>4 and sys.argv[4]=='@stdin':",
     " raw=sys.stdin.buffer.read(1048577)",
@@ -1069,7 +1069,7 @@ function projectInventoryScript() {
     " with progress_lock:",
     "  progress['bytes']+=byte_count; progress['files']+=file_count; now=time.monotonic()",
     "  if force or now-progress['at']>=0.25:",
-    "   sys.stderr.write('SIMPLE_PROGRESS '+json.dumps({'phase':'hashing','processedBytes':progress['bytes'],'processedFiles':progress['files']})+chr(10)); sys.stderr.flush(); progress['at']=now",
+    "   sys.stderr.write('SIMPLE_PROGRESS '+json.dumps({'phase':'hashing','processedBytes':progress['bytes'],'processedFiles':progress['files'],'cacheHits':reused,'cacheRehash':hashed,'cacheStatus':cache_status})+chr(10)); sys.stderr.flush(); progress['at']=now",
     "blocked={'.git','.vscode','.codex','.agents','.coding-tools','.local-gpt','.runtime','clean_dir','zlk_cluster','.venv','venv','env','node_modules','__pycache__','.cache','.pytest_cache','.mypy_cache','.ruff_cache','.tox'}",
     "def allowed(rel,isdir=False):",
     " parts=rel.replace(os.sep,'/').lower().split('/')",
@@ -1095,7 +1095,7 @@ function projectInventoryScript() {
     "target=os.path.join(root,*parts)",
     "if os.path.commonpath((root,os.path.realpath(target)))!=root: raise ValueError('inventory path outside project')",
     "if not os.path.isdir(target) and not os.path.isfile(target): print(json.dumps({'files':{}})); sys.exit(0)",
-    "cache={}; db=None; cache_root=hashlib.sha256(root.encode('utf-8')).hexdigest()",
+    "cache={}; db=None; cache_status='ready'; cache_at=time.monotonic(); update_bytes=0; cache_root=hashlib.sha256(root.encode('utf-8')).hexdigest()",
     "try:",
     " cache_dir=os.environ.get('SIMPLE_SFTP_HASH_CACHE_DIR') or os.path.join(os.path.expanduser('~'),'.cache','simple-sftp')",
     " os.makedirs(cache_dir,mode=0o700,exist_ok=True)",
@@ -1103,7 +1103,7 @@ function projectInventoryScript() {
     " db.execute('CREATE TABLE IF NOT EXISTS hashes (root TEXT NOT NULL, path TEXT NOT NULL, dev INTEGER NOT NULL, ino INTEGER NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY(root,path))')",
     "except (OSError,sqlite3.Error):",
     " if db is not None: db.close()",
-    " db=None; cache={}",
+    " db=None; cache={}; cache_status='unavailable'",
     "walk=((os.path.dirname(target),[],[os.path.basename(target)]),) if os.path.isfile(target) else os.walk(target,followlinks=False) if recursive else ((target,[],[name for name in os.listdir(target) if not os.path.isdir(os.path.join(target,name))]),)",
     "names=[]",
     "for current,dirs,files in walk:",
@@ -1116,7 +1116,16 @@ function projectInventoryScript() {
     "  for offset in range(0,len(names),512):",
     "   wanted=[item[0] for item in names[offset:offset+512]]",
     "   for row in db.execute('SELECT path,dev,ino,size,mtime_ns,ctime_ns,sha256 FROM hashes WHERE root=? AND path IN ('+','.join('?' for _ in wanted)+')',(cache_root,*wanted)): cache[row[0]]=tuple(row[1:])",
-    " except sqlite3.Error: cache={}",
+    " except sqlite3.Error: cache={}; cache_status='read-failed'; db.close(); db=None",
+    "def flush_inventory_cache(force=False):",
+    " global update_bytes,cache_at,db,cache_status",
+    " if db is None: updates.clear(); return",
+    " if not updates or not (force or len(updates)>=32 or update_bytes>=67108864 or time.monotonic()-cache_at>=1): return",
+    " try:",
+    "  db.executemany('INSERT INTO hashes (root,path,dev,ino,size,mtime_ns,ctime_ns,sha256) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(root,path) DO UPDATE SET dev=excluded.dev,ino=excluded.ino,size=excluded.size,mtime_ns=excluded.mtime_ns,ctime_ns=excluded.ctime_ns,sha256=excluded.sha256',updates)",
+    "  db.commit()",
+    " except (OSError,sqlite3.Error): db.close(); db=None; cache_status='write-failed'",
+    " updates.clear(); update_bytes=0; cache_at=time.monotonic()",
     "def inspect(item):",
     " rel,full=item",
     " try:",
@@ -1143,18 +1152,27 @@ function projectInventoryScript() {
     " except (FileNotFoundError,PermissionError,OSError) as exc:",
     "  return (rel,None,None,type(exc).__name__)",
     "with ThreadPoolExecutor(max_workers=8) as pool:",
-    " for rel,entry,update,error in pool.map(inspect,names):",
-    "  report_progress(file_count=1)",
-    "  if error: unverified[rel]=error",
-    "  elif entry:",
-    "   found[rel]=entry",
-    "   if update: hashed+=1; updates.append(update)",
-    "   else: reused+=1",
+    " remaining=iter(names); pending=set()",
+    " def fill_pending():",
+    "  while len(pending)<16:",
+    "   item=next(remaining,None)",
+    "   if item is None: break",
+    "   pending.add(pool.submit(inspect,item))",
+    " fill_pending()",
+    " while pending:",
+    "  done,pending=wait(pending,return_when=FIRST_COMPLETED)",
+    "  for future in done:",
+    "   rel,entry,update,error=future.result()",
+    "   if error: unverified[rel]=error",
+    "   elif entry:",
+    "    found[rel]=entry",
+    "    if update: hashed+=1; updates.append(update); update_bytes+=entry['size']",
+    "    else: reused+=1",
+    "   flush_inventory_cache(); report_progress(file_count=1)",
+    "  fill_pending()",
+    "flush_inventory_cache(True)",
     "if db is not None:",
     " try:",
-    "  if updates:",
-    "   db.executemany('INSERT INTO hashes (root,path,dev,ino,size,mtime_ns,ctime_ns,sha256) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(root,path) DO UPDATE SET dev=excluded.dev,ino=excluded.ino,size=excluded.size,mtime_ns=excluded.mtime_ns,ctime_ns=excluded.ctime_ns,sha256=excluded.sha256',updates)",
-    "   db.commit()",
     "  count=int(db.execute('SELECT COUNT(*) FROM hashes').fetchone()[0])",
     "  if count>250000:",
     "   db.execute('DELETE FROM hashes WHERE rowid IN (SELECT rowid FROM hashes ORDER BY rowid LIMIT ?)',(count-250000,))",
@@ -1162,7 +1180,7 @@ function projectInventoryScript() {
     " except (OSError,sqlite3.Error): pass",
     " finally: db.close()",
     "report_progress(force=True)",
-    "print(json.dumps({'files':found,'unverifiedFiles':unverified,'hashedFiles':hashed,'reusedFiles':reused,'cacheRows':len(cache)},separators=(',',':')))",
+    "print(json.dumps({'files':found,'unverifiedFiles':unverified,'hashedFiles':hashed,'reusedFiles':reused,'cacheRows':len(cache),'cacheStatus':cache_status},separators=(',',':')))",
   ].join("\n");
 }
 
@@ -1309,7 +1327,7 @@ function hashQuiescenceHelpers() {
     "def hash_progress(force=False):",
     " now=time.monotonic()",
     " if force or now-hash_stats.get('progressAt',0)>=0.25:",
-    "  sys.stderr.write('SIMPLE_PROGRESS '+json.dumps({'phase':'hashing','processedBytes':hash_stats.get('processedBytes',0),'processedFiles':hash_stats.get('processedFiles',0)})+chr(10)); sys.stderr.flush(); hash_stats['progressAt']=now",
+    "  sys.stderr.write('SIMPLE_PROGRESS '+json.dumps({'phase':'hashing','processedBytes':hash_stats.get('processedBytes',0),'processedFiles':hash_stats.get('processedFiles',0),'cacheHits':cache_hits,'cacheRehash':cache_rehash,'cacheStatus':cache_status})+chr(10)); sys.stderr.flush(); hash_stats['progressAt']=now",
     "def hash_current(full):",
     " global hash_stats",
     " hash_stats['digestReads']+=1",
@@ -1347,7 +1365,7 @@ function batchHashCacheHelpers() {
   return [
     "import sqlite3,stat as statmod",
     "cache_hits=0; cache_rehash=0; hash_stats={'digestReads':0}; cache_updates=[]; cache_queries=0",
-    "cache_root=hashlib.sha256(root.encode('utf-8')).hexdigest(); db=None; cache_ready=False",
+    "cache_root=hashlib.sha256(root.encode('utf-8')).hexdigest(); db=None; cache_ready=False; cache_status='ready'; cache_at=time.monotonic(); cache_bytes=0",
     "try:",
     " cache_dir=os.environ.get('SIMPLE_SFTP_HASH_CACHE_DIR') or os.path.join(os.path.expanduser('~'),'.cache','simple-sftp')",
     " os.makedirs(cache_dir,mode=0o700,exist_ok=True)",
@@ -1358,7 +1376,7 @@ function batchHashCacheHelpers() {
     " if db is not None:",
     "  try: db.close()",
     "  except sqlite3.Error: pass",
-    " db=None; cache_ready=False",
+    " db=None; cache_ready=False; cache_status='unavailable'",
     "def open_nofollow(full):",
     " flags=os.O_RDONLY",
     " if hasattr(os,'O_NOFOLLOW'): flags|=os.O_NOFOLLOW",
@@ -1373,12 +1391,12 @@ function batchHashCacheHelpers() {
     "   db.commit()",
     " except sqlite3.Error: pass",
     "def lookup_cached(rel,full,stat):",
-    " global cache_hits,cache_queries",
+    " global cache_hits,cache_queries,cache_status,cache_ready",
     " if not cache_ready or statmod.S_ISLNK(stat.st_mode) or not statmod.S_ISREG(stat.st_mode): return None",
     " cache_queries+=1",
     " try:",
     "  row=db.execute('SELECT dev,ino,size,mtime_ns,ctime_ns,sha256 FROM hashes WHERE root=? AND path=?',(cache_root,rel)).fetchone()",
-    " except sqlite3.Error: return None",
+    " except sqlite3.Error: cache_status='read-failed'; cache_ready=False; return None",
     " if row is None: return None",
     " current=cache_identity(stat)",
     " if tuple(int(part) for part in row[:5])!=current: return None",
@@ -1395,20 +1413,25 @@ function batchHashCacheHelpers() {
     " cache_hits+=1",
     " return row[5],again.st_size",
     "def remember_hash(rel,file_identity,digest):",
-    " global cache_rehash",
+    " global cache_rehash,cache_bytes",
     " cache_rehash+=1",
-    " if cache_ready: cache_updates.append((cache_root,rel,*file_identity,digest))",
-    "def flush_hash_cache():",
+    " if cache_ready: cache_updates.append((cache_root,rel,*file_identity,digest)); cache_bytes+=file_identity[2]; flush_hash_cache(False)",
+    "def flush_hash_cache(final=True):",
+    " global cache_at,cache_bytes,cache_status,cache_ready,db",
     " if db is None: return",
+    " if not final and len(cache_updates)<32 and cache_bytes<67108864 and time.monotonic()-cache_at<1: return",
     " try:",
     "  if cache_updates:",
     "   db.executemany('INSERT INTO hashes (root,path,dev,ino,size,mtime_ns,ctime_ns,sha256) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(root,path) DO UPDATE SET dev=excluded.dev,ino=excluded.ino,size=excluded.size,mtime_ns=excluded.mtime_ns,ctime_ns=excluded.ctime_ns,sha256=excluded.sha256',cache_updates)",
     "   db.commit()",
-    "  trim_hash_cache()",
-    " except (OSError,sqlite3.Error): pass",
+    "  cache_updates.clear(); cache_bytes=0; cache_at=time.monotonic()",
+    "  if final: trim_hash_cache()",
+    " except (OSError,sqlite3.Error): cache_status='write-failed'; cache_ready=False; final=True; cache_updates.clear()",
     " finally:",
-    "  try: db.close()",
-    "  except sqlite3.Error: pass",
+    "  if final:",
+    "   try: db.close()",
+    "   except sqlite3.Error: pass",
+    "   db=None",
   ];
 }
 
@@ -1439,10 +1462,10 @@ function batchFileHashScript() {
     "  remember_hash(rel,hashed[2],hashed[0])",
     "  found[rel]={'sha256':hashed[0],'size':hashed[1]}",
     " hash_stats['processedFiles']=len(found); hash_progress()",
-    "hash_progress(True)",
     "flush_hash_cache()",
+    "hash_progress(True)",
     "if unstable: raise ValueError('file changed during batch sync: '+', '.join(unstable))",
-    "print(json.dumps({'files':found,'cacheHits':cache_hits,'cacheRehash':cache_rehash,'digestReads':hash_stats['digestReads'],'cacheQueries':cache_queries},separators=(',',':')))",
+    "print(json.dumps({'files':found,'cacheHits':cache_hits,'cacheRehash':cache_rehash,'cacheStatus':cache_status,'digestReads':hash_stats['digestReads'],'cacheQueries':cache_queries},separators=(',',':')))",
   ].join("\n");
 }
 
@@ -1477,10 +1500,10 @@ function scopeInventoryScript() {
     "  remember_hash(relpath,hashed[2],hashed[0])",
     "  found[relpath]={'sha256':hashed[0],'size':hashed[1]}",
     " hash_stats['processedFiles']=len(found); hash_progress()",
-    "hash_progress(True)",
     "flush_hash_cache()",
+    "hash_progress(True)",
     "if unstable: raise ValueError('file changed during Plan sync: '+', '.join(unstable))",
-    "print(json.dumps({'files':found,'cacheHits':cache_hits,'cacheRehash':cache_rehash,'digestReads':hash_stats['digestReads'],'cacheQueries':cache_queries},separators=(',',':')))",
+    "print(json.dumps({'files':found,'cacheHits':cache_hits,'cacheRehash':cache_rehash,'cacheStatus':cache_status,'digestReads':hash_stats['digestReads'],'cacheQueries':cache_queries},separators=(',',':')))",
   ].join("\n");
 }
 
@@ -1493,6 +1516,7 @@ function batchHashPayload(parsed, expectedCount) {
     cacheRehash: Number(parsed.cacheRehash) || 0,
     digestReads: Number(parsed.digestReads) || 0,
     cacheQueries: Number(parsed.cacheQueries) || 0,
+    cacheStatus: parsed.cacheStatus,
   };
 }
 
@@ -1504,6 +1528,7 @@ function scopeHashPayload(parsed) {
     cacheRehash: Number(parsed.cacheRehash) || 0,
     digestReads: Number(parsed.digestReads) || 0,
     cacheQueries: Number(parsed.cacheQueries) || 0,
+    cacheStatus: parsed.cacheStatus,
   };
 }
 
@@ -1885,11 +1910,15 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   const digest = (entry) => typeof entry === "string" ? entry : entry && entry.sha256;
   const fileSizes = Object.fromEntries(paths.map((name) => [name, Number(sourceHashes[name]?.size) || 0]));
   const changed = paths.filter((name) => digest(sourceHashes[name]) !== digest(destinationHashes[name]));
+  const missingFiles = changed.filter(name => !digest(destinationHashes[name])).length;
+  const differentFiles = changed.length - missingFiles;
+  const unchangedFiles = paths.length - changed.length;
   const transferController = transferContext.getStore();
   if (transferController) {
     transferController.totalBytes = changed.reduce((sum, name) => sum + fileSizes[name], 0);
     transferController.comparedFiles = paths.length;
     transferController.changedFiles = changed.length;
+    Object.assign(transferController, { missingFiles, differentFiles, unchangedFiles });
     transferController.updateProgress({ phase: "preparing", scope: transferController.id, processedFiles: 0,
       completedFiles: 0, totalFiles: changed.length, completedGroups: 0 });
   }
@@ -1902,7 +1931,7 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   const planned = partitionTransferPaths(changed, options.singleStream === true ? Math.max(changed.length, 1) : 80,
     FPSYNC_PARALLEL_STREAMS, fileSizes, FPSYNC_MAX_BATCH_BYTES);
   progress.report({ message: changed.length
-    ? "清单完成（" + inventoryMs + " ms）；采用" + (compression === "none" ? "无压缩" : compression === "zstd" ? "zstd 压缩" : "gzip 压缩") + "流处理 " + changed.length + "/" + paths.length + " 个文件，共 " + planned.length + " 组"
+    ? "清单完成（" + inventoryMs + " ms）；跳过相同 " + unchangedFiles + "，目标缺失 " + missingFiles + "，内容不同 " + differentFiles + "；采用" + (compression === "none" ? "无压缩" : compression === "zstd" ? "zstd 压缩" : "gzip 压缩") + "流处理 " + changed.length + "/" + paths.length + " 个文件，共 " + planned.length + " 组"
     : `清单完成（${inventoryMs} ms）；${paths.length} 个文件均无需传输，准备校验…` });
   const streamStartedAt = Date.now();
   const partitions = await transferPartitionedTar(source, destination, changed, timeoutMs, (event) => {
@@ -1945,7 +1974,7 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   advance(100, `完成：传输 ${changed.length}/${paths.length} 个文件，SHA256 校验通过 · 清单 ${timing.inventoryMs} ms · 流处理 ${timing.streamMs} ms · 校验 ${timing.verifyMs} ms`);
   return { ok: true, paths: paths.length, transferredFiles: changed.length, partitions,
     verification: "sha256", transport: "partitioned-tar", compression, singleStream: options.singleStream === true,
-    directory, relativePath, timing, hashCache, compressionDecision, wireBytes };
+    directory, relativePath, timing, hashCache, compressionDecision, wireBytes, missingFiles, differentFiles, unchangedFiles };
   } finally { notification?.dispose?.(); }
 }
 
@@ -3416,6 +3445,8 @@ function createTransferController({ id, operation, localPath, remotePath, host }
     controller.progressScope = evidence.scope || id;
     if (evidence.processedBytes !== undefined) controller.processedBytes = evidence.processedBytes;
     if (evidence.processedFiles !== undefined) controller.processedFiles = evidence.processedFiles;
+    for (const key of ["cacheHits", "cacheRehash"]) controller[key] = Number.isSafeInteger(evidence[key]) && evidence[key] >= 0 ? evidence[key] : undefined;
+    controller.cacheStatus = ["ready", "unavailable", "read-failed", "write-failed"].includes(evidence.cacheStatus) ? evidence.cacheStatus : undefined;
     for (const key of ["completedFiles", "totalFiles", "completedGroups", "totalGroups"]) {
       if (Number.isSafeInteger(evidence[key]) && evidence[key] >= 0)
         controller[key] = Math.max(controller[key] || 0, evidence[key]);
@@ -3425,6 +3456,8 @@ function createTransferController({ id, operation, localPath, remotePath, host }
       lastEventAt = Date.now();
       const snapshot = { id, operationId: controller.operationId, phase: controller.phase, processedBytes: controller.processedBytes,
         transferredBytes, totalBytes: controller.totalBytes, comparedFiles: controller.comparedFiles, changedFiles: controller.changedFiles,
+        missingFiles: controller.missingFiles, differentFiles: controller.differentFiles, unchangedFiles: controller.unchangedFiles,
+        cacheHits: controller.cacheHits, cacheRehash: controller.cacheRehash, cacheStatus: controller.cacheStatus,
         progressScope: controller.progressScope, processedFiles: controller.processedFiles,
         completedFiles: controller.completedFiles, totalFiles: controller.totalFiles,
         completedGroups: controller.completedGroups, totalGroups: controller.totalGroups,
@@ -3443,7 +3476,7 @@ function createTransferController({ id, operation, localPath, remotePath, host }
 }
 
 function listActiveTransfers() {
-  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status, totalBytes, transferredBytes, operationId, phase, processedFiles, processedBytes, progressScope, lastProgressAt, comparedFiles, changedFiles, completedFiles, totalFiles, completedGroups, totalGroups }) => ({
+  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status, totalBytes, transferredBytes, operationId, phase, processedFiles, processedBytes, progressScope, lastProgressAt, comparedFiles, changedFiles, completedFiles, totalFiles, completedGroups, totalGroups, missingFiles, differentFiles, unchangedFiles, cacheHits, cacheRehash, cacheStatus }) => ({
     id,
     operation,
     localPath,
@@ -3456,6 +3489,7 @@ function listActiveTransfers() {
     operationId, phase, processedFiles, lastProgressAt,
     processedBytes, progressScope, comparedFiles, changedFiles,
     completedFiles, totalFiles, completedGroups, totalGroups,
+    missingFiles, differentFiles, unchangedFiles, cacheHits, cacheRehash, cacheStatus,
   }));
 }
 
@@ -4643,10 +4677,11 @@ function watchTransferProcess(child, onIdle, fileStep = true, filenames = [], re
         const item = JSON.parse(line.slice(16));
         if (!["preparing", "hashing", "packing", "transferring", "unpacking", "verifying", "publishing", "distributing"].includes(item.phase)) continue;
         const evidence = { phase: item.phase };
-        const keys = ["processedBytes", "processedFiles"];
+        const keys = ["processedBytes", "processedFiles", "cacheHits", "cacheRehash"];
         if (keys.some(key => item[key] !== undefined && (!Number.isSafeInteger(item[key]) || item[key] < 0))) continue;
         for (const key of keys) if (item[key] !== undefined) evidence[key] = item[key];
-        if (keys.some(key => evidence[key] !== undefined)) update(evidence);
+        if (["ready", "unavailable", "read-failed", "write-failed"].includes(item.cacheStatus)) evidence.cacheStatus = item.cacheStatus;
+        if (["processedBytes", "processedFiles"].some(key => evidence[key] !== undefined)) update(evidence);
       } catch {}
     }
     if (buffer.length > 16384) buffer = buffer.slice(-16384);

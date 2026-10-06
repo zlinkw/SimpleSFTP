@@ -33,7 +33,7 @@ test('delta stream transfers changed content only and reports compared versus ch
   const start = source.indexOf('async function syncServerToServerFpsyncCore('), end = source.indexOf('async function syncFromRemoteCore(', start);
   assert.ok(start >= 0 && end > start);
   const paths = Array.from({ length: 6 }, (_, i) => `work_dirs/p/${i}.csv`);
-  const files = Object.fromEntries(paths.map(name => [name, { sha256: 'a'.repeat(64), size: 10 }]));
+  const files = Object.fromEntries(paths.map(name => [name, { sha256: 'a'.repeat(64), size: 10, modifiedAtMs: 2000 }]));
   let dispatched, transferred = false;
   const updates = [];
   const controller = { id: 'one', updateProgress(row) { updates.push(row); } };
@@ -43,10 +43,11 @@ test('delta stream transfers changed content only and reports compared versus ch
     selectTransferCompression: async () => ({ compression: 'none' }), FPSYNC_PARALLEL_STREAMS: 2, FPSYNC_MAX_BATCH_BYTES: 512 * 1024 * 1024,
     partitionTransferPaths: __test.partitionTransferPaths, compressionHistory: { key() {}, record() {} },
     inspectRemoteBatchFiles: async target => ({ files: target.host === 'source' || transferred ? files : {
-      ...files, [paths[4]]: { sha256: 'b'.repeat(64), size: 10 }, [paths[5]]: undefined,
+      ...Object.fromEntries(paths.map(name => [name, { ...files[name], modifiedAtMs: 1000 }])), [paths[4]]: { sha256: 'b'.repeat(64), size: 10 }, [paths[5]]: undefined,
     }, cacheHits: 0, cacheRehash: 0, digestReads: 0, cacheQueries: 0 }),
     transferPartitionedTar: async (_source, _destination, changed, _timeout, report) => {
       dispatched = [...changed];
+      if (!changed.length) return 0;
       report({ phase: 'start', index: 1, total: 2, groupFiles: 1, completed: 0, completedFiles: 0, totalFiles: 2 });
       report({ phase: 'done', index: 1, total: 2, groupFiles: 1, completed: 1, completedFiles: 1, totalFiles: 2 });
       report({ phase: 'start', index: 2, total: 2, groupFiles: 1, completed: 1, completedFiles: 1, totalFiles: 2 });
@@ -61,10 +62,17 @@ test('delta stream transfers changed content only and reports compared versus ch
     relativePaths: paths }, { report() {} });
   assert.deepEqual(dispatched, paths.slice(4)); assert.equal(result.paths, 6); assert.equal(result.transferredFiles, 2);
   assert.equal(controller.comparedFiles, 6); assert.equal(controller.changedFiles, 2); assert.equal(controller.totalBytes, 20);
+  assert.equal(controller.unchangedFiles, 4); assert.equal(controller.missingFiles, 1); assert.equal(controller.differentFiles, 1);
+  assert.equal(result.unchangedFiles, 4); assert.equal(result.missingFiles, 1); assert.equal(result.differentFiles, 1);
   assert.ok(updates.some(row => row.completedFiles === 1 && row.totalFiles === 2));
   assert.equal(updates.at(-1).completedFiles, 2);
   assert.equal(updates.at(-1).completedGroups, 2);
   assert.equal(updates.at(-1).totalGroups, 2);
+  const repeated = await sandbox.run({ apiMode: true, compression: 'none', singleStream: true, confirm: true, pathConfirmed: true,
+    source: { host: 'source', port: 22, remotePath: '/project' }, destination: { host: 'destination', port: 22, remotePath: '/project' },
+    relativePaths: paths }, { report() {} });
+  assert.equal(dispatched.length,0); assert.equal(repeated.transferredFiles,0);
+  assert.equal(repeated.unchangedFiles,6); assert.equal(repeated.missingFiles,0); assert.equal(repeated.differentFiles,0);
 });
 
 test("direct rsync scopes delete to one Plan directory", () => {

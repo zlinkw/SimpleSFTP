@@ -23,6 +23,109 @@ const python = process.platform === "win32" ? "python" : "python3";
 const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-hash-cache-"));
 let lastStderr = "";
 
+test("interrupted inventory retains completed hash batches instead of starting cold again", () => {
+  const root = path.join(fixtureRoot, "interrupted");
+  const names = writeTree(root, 100);
+  const cacheDir = path.join(fixtureRoot, "cache-interrupted");
+  // Deterministic process interruption after 70 inspections, using completed Futures.
+  const executor = [
+    "from concurrent.futures import Future",
+    "class InterruptedExecutor:",
+    " def __init__(self,**kwargs): self.count=0",
+    " def __enter__(self): return self",
+    " def __exit__(self,*args): pass",
+    " def invoke(self,fn,item):",
+    "  self.count+=1",
+    "  if self.count==70: os._exit(23)",
+    "  return fn(item)",
+    " def map(self,fn,items):",
+    "  for item in items: yield self.invoke(fn,item)",
+    " def submit(self,fn,item):",
+    "  future=Future(); future.set_result(self.invoke(fn,item)); return future",
+    "ThreadPoolExecutor=InterruptedExecutor",
+  ].join("\n");
+  const interrupted = __test.projectInventoryScript().replace("with ThreadPoolExecutor(max_workers=8) as pool:", `${executor}\nwith ThreadPoolExecutor(max_workers=8) as pool:`);
+  const file = path.join(fixtureRoot, "interrupted.py");
+  fs.writeFileSync(file, interrupted, "utf8");
+  const run = spawnSync(python, ["-B", "-X", "utf8", file, root, ".", "1", "null"], {
+    encoding: "utf8", timeout: 10000, windowsHide: true, env: { ...process.env, SIMPLE_SFTP_HASH_CACHE_DIR: cacheDir },
+  });
+  assert.equal(run.status, 23, run.stderr);
+  const resumed = runPython(__test.projectInventoryScript(), [root, ".", "1", "null"], { SIMPLE_SFTP_HASH_CACHE_DIR: cacheDir });
+  assert.ok(resumed.reusedFiles >= 32 && resumed.reusedFiles < 70, `reused=${resumed.reusedFiles}, hashed=${resumed.hashedFiles}`);
+  assert.equal(resumed.reusedFiles + resumed.hashedFiles, names.length);
+  assert.equal(resumed.cacheStatus, "ready");
+});
+
+test("unavailable cache is observable while exact SHA256 remains available", () => {
+  const root = path.join(fixtureRoot, "cache-unavailable");
+  writeTree(root, 2);
+  const blocker = path.join(fixtureRoot, "not-a-cache-directory");
+  fs.writeFileSync(blocker, "keep", "utf8");
+  const result = runPython(__test.projectInventoryScript(), [root, ".", "1", "null"], { SIMPLE_SFTP_HASH_CACHE_DIR: blocker });
+  assert.equal(result.hashedFiles, 2); assert.equal(result.reusedFiles, 0);
+  assert.equal(result.cacheStatus, "unavailable");
+  const progress = lastStderr.split("\n").filter(line => line.startsWith("SIMPLE_PROGRESS ")).map(line => JSON.parse(line.slice(16)));
+  assert.equal(progress.at(-1).cacheRehash, 2);
+  assert.equal(progress.at(-1).cacheStatus, "unavailable");
+});
+
+test("interrupted exact-file verification also persists completed batches", () => {
+  const root = path.join(fixtureRoot, "batch-interrupted");
+  const names = writeTree(root, 100);
+  const cacheDir = path.join(fixtureRoot, "cache-batch-interrupted");
+  const script = __test.batchFileHashScript().replace("for raw in sys.stdin.buffer.read().split", [
+    "original_remember=remember_hash",
+    "def remember_hash(*args):",
+    " original_remember(*args)",
+    " if cache_rehash==70: os._exit(23)",
+    "for raw in sys.stdin.buffer.read().split",
+  ].join("\n"));
+  const file = path.join(fixtureRoot, "batch-interrupted.py"); fs.writeFileSync(file, script, "utf8");
+  const input = Buffer.from(names.map(name => `${name}\0`).join(""), "utf8");
+  const run = spawnSync(python, ["-B", "-X", "utf8", file, root, "0.2", "0.01"], {
+    input, encoding: "utf8", timeout: 10000, windowsHide: true, env: { ...process.env, SIMPLE_SFTP_HASH_CACHE_DIR: cacheDir },
+  });
+  assert.equal(run.status, 23, run.stderr);
+  const resumed = runPython(__test.batchFileHashScript(), [root, "0.2", "0.01"], { SIMPLE_SFTP_HASH_CACHE_DIR: cacheDir }, input);
+  assert.ok(resumed.cacheHits >= 64 && resumed.cacheHits < 70);
+  assert.equal(resumed.cacheHits + resumed.cacheRehash, 100);
+});
+
+test("completed small files commit without waiting for the first slow weight", () => {
+  const root = path.join(fixtureRoot, "unordered"); writeTree(root, 100);
+  const script = ["import threading", "committed=threading.Event()", __test.projectInventoryScript()
+    .replaceAll("db.commit()", "db.commit(); committed.set()")
+    .replace("with ThreadPoolExecutor(max_workers=8) as pool:", [
+      "original_inspect=inspect",
+      "def inspect(item):",
+      " if item[0].endswith('f000.bin'):",
+      "  early=committed.wait(0.5)",
+      "  sys.stderr.write('CACHE_WHILE_WEIGHT_PENDING '+str(early)+chr(10))",
+      " return original_inspect(item)",
+      "with ThreadPoolExecutor(max_workers=8) as pool:",
+    ].join("\n"))].join("\n");
+  const result = runPython(script, [root, ".", "1", "null"], { SIMPLE_SFTP_HASH_CACHE_DIR: path.join(fixtureRoot, "cache-unordered") });
+  assert.equal(result.hashedFiles, 100); assert.match(lastStderr, /CACHE_WHILE_WEIGHT_PENDING True/);
+});
+
+test("failed cache writes are reported and do not change verified file hashes", () => {
+  const root = path.join(fixtureRoot, "cache-write-failure"); writeTree(root, 40);
+  const script = [
+    "import sqlite3",
+    "real_connect=sqlite3.connect",
+    "class FailedWrites:",
+    " def __init__(self,db): self.db=db",
+    " def __getattr__(self,name): return getattr(self.db,name)",
+    " def executemany(self,*args): raise sqlite3.OperationalError('disk full')",
+    "sqlite3.connect=lambda *args,**kwargs: FailedWrites(real_connect(*args,**kwargs))",
+    __test.projectInventoryScript(),
+  ].join("\n");
+  const result = runPython(script, [root, ".", "1", "null"], { SIMPLE_SFTP_HASH_CACHE_DIR: path.join(fixtureRoot, "cache-write-failure-db") });
+  assert.equal(result.hashedFiles, 40); assert.equal(result.cacheStatus, 'write-failed');
+  assert.equal(result.files['batch/f000.bin'].sha256, crypto.createHash('sha256').update('payload-0').digest('hex'));
+});
+
 function runPython(script, args, env, stdin) {
   const file = path.join(fixtureRoot, `run-${process.hrtime.bigint().toString()}.py`);
   fs.writeFileSync(file, script, "utf8");

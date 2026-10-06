@@ -46,6 +46,20 @@ test('parallel wire scopes aggregate once, hash bytes never inflate network tota
   subscription.dispose();c.dispose();
 });
 
+test('hash diagnostics stay scoped while difference counts survive stream phase changes', () => {
+  const f = fixture(); const c = f.create({id:'diagnostics',operation:'sync.serverToServerFpsync'});
+  try {
+    Object.assign(c, {unchangedFiles:4,missingFiles:1,differentFiles:1});
+    c.updateProgress({phase:'hashing',scope:'source',processedFiles:6,cacheHits:5,cacheRehash:1,cacheStatus:'ready'});
+    assert.equal(f.list()[0].cacheHits,5); assert.equal(f.events.at(-1).data.cacheStatus,'ready');
+    c.updateProgress({phase:'hashing',scope:'destination',processedFiles:3,cacheHits:0,cacheRehash:3,cacheStatus:'write-failed'});
+    assert.equal(f.list()[0].cacheHits,0); assert.equal(f.list()[0].cacheRehash,3);
+    c.updateProgress({phase:'unpacking',processedBytes:100});
+    assert.equal(f.list()[0].cacheHits,undefined); assert.equal(f.events.at(-1).data.cacheStatus,undefined);
+    assert.equal(f.list()[0].unchangedFiles,4); assert.equal(f.list()[0].missingFiles,1); assert.equal(f.list()[0].differentFiles,1);
+  } finally { c.dispose(); }
+});
+
 test('committed file progress survives parallel stage resets and is exposed to SSE and polling',()=>{
   const f=fixture();const c=f.create({id:'sync',operation:'sync.serverToServerFpsync'});
   try {

@@ -51,6 +51,16 @@ test('wire scopes distinguish parallel streams while sharing one relay identity'
   assert.equal(f.updates.at(-1).metric, 'wire');
   f.child.emit('close');
 });
+
+test('hash cache telemetry travels with real progress but cannot become wire bytes or keepalive', () => {
+  const f = fixture({ stdoutBytesArePayload: false });
+  f.child.stderr.write('SIMPLE_PROGRESS {"phase":"hashing","cacheHits":50,"cacheRehash":2,"cacheStatus":"ready"}\n');
+  assert.equal(f.updates.length, 0);
+  f.child.stderr.write('SIMPLE_PROGRESS {"phase":"hashing","processedFiles":52,"processedBytes":4096,"cacheHits":50,"cacheRehash":2,"cacheStatus":"ready"}\n');
+  assert.equal(f.updates.at(-1).cacheHits, 50); assert.equal(f.updates.at(-1).cacheRehash, 2);
+  assert.equal(f.updates.at(-1).cacheStatus, 'ready'); assert.equal(f.updates.at(-1).metric, undefined);
+  f.child.emit('close');
+});
 test('control response bytes and malformed progress cannot masquerade as transfer work', () => {
   const f = fixture({}, [], false);
   f.monitor.receive(Buffer.alloc(400));
