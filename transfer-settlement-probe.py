@@ -15,6 +15,8 @@ import zlib
 
 MAX_PIDS = 8192
 MAX_COMMAND = 262144
+MAX_FDS = 1024
+MAX_FD_CHECKS = 4096
 TRANSFER_NAMES = {"tar", "ssh", "scp", "sftp", "sftp-server", "rsync", "gzip", "pigz", "zstd", "fpart", "fpsync"}
 RECEIVER_LOADER = "import base64,zlib,sys; code=zlib.decompress(base64.b64decode(sys.argv[1])); sys.argv=sys.argv[1:]; exec(compile(code,'simple_sftp_staged_receive','exec'))"
 
@@ -115,6 +117,70 @@ def read_bounded(path, limit):
     return value
 
 
+def descriptor_identity(directory, entry):
+    descriptor = directory + "/fd/" + entry
+    link = os.readlink(descriptor)
+    if len(link) > 4096:
+        raise RuntimeError("PROCESS_DESCRIPTOR_LIMIT")
+    value = read_bounded(directory + "/fdinfo/" + entry, 16384)
+    fields = {}
+    for line in value.splitlines():
+        key, separator, content = line.partition(b":")
+        if separator and key in (b"flags", b"ino", b"mnt_id"):
+            if key in fields:
+                raise RuntimeError("PROCESS_DESCRIPTOR_UNAVAILABLE")
+            fields[key] = content.strip()
+    try:
+        flags = int(fields[b"flags"], 8)
+        inode = int(fields[b"ino"])
+        mount = int(fields[b"mnt_id"])
+    except (KeyError, ValueError):
+        raise RuntimeError("PROCESS_DESCRIPTOR_UNAVAILABLE")
+    if flags < 0 or flags & os.O_ACCMODE not in (os.O_RDONLY, os.O_WRONLY, os.O_RDWR) or inode < 0 or mount < 0:
+        raise RuntimeError("PROCESS_DESCRIPTOR_UNAVAILABLE")
+    info = os.stat(descriptor)
+    if info.st_ino != inode:
+        raise RuntimeError("PROCESS_DESCRIPTOR_CHANGED")
+    return (link, flags, inode, mount, info.st_mode, info.st_nlink)
+
+
+def sftp_file_scope(directory, args, root, budget):
+    """An independent SFTP session is not a tar/staged-protocol participant.
+
+    Check the kernel executable and current handles instead of declaring that
+    every persistent SFTP subsystem is an abandoned writer. This is a bounded
+    observation, not proof that an external client can never issue a new write.
+    Actual target writers and unavailable/changing evidence remain guarded.
+    """
+    if not args or posixpath.basename(args[0]) != "sftp-server" or posixpath.basename(os.readlink(directory + "/exe")) != "sftp-server":
+        return None
+    entries = os.listdir(directory + "/fd")
+    if len(entries) > MAX_FDS or len(entries) > budget[0]:
+        raise RuntimeError("PROCESS_DESCRIPTOR_LIMIT")
+    if any(not entry.isdigit() for entry in entries):
+        raise RuntimeError("PROCESS_DESCRIPTOR_UNAVAILABLE")
+    budget[0] -= len(entries)
+    for entry in entries:
+        before = descriptor_identity(directory, entry)
+        after = descriptor_identity(directory, entry)
+        if before != after:
+            raise RuntimeError("PROCESS_DESCRIPTOR_CHANGED")
+        link, flags, _, _, mode, links = after
+        if not stat.S_ISREG(mode) or flags & os.O_ACCMODE == os.O_RDONLY:
+            continue
+        if links == 0 and link.endswith(" (deleted)"):
+            link = link[:-10]
+        if not link.startswith("/") or posixpath.normpath(link) != link:
+            raise RuntimeError("PROCESS_DESCRIPTOR_UNAVAILABLE")
+        if roots_overlap(link, root):
+            return "target-root"
+        if links > 1:
+            raise RuntimeError("PROCESS_DESCRIPTOR_UNAVAILABLE")  # Alias may also be in the target tree.
+    if set(os.listdir(directory + "/fd")) != set(entries):
+        raise RuntimeError("PROCESS_DESCRIPTOR_CHANGED")
+    return "unrelated"
+
+
 def ancestors():
     excluded, pid = set(), os.getpid()
     for _ in range(64):
@@ -135,7 +201,7 @@ def process_census(root, receiver_hash=""):
     entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
     if len(entries) > MAX_PIDS:
         raise RuntimeError("PROCESS_CENSUS_LIMIT")
-    inspected = 0
+    inspected, fd_budget = 0, [MAX_FD_CHECKS]
     for entry in entries:
         pid = int(entry)
         if pid in excluded:
@@ -173,6 +239,16 @@ def process_census(root, receiver_hash=""):
             continue
         if executable == "ssh" and ssh_forward_only(args):
             continue
+        if name == "sftp-server" and not marked and state == "S":
+            # D/T and unknown executables cannot be treated as an idle session.
+            scope = sftp_file_scope(directory, args, root, fd_budget)
+            final_identity = process_identity(directory)
+            if final_identity[1] != before[1]:
+                raise RuntimeError("PROCESS_IDENTITY_CHANGED")
+            if scope == "unrelated" and final_identity[0] == "S":
+                continue
+            if scope == "target-root":
+                raise ActiveTransfer(pid, name, final_identity[0], scope)
         scoped_root = receiver_root(args, receiver_hash)
         if scoped_root and not roots_overlap(scoped_root, root):
             continue

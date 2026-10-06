@@ -98,6 +98,16 @@ test("untrusted blocker fields cannot enter diagnostics and never count as exit 
   assert.doesNotMatch(receipt.reason, /secret/);
 });
 
+test("an SFTP session with a target write handle still denies replay with only bounded process identity", async () => {
+  const f = fixture({ processBlocker: { pid: 345, name: "sftp-server", state: "S", scope: "target-root", path: "/project/private.csv" } });
+  const receipt = await f.reconcile();
+  assert.equal(receipt.settled, false);
+  assert.deepEqual(receipt.blocker, { role: "destination", pid: 345, name: "sftp-server", state: "S", scope: "target-root" });
+  assert.doesNotMatch(JSON.stringify(receipt), /private\.csv/);
+  await assert.rejects(__test.beginTransferOperation("new-op", "456:new", true, key), /未确认的旧请求/);
+  assert.equal((await __test.listTransferOperationState()).settledOperations.length, 0);
+});
+
 test("live same-instance request with no child count is not proof of exit", async () => {
   const f = fixture();
   await __test.beginTransferOperation("live-op", "456:new", true, "c".repeat(64));

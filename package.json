@@ -2,7 +2,7 @@
 	"name": "simple-sftp",
 	"displayName": "SimpleSFTP",
 	"description": "为远端项目创建本地 SFTP 同步工作区，并提供批量文件上传下载与进度反馈。",
-	"version": "0.2.51",
+	"version": "0.2.52",
 	"publisher": "simple-local",
 	"extensionKind": [
 		"ui"

@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import shlex
+import stat
 import sys
 import types
 import unittest
@@ -101,25 +102,54 @@ class ProbeSafety(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 probe.process_census("/projects/example")
 
-    def scoped_census(self, command, name="python3", state="S", identity_changed=False):
-        reads = 0
+    def scoped_census(self, command, name="python3", state="S", identity_changed=False, descriptors=None, executable=None,
+                      denied=False, unstable=False, descriptor_failure=None, descriptor_changed=False,
+                      final_identity_changed=False, final_state=None):
+        reads, fd_reads = 0, 0
         def read(path, _limit):
-            nonlocal reads
+            nonlocal reads, fd_reads
             if path.endswith("mountinfo"):
                 return b"proc"
             if path.endswith("/stat"):
                 reads += 1
-                start = 124 if identity_changed and reads > 1 else 123
-                return ("2 (%s) %s 1 " % (name, state) + "0 " * 17 + str(start) + " 0").encode()
+                start = 124 if (identity_changed and reads > 1) or (final_identity_changed and reads > 2) else 123
+                current_state = final_state if reads > 2 and final_state else state
+                return ("2 (%s) %s 1 " % (name, current_state) + "0 " * 17 + str(start) + " 0").encode()
             if path.endswith("cmdline"):
                 return command
             if path.endswith("comm"):
                 return name.encode()
+            if "/fdinfo/" in path:
+                fd_reads += 1
+                item = (descriptors or {})[path.rsplit("/", 1)[-1]]
+                if descriptor_failure:
+                    raise descriptor_failure
+                flags = "0" if descriptor_changed and fd_reads > 1 else item.get("flags", "02")
+                return ("pos:\t0\nflags:\t%s\nmnt_id:\t1\nino:\t%s\n" % (flags, item.get("ino", "100"))).encode()
             raise AssertionError(path)
+        fd_scans = 0
         def listdir(path):
-            return ["2"] if path == "/proc" else []
+            nonlocal fd_scans
+            if path == "/proc":
+                return ["2"]
+            if denied:
+                raise PermissionError("fd table unavailable")
+            fd_scans += 1
+            return list(descriptors or {}) + (["99"] if unstable and fd_scans > 1 else [])
+        def readlink(path):
+            if path.endswith("/exe"):
+                return executable or "/usr/lib/openssh/sftp-server"
+            return (descriptors or {})[path.rsplit("/", 1)[-1]]["path"]
+        def stat_path(path):
+            if "/fd/" in path:
+                item = (descriptors or {})[path.rsplit("/", 1)[-1]]
+                return types.SimpleNamespace(st_mode=item.get("mode", stat.S_IFREG | 0o600), st_nlink=item.get("links", 1),
+                                             st_ino=int(item.get("ino", "100")))
+            return types.SimpleNamespace(st_uid=1000)
         with patch.object(probe, "ancestors", return_value={1}), patch.object(probe.os, "getuid", return_value=1000, create=True), \
-                patch.object(probe.os, "listdir", side_effect=listdir), patch.object(probe.os, "stat", return_value=types.SimpleNamespace(st_uid=1000)), \
+                patch.object(probe.os, "O_ACCMODE", 3, create=True), \
+                patch.object(probe.os, "listdir", side_effect=listdir), patch.object(probe.os, "readlink", side_effect=readlink), \
+                patch.object(probe.os, "stat", side_effect=stat_path), \
                 patch.object(probe.os.path, "realpath", side_effect=lambda path: path), patch.object(probe, "read_bounded", side_effect=read):
             return probe.process_census("/projects/example", RECEIVER_HASH)
 
@@ -193,6 +223,64 @@ class ProbeSafety(unittest.TestCase):
         args[0] = "/usr/bin/python3.11"
         with self.assertRaisesRegex(RuntimeError, "REMOTE_TRANSFER_STILL_ACTIVE"):
             self.scoped_census("\0".join(args).encode(), "python3.11")
+
+    def test_persistent_sftp_session_without_file_handles_is_not_old_tar_transfer(self):
+        descriptors = {str(fd): {"path": "socket:[%d]" % (100 + fd), "mode": stat.S_IFSOCK} for fd in range(3)}
+        self.assertEqual(self.scoped_census(b"/usr/lib/openssh/sftp-server\0", "sftp-server", descriptors=descriptors), 1)
+
+    def test_sftp_other_project_or_read_only_target_handles_are_not_old_writers(self):
+        for item in ({"path": "/projects/example/raw.csv", "flags": "0100000"},
+                     {"path": "/projects/example-other/raw.csv", "flags": "0100002"},
+                     {"path": "/projects/other/raw.csv", "flags": "0100002"}):
+            self.assertEqual(self.scoped_census(b"/usr/lib/openssh/sftp-server\0", "sftp-server", descriptors={"3": item}), 1)
+
+    def test_sftp_target_writable_file_still_blocks_and_reports_target_scope(self):
+        for flags in ("0100001", "0100002", "02001002"):
+            with self.assertRaises(probe.ActiveTransfer) as caught:
+                self.scoped_census(b"/usr/lib/openssh/sftp-server\0", "sftp-server",
+                                   descriptors={"3": {"path": "/projects/example/raw.csv", "flags": flags}})
+            self.assertEqual(caught.exception.blocker["scope"], "target-root")
+            self.assertEqual(set(caught.exception.blocker), {"pid", "name", "state", "scope"})
+
+    def test_sftp_target_deleted_file_handle_cannot_be_mistaken_for_idle(self):
+        with self.assertRaises(probe.ActiveTransfer) as caught:
+            self.scoped_census(b"/usr/lib/openssh/sftp-server\0", "sftp-server",
+                               descriptors={"3": {"path": "/projects/example/raw.csv (deleted)", "links": 0}})
+        self.assertEqual(caught.exception.blocker["scope"], "target-root")
+
+    def test_unknown_sftp_executable_and_uninspectable_handles_stay_guarded(self):
+        for options in ({"executable": "/home/user/other-program"}, {"denied": True}, {"unstable": True},
+                        {"descriptors": {"3": {"path": "/projects/other/a", "flags": "bad"}}},
+                        {"descriptors": {"3": {"path": "/projects/other/a", "links": 2}}},
+                        {"descriptors": {"3": {"path": "/projects/other/a"}}, "descriptor_failure": FileNotFoundError()}):
+            with self.assertRaises((RuntimeError, OSError)):
+                self.scoped_census(b"/usr/lib/openssh/sftp-server\0", "sftp-server", **options)
+
+    def test_sftp_fd_table_remains_bounded_and_pid_identity_is_rechecked(self):
+        with self.assertRaises(RuntimeError):
+            self.scoped_census(b"/usr/lib/openssh/sftp-server\0", "sftp-server", descriptors={str(fd): {"path": "/other/a"} for fd in range(1025)})
+        with self.assertRaisesRegex(RuntimeError, "PROCESS_IDENTITY_CHANGED"):
+            self.scoped_census(b"/usr/lib/openssh/sftp-server\0", "sftp-server", identity_changed=True)
+
+    def test_sftp_fd_changes_and_final_process_changes_never_prove_idle(self):
+        with self.assertRaisesRegex(RuntimeError, "PROCESS_DESCRIPTOR_CHANGED"):
+            self.scoped_census(b"/usr/lib/openssh/sftp-server\0", "sftp-server", descriptor_changed=True,
+                               descriptors={"3": {"path": "/projects/other/a"}})
+        with self.assertRaisesRegex(RuntimeError, "PROCESS_IDENTITY_CHANGED"):
+            self.scoped_census(b"/usr/lib/openssh/sftp-server\0", "sftp-server", final_identity_changed=True)
+        with self.assertRaises(probe.ActiveTransfer):
+            self.scoped_census(b"/usr/lib/openssh/sftp-server\0", "sftp-server", final_state="R")
+
+    def test_sftp_stopped_or_uninterruptible_session_is_not_ignored(self):
+        for state in ("D", "T", "R"):
+            with self.assertRaises(probe.ActiveTransfer):
+                self.scoped_census(b"/usr/lib/openssh/sftp-server\0", "sftp-server", state=state)
+
+    def test_sftp_descriptor_budget_is_shared_across_sessions(self):
+        args = ["/usr/lib/openssh/sftp-server"]
+        with patch.object(probe.os, "readlink", return_value=args[0]), patch.object(probe.os, "listdir", return_value=["0", "1"]):
+            with self.assertRaisesRegex(RuntimeError, "PROCESS_DESCRIPTOR_LIMIT"):
+                probe.sftp_file_scope("/proc/2", args, "/projects/example", [1])
 
 
 if __name__ == "__main__":
