@@ -52,6 +52,26 @@ test("interactive upload retains the cancellable progress notification", async (
   assert.equal(runner.progressCalls, 1);
 });
 
+test('disconnected read removes its capacity ticket without touching the active transfer', async () => {
+  const { TransferCapacity } = require('../transfer-capacity');
+  const pool = new TransferCapacity(), controller = new AbortController();
+  let release, started = false;
+  const active = pool.run(['worker:22'], undefined, () => new Promise(resolve => { release = resolve; }));
+  const start = source.indexOf('async function withTransferCapacity('), end = source.indexOf('module.exports =', start);
+  assert.ok(start >= 0 && end > start);
+  const sandbox = { AbortController, Error, String, transferContext: { getStore: () => undefined },
+    currentApiRequestContext: () => ({ readOnly: true, signal: controller.signal }),
+    transferCapacity: pool, normalizeSshPort: (_port, fallback) => fallback, waitLocalTransferResources: async () => {} };
+  vm.createContext(sandbox);
+  vm.runInContext(source.slice(start, end) + '\nthis.capacity = withTransferCapacity;', sandbox);
+  const queued = sandbox.capacity({ source: { host: 'worker' } }, () => { started = true; });
+  assert.equal(pool.pending.length, 1);
+  controller.abort(Error('reader disconnected'));
+  await assert.rejects(queued, /reader disconnected/);
+  assert.equal(started, false); assert.equal(pool.pending.length, 0); assert.equal(pool.active, 1);
+  release(); await active; assert.equal(pool.active, 0);
+});
+
 test("SSH spawn errors settle uploads even if killing the child throws", async () => {
   const uploadStart = source.indexOf("function runLocalTarUpload(");
   const uploadEnd = source.indexOf("function createRemoteExtractCommand(", uploadStart);

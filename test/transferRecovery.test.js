@@ -36,6 +36,7 @@ function fixture(options = {}) {
     if (options.processBlocker && target.host === "dest-host") return JSON.stringify({ idle: false, reason: "REMOTE_TRANSFER_STILL_ACTIVE",
       blocker: options.processBlocker });
     if (options.malformedProof) return JSON.stringify({ idle: true, root: target.remotePath });
+    if (options.externalProof) return JSON.stringify({ idle: true, root: target.remotePath, inspectedProcesses: 3, inspectedLocks: 1, ...options.externalProof });
     return JSON.stringify({ idle: true, root: target.remotePath, inspectedProcesses: 3, inspectedLocks: 1 });
   });
   const reconcile = (overrides = {}) => __test.createLocalApiMethods()["transfers.reconcile"]({ operationId: "legacy-op", operationInstanceId: "123:old",
@@ -77,6 +78,20 @@ test("changed host, original instance, or unsupported method cannot unlock legac
   assert.equal((await f.reconcile({ retryParams: { ...params, destination: { ...params.destination, host: "other-host" } } })).status, "identityMismatch");
   assert.equal((await f.reconcile({ retryMethod: "sync.deletePath" })).settled, false);
   assert.deepEqual(f.order, []);
+});
+
+test('explicit tar exit proof preserves bounded unobserved external SFTP evidence without argv', async () => {
+  const f = fixture({ externalProof: { protocol: 'staged-tar-v1', unobservedExternalSessions: [
+    { pid: 345, name: 'sftp-server', scope: 'external-session-uninspectable', argv: 'secret' },
+  ] } });
+  assert.equal((await f.reconcile()).settled, true);
+  const proof = f.values.get(ledgerKey)[0].recovery.proofs[0];
+  assert.deepEqual(proof.unobservedExternalSessions, [{ pid: 345, name: 'sftp-server', scope: 'external-session-uninspectable' }]);
+  assert.doesNotMatch(JSON.stringify(proof), /secret|argv/);
+  const invalid = fixture({ externalProof: { protocol: 'unknown', unobservedExternalSessions: [
+    { pid: 345, name: 'sftp-server', scope: 'external-session-uninspectable' },
+  ] } });
+  assert.equal((await invalid.reconcile()).settled, false);
 });
 
 test("a real active remote process reports bounded endpoint identity without unlocking or exposing argv", async () => {

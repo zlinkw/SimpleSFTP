@@ -1781,18 +1781,20 @@ function fpsyncProgressTitle(options = {}) {
 }
 
 async function syncServerToServerFpsync(options = {}) {
+  const execute = (progress) => withTransferCapacity(options, () => syncServerToServerFpsyncCore(options, progress));
+  if (options.apiMode) return execute({ report() {} });
   return vscode.window.withProgress({
     location: vscode.ProgressLocation.Notification,
     title: fpsyncProgressTitle(options),
     cancellable: false,
-  }, (progress) => withTransferCapacity(options, () => syncServerToServerFpsyncCore(options, progress)));
+  }, execute);
 }
 
 async function syncServerToServerFpsyncCore(options = {}, progress) {
   const notifyStartedAt = Date.now();
-  const phaseLabels = { preparing: "准备清单", hashing: "SHA256 校验", packing: "打包", transferring: "网络传输",
-    unpacking: "解包", verifying: "内容复核", publishing: "发布文件", distributing: "本地分发" };
-  const notification = transferContext.getStore()?.onProgress?.((snapshot) => {
+  const phaseLabels = { preparing: "准备清单", hashing: "SHA256 校验", packing: "流处理（打包、传输与解包）", transferring: "流处理（打包、传输与解包）",
+    unpacking: "流处理（打包、传输与解包）", verifying: "内容复核", publishing: "发布文件", distributing: "本地分发" };
+  const notification = options.apiMode ? undefined : transferContext.getStore()?.onProgress?.((snapshot) => {
     const label = phaseLabels[snapshot.phase] || "处理文件";
     const bytes = Number(snapshot.phase === "transferring" ? snapshot.transferredBytes : snapshot.processedBytes) || 0;
     progress.report({ message: `${label} · ${snapshot.processedFiles || 0} 个文件 · ${Math.round(bytes / 1024)} KiB${snapshot.phase === "transferring" ? " 实际流字节" : " 已处理"} · 已耗时 ${Math.floor((Date.now() - notifyStartedAt) / 1000)} 秒` });
@@ -1844,7 +1846,12 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   const fileSizes = Object.fromEntries(paths.map((name) => [name, Number(sourceHashes[name]?.size) || 0]));
   const changed = paths.filter((name) => digest(sourceHashes[name]) !== digest(destinationHashes[name]));
   const transferController = transferContext.getStore();
-  if (transferController) transferController.totalBytes = changed.reduce((sum, name) => sum + fileSizes[name], 0);
+  if (transferController) {
+    transferController.totalBytes = changed.reduce((sum, name) => sum + fileSizes[name], 0);
+    transferController.comparedFiles = paths.length;
+    transferController.changedFiles = changed.length;
+    transferController.updateProgress({ phase: "preparing", scope: transferController.id, processedFiles: 0 });
+  }
   const compressionDecision = changed.length
     ? await selectTransferCompression({ ...options, compression: requestedCompression }, source, destination, changed, fileSizes)
     : { compression: requestedCompression === "none" ? "none" : requestedCompression === "zstd" ? "zstd" : "gzip", reason: "no-changed-files", sampleBytes: 0 };
@@ -3367,7 +3374,8 @@ function createTransferController({ id, operation, localPath, remotePath, host }
     if (phaseChanged || Date.now() - lastEventAt >= 200 || evidence.status) {
       lastEventAt = Date.now();
       const snapshot = { id, operationId: controller.operationId, phase: controller.phase, processedBytes: controller.processedBytes,
-        transferredBytes, totalBytes: controller.totalBytes, progressScope: controller.progressScope, processedFiles: controller.processedFiles,
+        transferredBytes, totalBytes: controller.totalBytes, comparedFiles: controller.comparedFiles, changedFiles: controller.changedFiles,
+        progressScope: controller.progressScope, processedFiles: controller.processedFiles,
         lastProgressAt: controller.lastProgressAt, status: controller.status };
       localApiServer?.publish({ type: "transfer_progress", data: snapshot });
       for (const listener of progressListeners) { try { listener(snapshot); } catch {} }
@@ -3383,7 +3391,7 @@ function createTransferController({ id, operation, localPath, remotePath, host }
 }
 
 function listActiveTransfers() {
-  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status, totalBytes, transferredBytes, operationId, phase, processedFiles, processedBytes, progressScope, lastProgressAt }) => ({
+  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status, totalBytes, transferredBytes, operationId, phase, processedFiles, processedBytes, progressScope, lastProgressAt, comparedFiles, changedFiles }) => ({
     id,
     operation,
     localPath,
@@ -3394,7 +3402,7 @@ function listActiveTransfers() {
     totalBytes,
     transferredBytes,
     operationId, phase, processedFiles, lastProgressAt,
-    processedBytes, progressScope,
+    processedBytes, progressScope, comparedFiles, changedFiles,
   }));
 }
 
@@ -3652,7 +3660,13 @@ async function reconcileTransferOperationCore(params) {
       if (proof.idle !== true || proof.root !== target.remotePath || !Number.isSafeInteger(proof.inspectedProcesses)
           || proof.inspectedProcesses < 0 || proof.inspectedProcesses > 8192 || !Number.isSafeInteger(proof.inspectedLocks)
           || proof.inspectedLocks < 0 || proof.inspectedLocks > 32) throw new Error(proof.reason || "INVALID_REMOTE_EXIT_PROOF");
-      proofs.push({ inspectedProcesses: proof.inspectedProcesses, inspectedLocks: proof.inspectedLocks });
+      const external = proof.unobservedExternalSessions;
+      if (external !== undefined && (!Array.isArray(external) || external.length > 32 || external.some(item =>
+          !Number.isSafeInteger(item?.pid) || item.pid <= 0 || item.pid > 2147483647 || item.name !== "sftp-server"
+          || item.scope !== "external-session-uninspectable") || (external.length && proof.protocol !== "staged-tar-v1")))
+        throw new Error("INVALID_REMOTE_EXIT_PROOF");
+      proofs.push({ inspectedProcesses: proof.inspectedProcesses, inspectedLocks: proof.inspectedLocks,
+        ...(external?.length ? { protocol: proof.protocol, unobservedExternalSessions: external.map(({ pid, name, scope }) => ({ pid, name, scope })) } : {}) });
     }
     // The probes themselves use SSH. Check again only after both have closed.
     await localProof(row.operationInstanceId, row.operationInstanceId === currentTransferApiInstanceId());
@@ -4075,10 +4089,10 @@ function createLocalApiMethods() {
     "sync.projectFileStats": async (params = {}) => projectFileStats(params),
     "sync.projectTree": async (params = {}) => projectTree(params),
     "sync.deletePath": async (params = {}) => deleteProjectPath(params),
-    "sync.serverToServerBatch": async (params = {}) => syncServerToServerBatch(params),
-    "sync.serverToServerFpsync": async (params = {}) => syncServerToServerFpsync(params),
+    "sync.serverToServerBatch": async (params = {}) => syncServerToServerBatch({ ...params, apiMode: true }),
+    "sync.serverToServerFpsync": async (params = {}) => syncServerToServerFpsync({ ...params, apiMode: true }),
     "sync.serverToServer": async (params = {}) => {
-      const result = await syncServerToServer(params);
+      const result = await syncServerToServer({ ...params, apiMode: true });
       publishLocalApiEvent("sync.serverToServer", {
         sourceId: params.source && params.source.id,
         destinationId: params.destination && params.destination.id,
@@ -6274,6 +6288,10 @@ async function withTransferCapacity(options, work) {
   const cancelSubscription = parent?.onCancel(cancel);
   if (parent?.status === "cancelled" || options.token?.isCancellationRequested) cancel("传输已取消");
   const tokenSubscription = options.token?.onCancellationRequested?.(() => cancel("传输已取消"));
+  const readSignal = currentApiRequestContext()?.readOnly ? currentApiRequestContext().signal : undefined;
+  const cancelRead = () => abort.abort(readSignal.reason);
+  readSignal?.addEventListener("abort", cancelRead, { once: true });
+  if (readSignal?.aborted) cancelRead();
   const keys = [options.source, options.destination, options.server, options.sftp, options.target, options].filter(item => item?.host).map(item => String(item.host).toLowerCase() + ":" + normalizeSshPort(item.port, 22));
   parent?.pause();
   try {
@@ -6282,7 +6300,7 @@ async function withTransferCapacity(options, work) {
       try { return await work(); }
       finally { if (parent?.operationId) await waitLocalTransferResources(parent.operationId); }
     });
-  } finally { parent?.resume(); cancelSubscription?.dispose?.(); tokenSubscription?.dispose?.(); }
+  } finally { parent?.resume(); cancelSubscription?.dispose?.(); tokenSubscription?.dispose?.(); readSignal?.removeEventListener("abort", cancelRead); }
 }
 
 module.exports = {
@@ -6322,6 +6340,7 @@ module.exports = {
     transferPartitionedTar,
     transferChunkedServerFile,
     syncServerToServerFpsyncCore,
+    syncServerToServerFpsync,
     setRemoteBatchTransport,
     batchFileHashScript,
     scopeInventoryScript,

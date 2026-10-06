@@ -156,7 +156,9 @@ test("disposal preserves a newer discovery and consumes its own fixed writing sl
 
 test("disconnected readers cancel while writes remain owned by durable operations", async () => {
   const { EventEmitter } = require("node:events");
-  for (const [method, readOnly] of [["project.inventory", true], ["transfers.reconcile", true], ["upload.start", false]]) {
+  for (const [method, readOnly] of [["project.inventory", true], ["sync.projectInventory", true], ["sync.projectFileStats", true],
+      ["sync.projectTree", true], ["sync.planLogPaths", true], ["transfers.reconcile", true], ["upload.start", false],
+      ["sync.serverToServerFpsync", false]]) {
     let entered, release, captured;
     const ready = new Promise(resolve => { entered = resolve; });
     const server = new LocalApiServer({ methods: { [method]: async (_params, _server, context) => {

@@ -5,16 +5,55 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const vm = require('node:vm');
 const originalLoad = Module._load;
+let notificationCount = 0;
 Module._load = function (request, ...args) {
   return request === "vscode" ? {
     TreeItem: class {},
     ProgressLocation: { Notification: 1 },
-    window: { withProgress: (_options, operation) => operation({ report: () => undefined }) },
+    window: { withProgress: (_options, operation) => { notificationCount++; return operation({ report: () => undefined }); } },
   } : originalLoad.call(this, request, ...args);
 };
 const { __test } = require("../extension.js");
 Module._load = originalLoad;
+
+test('API caller owns progress UI while interactive Worker sync retains its notification', async () => {
+  const params = { source: { host: 'source', user: 'research', remotePath: '/projects/demo' },
+    destination: { host: 'destination', user: 'research', remotePath: '/projects/demo' }, relativePaths: ['work_dirs/p/a.csv'] };
+  const before = notificationCount;
+  await assert.rejects(__test.syncServerToServerFpsync({ ...params, apiMode: true }), error => error.apiCode === 2001);
+  assert.equal(notificationCount, before);
+  await assert.rejects(__test.syncServerToServerFpsync(params), error => error.apiCode === 2001);
+  assert.equal(notificationCount, before + 1);
+});
+
+test('delta stream transfers changed content only and reports compared versus changed files', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '../extension.js'), 'utf8');
+  const start = source.indexOf('async function syncServerToServerFpsyncCore('), end = source.indexOf('async function syncFromRemoteCore(', start);
+  assert.ok(start >= 0 && end > start);
+  const paths = Array.from({ length: 6 }, (_, i) => `work_dirs/p/${i}.csv`);
+  const files = Object.fromEntries(paths.map(name => [name, { sha256: 'a'.repeat(64), size: 10 }]));
+  let dispatched, transferred = false;
+  const controller = { id: 'one', updateProgress() {} };
+  const sandbox = { Date, String, Number, Set, Map, Array, Object, Math, Error,
+    requestedTransferCompression: () => 'none', directSyncTarget: value => value, directSyncRelativePath: value => value,
+    transferTimeoutMs: () => 120000, transferContext: { getStore: () => controller },
+    selectTransferCompression: async () => ({ compression: 'none' }), FPSYNC_PARALLEL_STREAMS: 2, FPSYNC_MAX_BATCH_BYTES: 128 * 1024 * 1024,
+    partitionTransferPaths: __test.partitionTransferPaths, compressionHistory: { key() {}, record() {} },
+    inspectRemoteBatchFiles: async target => ({ files: target.host === 'source' || transferred ? files : {
+      ...files, [paths[4]]: { sha256: 'b'.repeat(64), size: 10 }, [paths[5]]: undefined,
+    }, cacheHits: 0, cacheRehash: 0, digestReads: 0, cacheQueries: 0 }),
+    transferPartitionedTar: async (_source, _destination, changed) => { dispatched = [...changed]; transferred = true; return 1; },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(source.slice(start, end) + '\nthis.run = syncServerToServerFpsyncCore;', sandbox);
+  const result = await sandbox.run({ apiMode: true, compression: 'none', singleStream: true, confirm: true, pathConfirmed: true,
+    source: { host: 'source', port: 22, remotePath: '/project' }, destination: { host: 'destination', port: 22, remotePath: '/project' },
+    relativePaths: paths }, { report() {} });
+  assert.deepEqual(dispatched, paths.slice(4)); assert.equal(result.paths, 6); assert.equal(result.transferredFiles, 2);
+  assert.equal(controller.comparedFiles, 6); assert.equal(controller.changedFiles, 2); assert.equal(controller.totalBytes, 20);
+});
 
 test("direct rsync scopes delete to one Plan directory", () => {
   const source = __test.directSyncTarget({ host: "nwpu2", user: "research", port: 2222, remotePath: "/projects/demo" }, "来源");

@@ -104,7 +104,8 @@ class ProbeSafety(unittest.TestCase):
 
     def scoped_census(self, command, name="python3", state="S", identity_changed=False, descriptors=None, executable=None,
                       denied=False, unstable=False, descriptor_failure=None, descriptor_changed=False,
-                      final_identity_changed=False, final_state=None):
+                      final_identity_changed=False, final_state=None, exe_denied=False, protocol="", observations=None,
+                      trusted_program=True):
         reads, fd_reads = 0, 0
         def read(path, _limit):
             nonlocal reads, fd_reads
@@ -138,9 +139,13 @@ class ProbeSafety(unittest.TestCase):
             return list(descriptors or {}) + (["99"] if unstable and fd_scans > 1 else [])
         def readlink(path):
             if path.endswith("/exe"):
+                if exe_denied:
+                    raise PermissionError("exe unavailable")
                 return executable or "/usr/lib/openssh/sftp-server"
             return (descriptors or {})[path.rsplit("/", 1)[-1]]["path"]
         def stat_path(path):
+            if path == "/usr/lib/openssh/sftp-server":
+                return types.SimpleNamespace(st_uid=0 if trusted_program else 1000, st_mode=stat.S_IFREG | 0o755)
             if "/fd/" in path:
                 item = (descriptors or {})[path.rsplit("/", 1)[-1]]
                 return types.SimpleNamespace(st_mode=item.get("mode", stat.S_IFREG | 0o600), st_nlink=item.get("links", 1),
@@ -151,6 +156,8 @@ class ProbeSafety(unittest.TestCase):
                 patch.object(probe.os, "listdir", side_effect=listdir), patch.object(probe.os, "readlink", side_effect=readlink), \
                 patch.object(probe.os, "stat", side_effect=stat_path), \
                 patch.object(probe.os.path, "realpath", side_effect=lambda path: path), patch.object(probe, "read_bounded", side_effect=read):
+            if protocol:
+                return probe.process_census("/projects/example", RECEIVER_HASH, protocol, observations)
             return probe.process_census("/projects/example", RECEIVER_HASH)
 
     def receiver(self, root):
@@ -281,6 +288,25 @@ class ProbeSafety(unittest.TestCase):
         with patch.object(probe.os, "readlink", return_value=args[0]), patch.object(probe.os, "listdir", return_value=["0", "1"]):
             with self.assertRaisesRegex(RuntimeError, "PROCESS_DESCRIPTOR_LIMIT"):
                 probe.sftp_file_scope("/proc/2", args, "/projects/example", [1])
+
+    def test_protected_system_sftp_is_external_to_explicit_tar_protocol(self):
+        for options in ({"exe_denied": True}, {"denied": True}):
+            observations = []
+            self.assertEqual(self.scoped_census(b"/usr/lib/openssh/sftp-server\0", "sftp-server",
+                             protocol="staged-tar-v1", observations=observations, **options), 1)
+            self.assertEqual(observations, [{"pid": 2, "name": "sftp-server", "scope": "external-session-uninspectable"}])
+
+    def test_permission_does_not_exempt_unknown_program_or_unknown_protocol(self):
+        for options in ({}, {"protocol": "other"}, {"protocol": "staged-tar-v1", "trusted_program": False},
+                        {"protocol": "staged-tar-v1", "final_identity_changed": True},
+                        {"protocol": "staged-tar-v1", "final_state": "R"}):
+            with self.assertRaises((RuntimeError, OSError)):
+                self.scoped_census(b"/usr/lib/openssh/sftp-server\0", "sftp-server", exe_denied=True, **options)
+
+    def test_tar_protocol_still_blocks_observed_target_sftp_writer(self):
+        with self.assertRaises(probe.ActiveTransfer):
+            self.scoped_census(b"/usr/lib/openssh/sftp-server\0", "sftp-server", protocol="staged-tar-v1",
+                               descriptors={"3": {"path": "/projects/example/raw.csv", "flags": "0100002"}})
 
 
 if __name__ == "__main__":

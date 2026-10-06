@@ -192,7 +192,16 @@ def ancestors():
     raise RuntimeError("PROCESS_ANCESTRY_LIMIT")
 
 
-def process_census(root, receiver_hash=""):
+def protected_system_sftp(args):
+    # This does not prove an idle FD table. It only identifies an independent
+    # system SFTP service, which the explicit staged-tar protocol never starts.
+    if not args or not args[0].startswith("/") or posixpath.basename(args[0]) != "sftp-server":
+        return False
+    info = os.stat(os.path.realpath(args[0]))
+    return stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_mode & 0o111 != 0 and info.st_mode & 0o022 == 0
+
+
+def process_census(root, receiver_hash="", protocol="", observations=None):
     # hidepid=4 can conceal a same-user receiver, so this is not full evidence.
     mounts = read_bounded("/proc/self/mountinfo", 1048576)
     if b"hidepid=4" in mounts or b"hidepid=ptraceable" in mounts:
@@ -241,11 +250,25 @@ def process_census(root, receiver_hash=""):
             continue
         if name == "sftp-server" and not marked and state == "S":
             # D/T and unknown executables cannot be treated as an idle session.
-            scope = sftp_file_scope(directory, args, root, fd_budget)
+            try:
+                scope = sftp_file_scope(directory, args, root, fd_budget)
+            except PermissionError:
+                # OpenSSH can disable ptrace access even for the same UID.
+                # Do not turn an unobserved external session into an old tar
+                # writer. Other protocols and ambiguous programs fail closed.
+                if protocol != "staged-tar-v1" or len(receiver_hash) != 64 or not protected_system_sftp(args):
+                    raise
+                if read_bounded(directory + "/cmdline", MAX_COMMAND) != command:
+                    raise RuntimeError("PROCESS_IDENTITY_CHANGED")
+                scope = "external-session-uninspectable"
             final_identity = process_identity(directory)
             if final_identity[1] != before[1]:
                 raise RuntimeError("PROCESS_IDENTITY_CHANGED")
             if scope == "unrelated" and final_identity[0] == "S":
+                continue
+            if scope == "external-session-uninspectable" and final_identity[0] == "S":
+                if observations is not None and len(observations) < 32:
+                    observations.append({"pid": pid, "name": name, "scope": scope})
                 continue
             if scope == "target-root":
                 raise ActiveTransfer(pid, name, final_identity[0], scope)
@@ -256,7 +279,7 @@ def process_census(root, receiver_hash=""):
     return inspected
 
 
-def verify_idle(root, receiver_hash=""):
+def verify_idle(root, receiver_hash="", protocol=""):
     if not os.path.isabs(root) or root == "/" or os.path.realpath(root) != root or not os.path.isdir(root):
         raise RuntimeError("UNSAFE_TRANSFER_ROOT")
     descriptors = []
@@ -275,8 +298,10 @@ def verify_idle(root, receiver_hash=""):
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise RuntimeError("REMOTE_TRANSFER_SLOT_BUSY")
-        count = process_census(root, receiver_hash)
-        return {"idle": True, "root": root, "inspectedProcesses": count, "inspectedLocks": len(descriptors)}
+        observations = []
+        count = process_census(root, receiver_hash, protocol, observations)
+        return {"idle": True, "root": root, "protocol": protocol, "inspectedProcesses": count,
+                "inspectedLocks": len(descriptors), "unobservedExternalSessions": observations}
     finally:
         for descriptor in descriptors:
             os.close(descriptor)
@@ -284,7 +309,7 @@ def verify_idle(root, receiver_hash=""):
 
 def main():
     try:
-        result = verify_idle(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "")
+        result = verify_idle(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "", sys.argv[3] if len(sys.argv) > 3 else "")
     except Exception as error:
         result = {"idle": False, "reason": str(error)[:160]}
         if isinstance(error, ActiveTransfer):
