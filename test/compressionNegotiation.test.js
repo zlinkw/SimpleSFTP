@@ -96,3 +96,25 @@ test("manifest argument bytes remain bounded even when file contents are tiny", 
   assert.deepEqual(groups.flat(), files);
   assert.ok(groups.every(group => group.reduce((n, name) => n + Buffer.byteLength(name) * 2 + 160, 0) <= 48000));
 });
+
+test("LAN archives group up to 512 MiB without allocating entire file contents", async () => {
+  const files = Array.from({ length: 6 }, (_, index) => `work/current/weight-${index}.pth`);
+  const packed = [], progress = [];
+  api.setRemoteBatchTransport(async (_endpoint, command, paths) => {
+    assert.match(command, /tar --null/);
+    packed.push([...paths]);
+    if (paths.length > 1) await new Promise(setImmediate);
+    return "";
+  });
+  const partitions = await api.transferPartitionedTar(source, target, files, 5000, row=>progress.push(row), {
+    compression: "none", singleStream: true,
+    fileSizes: Object.fromEntries(files.map(file => [file, 100 * 1024 * 1024])),
+    expectedFiles: Object.fromEntries(files.map(file => [file, {size:100 * 1024 * 1024,sha256:"a".repeat(64)}])),
+  });
+  assert.equal(partitions,2);
+  assert.deepEqual(packed.map(group=>group.length).sort((a,b)=>a-b),[1,5]);
+  assert.ok(packed.every(group=>group.length * 100 * 1024 * 1024 <= 512 * 1024 * 1024));
+  assert.deepEqual(progress.filter(row=>row.phase==='done').map(row=>row.completedFiles),[1,6],
+    'out-of-order parallel groups contribute their actual file counts once');
+  assert.equal(progress.at(-1).completed,2);assert.equal(progress.at(-1).totalFiles,6);
+});

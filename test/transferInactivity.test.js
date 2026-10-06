@@ -45,3 +45,21 @@ test('parallel wire scopes aggregate once, hash bytes never inflate network tota
   assert.equal(notified,1);
   subscription.dispose();c.dispose();
 });
+
+test('committed file progress survives parallel stage resets and is exposed to SSE and polling',()=>{
+  const f=fixture();const c=f.create({id:'sync',operation:'sync.serverToServerFpsync'});
+  try {
+    c.updateProgress({phase:'transferring',scope:'groups',processedFiles:2,completedFiles:2,totalFiles:6,completedGroups:1,totalGroups:3});
+    c.updateProgress({phase:'unpacking',scope:'child-b',processedFiles:0,processedBytes:1024});
+    c.updateProgress({phase:'verifying',scope:'child-c',processedFiles:0,processedBytes:2048});
+    let row=f.list()[0];
+    assert.equal(row.processedFiles,0,'stage-local counts are kept separate');
+    assert.equal(row.completedFiles,2);assert.equal(row.totalFiles,6);
+    assert.equal(row.completedGroups,1);assert.equal(row.totalGroups,3);
+    assert.equal(f.events.at(-1).data.completedFiles,2);
+    c.updateProgress({phase:'transferring',scope:'groups',processedFiles:6,completedFiles:6,totalFiles:6,completedGroups:3,totalGroups:3});
+    row=f.list()[0];assert.equal(row.completedFiles,6);assert.equal(row.completedGroups,3);
+    c.updateProgress({phase:'unpacking',scope:'late-child',processedFiles:0,completedFiles:0,completedGroups:0,processedBytes:4096});
+    assert.equal(f.list()[0].completedFiles,6,'late evidence must not reset committed totals');
+  } finally {c.dispose();}
+});

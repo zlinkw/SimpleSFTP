@@ -35,16 +35,24 @@ test('delta stream transfers changed content only and reports compared versus ch
   const paths = Array.from({ length: 6 }, (_, i) => `work_dirs/p/${i}.csv`);
   const files = Object.fromEntries(paths.map(name => [name, { sha256: 'a'.repeat(64), size: 10 }]));
   let dispatched, transferred = false;
-  const controller = { id: 'one', updateProgress() {} };
+  const updates = [];
+  const controller = { id: 'one', updateProgress(row) { updates.push(row); } };
   const sandbox = { Date, String, Number, Set, Map, Array, Object, Math, Error,
     requestedTransferCompression: () => 'none', directSyncTarget: value => value, directSyncRelativePath: value => value,
     transferTimeoutMs: () => 120000, transferContext: { getStore: () => controller },
-    selectTransferCompression: async () => ({ compression: 'none' }), FPSYNC_PARALLEL_STREAMS: 2, FPSYNC_MAX_BATCH_BYTES: 128 * 1024 * 1024,
+    selectTransferCompression: async () => ({ compression: 'none' }), FPSYNC_PARALLEL_STREAMS: 2, FPSYNC_MAX_BATCH_BYTES: 512 * 1024 * 1024,
     partitionTransferPaths: __test.partitionTransferPaths, compressionHistory: { key() {}, record() {} },
     inspectRemoteBatchFiles: async target => ({ files: target.host === 'source' || transferred ? files : {
       ...files, [paths[4]]: { sha256: 'b'.repeat(64), size: 10 }, [paths[5]]: undefined,
     }, cacheHits: 0, cacheRehash: 0, digestReads: 0, cacheQueries: 0 }),
-    transferPartitionedTar: async (_source, _destination, changed) => { dispatched = [...changed]; transferred = true; return 1; },
+    transferPartitionedTar: async (_source, _destination, changed, _timeout, report) => {
+      dispatched = [...changed];
+      report({ phase: 'start', index: 1, total: 2, groupFiles: 1, completed: 0, completedFiles: 0, totalFiles: 2 });
+      report({ phase: 'done', index: 1, total: 2, groupFiles: 1, completed: 1, completedFiles: 1, totalFiles: 2 });
+      report({ phase: 'start', index: 2, total: 2, groupFiles: 1, completed: 1, completedFiles: 1, totalFiles: 2 });
+      report({ phase: 'done', index: 2, total: 2, groupFiles: 1, completed: 2, completedFiles: 2, totalFiles: 2 });
+      transferred = true; return 2;
+    },
   };
   vm.createContext(sandbox);
   vm.runInContext(source.slice(start, end) + '\nthis.run = syncServerToServerFpsyncCore;', sandbox);
@@ -53,6 +61,10 @@ test('delta stream transfers changed content only and reports compared versus ch
     relativePaths: paths }, { report() {} });
   assert.deepEqual(dispatched, paths.slice(4)); assert.equal(result.paths, 6); assert.equal(result.transferredFiles, 2);
   assert.equal(controller.comparedFiles, 6); assert.equal(controller.changedFiles, 2); assert.equal(controller.totalBytes, 20);
+  assert.ok(updates.some(row => row.completedFiles === 1 && row.totalFiles === 2));
+  assert.equal(updates.at(-1).completedFiles, 2);
+  assert.equal(updates.at(-1).completedGroups, 2);
+  assert.equal(updates.at(-1).totalGroups, 2);
 });
 
 test("direct rsync scopes delete to one Plan directory", () => {

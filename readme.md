@@ -2,7 +2,7 @@
 
 SimpleSFTP 是一个 Windows VS Code 扩展，用于在本地项目和远端 Linux 项目目录之间同步代码、轻量结果和 Agent runtime。本地与远端之间使用系统 `ssh` 和 `tar` 流传输，Worker 之间支持分区并行的 tar 流同步，也不会保存云凭据。
 
-`sync.serverToServerFpsync` 按指定路径比较两端 SHA256，仅传变化文件。稳定文件先取 size/mtime，读完后核对身份；发现变化才退避等待，首次 0.25 秒、最多 1 秒，总时限 15 秒。普通批次同时限制为 80 文件、128 MiB 和命令元数据大小，最多两路流；全局最多两个传输，每个 Worker 最多一个，不同 Worker 可以独立推进。任一路失败后停止启动新组，等待已启动的资源结算，不报整批完成。`sync.serverToServerBatch` 与 `sync.serverToServer` 的非删除路径复用该实现。无需安装 fpsync，不落盘中间压缩包；目标端独有旧文件只提供精确清理预览，删除仍需单独两次确认。
+`sync.serverToServerFpsync` 按指定路径比较两端 SHA256，仅传变化文件。稳定文件先取 size/mtime，读完后核对身份；发现变化才退避等待，首次 0.25 秒、最多 1 秒，总时限 15 秒。普通批次同时限制为 80 文件、512 MiB 和命令元数据大小；显式合并传输可跨 Plan 合并文件，但仍受 512 MiB 与元数据界限约束。最多两路流；全局最多两个传输，每个 Worker 最多一个，不同 Worker 可以独立推进。归档内容持续流式处理，不在内存中缓存整个批次。进度中的 completedFiles/totalFiles 与 completedGroups/totalGroups 是整次请求成功完成的文件/分组数，独立于当前 child 的 processedFiles 阶段计数，后续解包不会清零。任一路失败后停止启动新组，等待已启动的资源结算，不报整批完成。`sync.serverToServerBatch` 与 `sync.serverToServer` 的非删除路径复用该实现。无需安装 fpsync，不落盘中间压缩包；目标端独有旧文件只提供精确清理预览，删除仍需单独两次确认。
 
 SimpleSFTP 与 [SimpleExperiment](https://github.com/zlinkw/SimpleExperiment) 配套使用。SimpleExperiment 负责服务器状态和实验调度；SimpleSFTP 只负责真实文件传输。
 
@@ -160,7 +160,7 @@ simple-sftp-api upload.workspace --json upload.json
 
 `sync.serverToServerFpsync` 支持跨 Plan 的精确文件数组，最多 5000 个安全相对路径。`compression: "auto"` 在源端只读采样最多 8 个文件的分散内容窗口、累计最多 256 KiB，SSH 采样最多 5 秒；比较实测样本压缩字节、CPU/耗时及近期链路吞吐，低收益或 CPU 成本过高时选择 `none`。gzip 总是兼容；zstd 只有两端均检测成功才参与选择，未安装时无需新增依赖。`singleStream: true` 不按 Plan 分包，但仍遵守字节与元数据边界。采样失败安全回退 gzip。吞吐摘要只在内存保留最近 64 个端点组合、15 分钟有效；尚无实测吞吐时使用明确标注的估计，估计耗时不等于实际提速。直接传输和本机中继都遵循同一策略，传后逐文件核对 SHA256。
 
-超过 128 MiB 的单文件独立传输，以 8 MiB SHA256 块连续流式接收，上限 64 GiB。重试先验证固定暂存槽中的已完成块，再从缺失位置继续；完整文件 hash 验证后才发布。普通 tar 批次也必须完整接收并验证所有文件后才替换最终路径。远端最多 32 个固定 `.simple-sftp-stage-*` 槽及锁文件；成功 `replace` 消耗数据暂存，保留小型归属/恢复记录并复用闲置槽。损坏、未知所有者和未结算槽不会自动删除或占用。失败/取消不把半成品发布为当前结果，无法证明远端结算时禁止并发重发。
+超过 512 MiB 的单文件独立传输，以 8 MiB SHA256 块连续流式接收，上限 64 GiB；8 MiB 是恢复校验帧，不是每次重建连接的归档大小。重试先验证固定暂存槽中的已完成块，再从缺失位置继续；完整文件 hash 验证后才发布。普通 tar 批次也必须完整接收并验证所有文件后才替换最终路径。远端最多 32 个固定 `.simple-sftp-stage-*` 槽及锁文件；成功 `replace` 消耗数据暂存，保留小型归属/恢复记录并复用闲置槽。损坏、未知所有者和未结算槽不会自动删除或占用。失败/取消不把半成品发布为当前结果，无法证明远端结算时禁止并发重发。
 
 `transfers.reconcile` 核实旧 `sync.serverToServerFpsync` 请求是否已退出。需要原 `operationId/operationInstanceId/requestKey`、相同 `retryMethod` 和只含端点身份的 `retryParams`；capabilities 公布 `transferSettlementReconciliation`。核对本地原实例、传输进程、两端同用户进程和固定接收槽锁，并同时持有两端项目资源租约；权限不足、连接失败、活动进程或锁、身份不符均保持阻止。只有退出证据完整且回执持久化成功才返回 `settled:true`，原失败原因继续保留。该回执只证明旧 writer 已退出，不能证明旧传输成功；后续新请求仍须重新核验 SHA256。核实不删除数据、不发送 kill、不生成远端临时文件，用户无须手工清空未知回执。
 

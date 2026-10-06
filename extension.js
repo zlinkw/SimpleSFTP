@@ -270,7 +270,7 @@ function startLocalApiServer(context) {
     methods: createLocalApiMethods(),
     methodOptions: {
       "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576 },
-      "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024 },
+      "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
       "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number" },
     },
   });
@@ -1502,7 +1502,8 @@ async function syncServerToServerBatch(options = {}) {
   return syncServerToServerFpsync({ ...options, source, destination, relativePaths: paths, confirm: true, pathConfirmed: true });
 }
 
-const FPSYNC_MAX_BATCH_BYTES = 128 * 1024 * 1024;
+// Streaming archives never buffer the batch; the byte limit bounds retry/staging cost.
+const FPSYNC_MAX_BATCH_BYTES = 512 * 1024 * 1024;
 const FPSYNC_PARALLEL_STREAMS = 2;
 
 function partitionTransferPaths(paths, singleStreamFiles = 80, parallelSlots = 4, fileSizes, maxBytes = Infinity) {
@@ -1796,8 +1797,13 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
     unpacking: "流处理（打包、传输与解包）", verifying: "内容复核", publishing: "发布文件", distributing: "本地分发" };
   const notification = options.apiMode ? undefined : transferContext.getStore()?.onProgress?.((snapshot) => {
     const label = phaseLabels[snapshot.phase] || "处理文件";
-    const bytes = Number(snapshot.phase === "transferring" ? snapshot.transferredBytes : snapshot.processedBytes) || 0;
-    progress.report({ message: `${label} · ${snapshot.processedFiles || 0} 个文件 · ${Math.round(bytes / 1024)} KiB${snapshot.phase === "transferring" ? " 实际流字节" : " 已处理"} · 已耗时 ${Math.floor((Date.now() - notifyStartedAt) / 1000)} 秒` });
+    const committed = snapshot.completedFiles !== undefined;
+    const wire = committed || snapshot.phase === "transferring";
+    const bytes = Number(wire ? snapshot.transferredBytes : snapshot.processedBytes) || 0;
+    const files = committed ? `已完成 ${snapshot.completedFiles}/${snapshot.totalFiles} 个文件`
+      : snapshot.processedFiles ? `阶段已处理 ${snapshot.processedFiles} 个文件` : "文件流处理中";
+    const groups = snapshot.totalGroups ? ` · 分组 ${snapshot.completedGroups || 0}/${snapshot.totalGroups}` : "";
+    progress.report({ message: `${label} · ${files}${groups} · ${Math.round(bytes / 1024)} KiB${wire ? " 实际流字节" : " 已处理"} · 已耗时 ${Math.floor((Date.now() - notifyStartedAt) / 1000)} 秒` });
   });
   try {
   const requestedCompression = requestedTransferCompression(options);
@@ -1850,7 +1856,8 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
     transferController.totalBytes = changed.reduce((sum, name) => sum + fileSizes[name], 0);
     transferController.comparedFiles = paths.length;
     transferController.changedFiles = changed.length;
-    transferController.updateProgress({ phase: "preparing", scope: transferController.id, processedFiles: 0 });
+    transferController.updateProgress({ phase: "preparing", scope: transferController.id, processedFiles: 0,
+      completedFiles: 0, totalFiles: changed.length, completedGroups: 0 });
   }
   const compressionDecision = changed.length
     ? await selectTransferCompression({ ...options, compression: requestedCompression }, source, destination, changed, fileSizes)
@@ -1865,6 +1872,11 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
     : `清单完成（${inventoryMs} ms）；${paths.length} 个文件均无需传输，准备校验…` });
   const streamStartedAt = Date.now();
   const partitions = await transferPartitionedTar(source, destination, changed, timeoutMs, (event) => {
+    // Only a successfully exited, hash-verified receiver commits a whole group.
+    // Child-local packing/unpacking counters must never overwrite this total.
+    transferController?.updateProgress({ phase: "transferring", scope: `groups:${transferController.id}`,
+      processedFiles: event.completedFiles, completedFiles: event.completedFiles, totalFiles: event.totalFiles,
+      completedGroups: event.completed, totalGroups: event.total });
     if (event.phase === "start") {
       progress.report({ message: `正在流处理（打包、传输与解包）第 ${event.index}/${event.total} 组（${event.groupFiles} 个文件）· 已完成 ${event.completed}/${event.total} 组` });
       return;
@@ -3370,12 +3382,18 @@ function createTransferController({ id, operation, localPath, remotePath, host }
     controller.progressScope = evidence.scope || id;
     if (evidence.processedBytes !== undefined) controller.processedBytes = evidence.processedBytes;
     if (evidence.processedFiles !== undefined) controller.processedFiles = evidence.processedFiles;
+    for (const key of ["completedFiles", "totalFiles", "completedGroups", "totalGroups"]) {
+      if (Number.isSafeInteger(evidence[key]) && evidence[key] >= 0)
+        controller[key] = Math.max(controller[key] || 0, evidence[key]);
+    }
     controller.lastProgressAt = new Date(idle.lastProgressAt).toISOString();
     if (phaseChanged || Date.now() - lastEventAt >= 200 || evidence.status) {
       lastEventAt = Date.now();
       const snapshot = { id, operationId: controller.operationId, phase: controller.phase, processedBytes: controller.processedBytes,
         transferredBytes, totalBytes: controller.totalBytes, comparedFiles: controller.comparedFiles, changedFiles: controller.changedFiles,
         progressScope: controller.progressScope, processedFiles: controller.processedFiles,
+        completedFiles: controller.completedFiles, totalFiles: controller.totalFiles,
+        completedGroups: controller.completedGroups, totalGroups: controller.totalGroups,
         lastProgressAt: controller.lastProgressAt, status: controller.status };
       localApiServer?.publish({ type: "transfer_progress", data: snapshot });
       for (const listener of progressListeners) { try { listener(snapshot); } catch {} }
@@ -3391,7 +3409,7 @@ function createTransferController({ id, operation, localPath, remotePath, host }
 }
 
 function listActiveTransfers() {
-  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status, totalBytes, transferredBytes, operationId, phase, processedFiles, processedBytes, progressScope, lastProgressAt, comparedFiles, changedFiles }) => ({
+  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status, totalBytes, transferredBytes, operationId, phase, processedFiles, processedBytes, progressScope, lastProgressAt, comparedFiles, changedFiles, completedFiles, totalFiles, completedGroups, totalGroups }) => ({
     id,
     operation,
     localPath,
@@ -3403,6 +3421,7 @@ function listActiveTransfers() {
     transferredBytes,
     operationId, phase, processedFiles, lastProgressAt,
     processedBytes, progressScope, comparedFiles, changedFiles,
+    completedFiles, totalFiles, completedGroups, totalGroups,
   }));
 }
 
