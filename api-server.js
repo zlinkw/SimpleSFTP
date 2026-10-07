@@ -7,6 +7,7 @@ const path = require("path");
 const { atomicWriteText } = require("./state-store");
 const { HostOperationLeaseManager } = require("./host-operation-lease");
 const { AsyncLocalStorage } = require("node:async_hooks");
+const { READ_ONLY_SETTLEMENT_METHODS } = require("./transfer-settlement");
 const apiRequestContext = new AsyncLocalStorage();
 
 const LOOPBACK_REMOTE_ADDRESSES = new Set([
@@ -424,7 +425,8 @@ class LocalApiServer {
       version: this.version,
       instanceId: this.instanceId(),
       features: { transferSettlementReceipts: true,
-        ...(typeof this.methods["transfers.reconcile"] === "function" ? { transferSettlementReconciliation: true } : {}),
+        ...(typeof this.methods["transfers.reconcile"] === "function" ? { transferSettlementReconciliation: true,
+          transferReconciliationMethods: ["sync.serverToServerFpsync", ...READ_ONLY_SETTLEMENT_METHODS] } : {}),
         ...(this.methodOptions["sync.projectInventory"]?.scopeTransport === "stdin" ? { projectInventoryStdinScopes: true } : {}) },
       transport: ["http", "cli"],
       rpc: "json-rpc-2.0",

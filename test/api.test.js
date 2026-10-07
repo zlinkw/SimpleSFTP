@@ -233,6 +233,7 @@ test("local API exposes health, compression capabilities and loadable OpenAPI", 
     assert.match(capabilityBody.instanceId, /^\d+:/);
     assert.equal(capabilityBody.features.transferSettlementReceipts, true);
     assert.equal(capabilityBody.features.transferSettlementReconciliation, true);
+    assert.ok(capabilityBody.features.transferReconciliationMethods.includes('sync.projectInventory'));
     assert.deepEqual(capabilityBody.methodOptions, methodOptions);
 
     const openapi = await request(f.server.port, {

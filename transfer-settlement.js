@@ -5,6 +5,9 @@ const fs = require("node:fs");
 const path = require("node:path");
 const zlib = require("node:zlib");
 
+// These protocols read project data; they never write or remove project outputs.
+const READ_ONLY_SETTLEMENT_METHODS = ["sync.downloadMappedPaths", "sync.projectInventory", "sync.projectTree", "sync.projectFileStats"];
+
 function identityOf(value) {
   if (!value || typeof value !== "object") return undefined;
   const result = {};
@@ -64,4 +67,4 @@ function settlementProbeCommand(root, quote) {
   return `python3 -B -c ${quote(loader)} ${quote(encoded)} ${quote(root)} ${quote(receiverHash)} ${quote("staged-tar-v1")}`;
 }
 
-module.exports = { clientRequestKey, retryIdentity, assertLocalProcessesIdle, localTransferExitProof, settlementProbeCommand };
+module.exports = { READ_ONLY_SETTLEMENT_METHODS, clientRequestKey, retryIdentity, assertLocalProcessesIdle, localTransferExitProof, settlementProbeCommand };

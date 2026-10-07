@@ -16,7 +16,7 @@ const params = { source: { id: "source", host: "source-host", username: "tester"
 const key = clientRequestKey(method, params), ledgerKey = "simple-sftp-transfer-settlement.v1";
 
 function downloadFixture(options = {}) {
-  const downloadMethod = "sync.downloadMappedPaths";
+  const downloadMethod = options.method || "sync.downloadMappedPaths";
   const retryParams = { localPath: "C:/projects/example", server: { id: "source", host: "source-host", username: "tester", port: 2222, remotePath: "/projects/example" } };
   const requestKey = clientRequestKey(downloadMethod, retryParams), order = [];
   const values = new Map([[ledgerKey, [{ operationId: "old-download", operationInstanceId: "123:old", status: "outcomeUnknown",
@@ -42,6 +42,22 @@ test("legacy read-only download is settled only after local exit proof and permi
   await __test.beginTransferOperation("fresh-read", "456:new", false, f.requestKey);
   await __test.finishTransferOperation("fresh-read");
 });
+
+for (const method of ["sync.projectInventory", "sync.projectTree", "sync.projectFileStats"]) {
+  test(`legacy ${method} inspection recovers after proven local exit without a remote writer probe`, async () => {
+    const f = downloadFixture({ method });
+    assert.equal((await f.reconcile()).settled, true);
+    assert.deepEqual(f.order, ["local", "local"]);
+    await __test.beginTransferOperation("fresh-inspection", "456:new", false, f.requestKey);
+    await __test.finishTransferOperation("fresh-inspection");
+    const busy = downloadFixture({ method, localBusy: true });
+    assert.equal((await busy.reconcile()).settled, false);
+    const writer = downloadFixture({ method, remoteMutation: true });
+    assert.equal((await writer.reconcile()).settled, false);
+    const changed = downloadFixture({ method });
+    assert.equal((await changed.reconcile({ retryParams: { ...changed.retryParams, localPath: 'C:/other' } })).status, 'identityMismatch');
+  });
+}
 
 for (const option of ["localBusy", "remoteMutation", "failPersistence"]) {
   test(`read-only recovery refuses uncertain evidence (${option})`, async () => {

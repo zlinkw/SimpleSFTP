@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.61
+
+- Support verified exit reconciliation for abandoned projectInventory, projectTree and projectFileStats reads. Request identity, persisted read-only status, local owner/transport exit, and durable exit receipts are required; live requests and remote writers remain blocked.
+- Advertise the supported reconciliation methods so SimpleExperiment can retain protection when connected to an older plugin.
+
 ## 0.2.42
 
 - Added `sync.downloadMappedPaths`: one uncompressed remote tar stream carries every selected source-to-local mapping, then extraction writes each file to its own final path.

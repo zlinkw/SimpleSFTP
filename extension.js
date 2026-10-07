@@ -14,7 +14,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
-const { clientRequestKey, retryIdentity, localTransferExitProof, settlementProbeCommand } = require("./transfer-settlement");
+const { READ_ONLY_SETTLEMENT_METHODS, clientRequestKey, retryIdentity, localTransferExitProof, settlementProbeCommand } = require("./transfer-settlement");
 let transferRecoveryTestHooks = null;
 const transferRecoveries = new Map();
 const { execFile, spawn } = require("child_process");
@@ -3711,7 +3711,7 @@ async function reconcileTransferOperationCore(params) {
     || (row.operationInstanceId === currentTransferApiInstanceId() && !row.requestDone);
   if (hasLocalWork()) return receipt("outcomeUnknown", "旧传输本地请求/进程尚未退出");
   const method = String(params.retryMethod || "");
-  if (!["sync.serverToServerFpsync", "sync.downloadMappedPaths"].includes(method)) return receipt("outcomeUnknown", "该传输协议尚不支持自动核实退出");
+  if (method !== "sync.serverToServerFpsync" && !READ_ONLY_SETTLEMENT_METHODS.includes(method)) return receipt("outcomeUnknown", "该传输协议尚不支持自动核实退出");
   let identity, source, destination;
   try {
     identity = retryIdentity(params.retryParams || {});
@@ -3739,7 +3739,7 @@ async function reconcileTransferOperationCore(params) {
       throw new Error("EXIT_RECEIPT_PERSISTENCE_FAILED");
     }
   };
-  if (method === "sync.downloadMappedPaths") {
+  if (READ_ONLY_SETTLEMENT_METHODS.includes(method)) {
     if (row.remoteMutation !== false) return receipt("outcomeUnknown", "旧请求无法确认为只读下载，保留退出保护");
     // This protocol only reads remote files. After the old local owner and all
     // transports have exited, there is no remote writer or local file handle to unlock.
@@ -4354,7 +4354,8 @@ function createLocalApiMethods() {
       const controllerId = nextTransferId(name);
       const operationId = String(params._operationId || controllerId);
       const remoteMutation = /^(upload[.]|handoff[.]|sync[.](?:serverToServer|deletePath)|remote[.])/.test(name);
-      const recoveryContext = ["sync.serverToServerFpsync", "sync.downloadMappedPaths"].includes(name) ? { method: name, params: retryIdentity(params) } : undefined;
+      const recoveryContext = name === "sync.serverToServerFpsync" || READ_ONLY_SETTLEMENT_METHODS.includes(name)
+        ? { method: name, params: retryIdentity(params) } : undefined;
       await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, params._requestKey || transferRequestKey(name, params), recoveryContext);
       const controller = createTransferController({ id: controllerId, operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "" });
       controller.operationId = operationId;
