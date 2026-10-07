@@ -168,6 +168,8 @@ simple-sftp-api upload.workspace --json upload.json
 
 指定文件上传时，`remotePath` 是实际目标目录。若同时传入 `server.remotePath`，两者必须一致；不一致时插件会拒绝上传。`target.show`、API 确认预览和实际传输使用同一目标解析逻辑。用服务器名称指定目标时，该名称必须匹配已保存的服务器配置；未知名称不会回退到当前活动服务器。上传前请核对预览中的主机、端口与远端目录。
 
+`memoryOnly: true` 仅返回逐项 SHA256 核验后的 Base64 内容，不创建原始文件、接收槽、结果表或暂存目录；单文件和批次均限 4 MiB，必须提供每项的大小和 SHA256。0.2.60 新增能力 `methodOptions["sync.downloadMappedPaths"].memoryWrapperResults`：配合 `metricsOnly: true, wrapperResults: true`，支持包装器声明的 TSV、JSONL、YAML 和轻量二进制结果在审核页临时展示。该选项只扩展内存接收，权重、检查点、代码、状态和受保护目录继续拒绝，不放宽磁盘下载范围；不支持该能力时客户端应明确报告并保留版本，禁止回退到落盘缓存。
+
 ### 清单校验与进度
 
 `sync.projectInventory` 的精确 `scopePaths` 通过 SSH stdin 发送，每次最多 5000 路径、1 MiB；能力 `projectInventoryStdinScopes` 由 live capabilities 公布，旧客户端参数仍兼容。目录遍历只进入请求范围的祖先和子树；SQLite 分批索引读取本次范围的缓存，不载入整个项目历史。复用 SHA256 前核对 dev/ino/size/mtime/ctime、打开的文件身份和最终路径身份；内容或身份变化时重新哈希，缺失与未验证文件不能冒充成功。

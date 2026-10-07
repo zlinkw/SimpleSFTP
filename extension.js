@@ -271,7 +271,7 @@ function startLocalApiServer(context) {
     methodOptions: {
       "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576 },
       "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
-      "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024 },
+      "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, memoryWrapperResults: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024 },
     },
   });
   localApiServer = server;
@@ -2779,7 +2779,11 @@ function rejectMappedDownloadKind(remotePath, options) {
     if (WEIGHT_DOWNLOAD_EXTENSIONS.has(extension) || /(^|\/)(weights?|checkpoints?)(\/|$)/.test(lower)) {
       throw new Error(`映射下载拒绝权重或检查点文件：${remotePath}`);
     }
-    if (!METRIC_DOWNLOAD_EXTENSIONS.has(extension)) {
+    const wrapper = options.wrapperResults === true && options.memoryOnly === true;
+    if (wrapper && (!extension || /\.(pt|pth|ckpt|safetensors|onnx|bin|py|pyc|js|ts|sh|exe|dll|lock|pid)$/i.test(extension)
+      || /(^|\/)(code_backup|\.runtime|__pycache__|clean_dir)(\/|$)/i.test(lower)))
+      throw new Error(`wrapper 内存下载拒绝代码、状态或权重：${remotePath}`);
+    if (!wrapper && !METRIC_DOWNLOAD_EXTENSIONS.has(extension)) {
       throw new Error(`指标批量下载只接受 csv/json/md/txt/log：${remotePath}`);
     }
     if (base.endsWith(".csv.lock") || base === ".tb_mean.lock") {

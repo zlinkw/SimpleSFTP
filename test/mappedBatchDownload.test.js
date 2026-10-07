@@ -26,6 +26,32 @@ Module._load = originalLoad;
 
 const BLOCK = 512;
 
+test("wrapper memory review accepts TSV JSONL YAML and binary results without disk output", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mapped-wrapper-review-"));
+  const bodies = [Buffer.from('label\tnote\n案例\t保留\n'), Buffer.from('{"value":null}\n'), Buffer.from('model: same\n'), Buffer.from([0, 255, 2, 9])];
+  const entries = ['a.tsv', 'a.jsonl', 'a.yaml', 'mask.npz'].map((name, index) => ({ remotePath: 'work_dirs/case/attempts/run/' + name,
+    localRelativePath: 'unused/' + name, bytes: bodies[index].length, sha256: require('crypto').createHash('sha256').update(bodies[index]).digest('hex') }));
+  __test.setMappedDownloadTransport(() => tarStream(bodies.map((body, index) => ({ name: 'mapped/' + index, body }))));
+  try {
+    const result = await __test.createLocalApiMethods()['sync.downloadMappedPaths'](baseParams(root, entries,
+      { memoryOnly: true, metricsOnly: true, wrapperResults: true, compression: 'none' }));
+    assert.equal(result.memoryOnly, true);
+    assert.deepEqual(result.entries.map(entry => Buffer.from(entry.dataBase64, 'base64')), bodies);
+    assert.deepEqual(fs.readdirSync(root), []);
+  } finally { __test.setMappedDownloadTransport(null); }
+});
+
+test("wrapper memory review still refuses weights code state missing hashes and oversized files", () => {
+  const base = { remotePath: 'work_dirs/case/attempts/run/a.yaml', localRelativePath: 'unused/a.yaml', bytes: 1, sha256: 'a'.repeat(64) };
+  const options = entries => ({ entries, memoryOnly: true, metricsOnly: true, wrapperResults: true });
+  for (const remotePath of ['weights/a.yaml', 'a.pth', 'a.py', 'a.pid', 'a.lock', 'code_backup/a.yaml', '.runtime/a.yaml', 'clean_dir/a.yaml'])
+    assert.throws(() => __test.normalizeMappedDownloadEntries(options([{ ...base, remotePath }])), /拒绝|状态|权重|检查点/);
+  for (const fault of [{ sha256: '' }, { bytes: null }, { bytes: 4 * 1024 * 1024 + 1 }])
+    assert.throws(() => __test.normalizeMappedDownloadEntries(options([{ ...base, ...fault }])), /上限|大小|SHA256/);
+  assert.throws(() => __test.normalizeMappedDownloadEntries({ ...options([base]), memoryOnly: false }), /csv\/json/,
+    'the new wrapper flag must not broaden disk download permissions');
+});
+
 test("large memory metric batches keep SSH arguments bounded and send the manifest via stdin", async () => {
   const body = "case,seed,value\nA,42,0.9\n";
   const sha256 = require("crypto").createHash("sha256").update(body).digest("hex");
