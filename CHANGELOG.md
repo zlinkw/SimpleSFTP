@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.62
+
+- Allow independent live projectInventory, projectTree and projectFileStats requests for the same Worker/root. Multiple Plan preflight checks and background result scans keep separate operation identities and wait for existing transfer capacity without cancelling each other.
+- Keep unknown receipts, older service generations, cancellation settlement, local output downloads and remote writers guarded. Explicit cancellation affects only its operation; reconciliation retains the stable target identity.
+- Add regressions for four concurrent Plan checks on two Workers, the inventory API/capacity boundary, isolated cancellation and protected writer/unknown outcomes.
+
 ## 0.2.61
 
 - Support verified exit reconciliation for abandoned projectInventory, projectTree and projectFileStats reads. Request identity, persisted read-only status, local owner/transport exit, and durable exit receipts are required; live requests and remote writers remain blocked.

@@ -3583,7 +3583,16 @@ async function beginTransferOperation(operationId, requestedInstanceId, remoteMu
     throw new Error("SimpleSFTP 实例已变化，未启动旧身份传输。");
   if (transferOperationLedger.has(id)) throw new Error("SimpleSFTP 请求身份已使用，未重复启动传输。");
   const targetKey = /^[a-f0-9]{64}$/i.test(String(requestKey || "")) ? String(requestKey).toLowerCase() : transferRequestKey("unknown", {});
-  const blocker = [...transferOperationLedger.values()].find((row) => (row.status !== "settled" || !row.persisted) && row.requestKey === targetKey);
+  // Live metadata readers have no local output or remote writer to serialize.
+  // Sharing a Worker/root does not make different Plan checks a user retry.
+  // Keep the stable target key for reconciliation of unknown/older receipts.
+  const metadataMethods = ["sync.projectInventory", "sync.projectTree", "sync.projectFileStats"];
+  const concurrentMetadataRead = (row) => remoteMutation === false && row.remoteMutation === false
+    && metadataMethods.includes(recoveryContext?.method) && row.recoveryContext?.method === recoveryContext.method
+    && row.operationInstanceId === instanceId && !row.outcomeUnknown && !row.cancelRequestedAt
+    && ["running", "draining"].includes(row.status);
+  const blocker = [...transferOperationLedger.values()].find((row) => (row.status !== "settled" || !row.persisted)
+    && row.requestKey === targetKey && !concurrentMetadataRead(row));
   if (blocker) {
     const error = new Error("相同传输目标仍有未确认的旧请求，未启动并发传输。");
     error.apiData = { blockedOperationId: blocker.operationId, operationInstanceId: blocker.operationInstanceId, notStarted: true };
@@ -6542,7 +6551,7 @@ module.exports = {
       transferRecoveryTestHooks = options.recoveryHooks || null;
       transferRecoveries.clear();
       extensionContext = { globalState: options.globalState };
-      localApiServer = { instanceId: () => String(options.instanceId || "test-instance") };
+      localApiServer = { instanceId: () => String(options.instanceId || "test-instance"), publish() {} };
       if (options.reset !== false) {
         transferLedgerLoaded = false;
         transferLedgerWrite = Promise.resolve();

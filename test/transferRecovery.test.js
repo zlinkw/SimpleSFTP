@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict"), test = require("node:test"), Module = require("node:module");
 const { spawnSync } = require("node:child_process");
-const { clientRequestKey, assertLocalProcessesIdle, settlementProbeCommand } = require("../transfer-settlement");
+const { clientRequestKey, retryIdentity, assertLocalProcessesIdle, settlementProbeCommand } = require("../transfer-settlement");
 const originalLoad = Module._load;
 Module._load = function(request, ...args) {
   return request === "vscode" ? { TreeItem: class {}, ProgressLocation: { Notification: 1 },
@@ -103,6 +103,108 @@ function fixture(options = {}) {
     requestKey: key, retryMethod: method, retryParams: params, ...overrides });
   return { values, order, reconcile };
 }
+
+for (const readMethod of ["sync.projectInventory", "sync.projectTree", "sync.projectFileStats"]) {
+  test(`${readMethod}: four Plan checks coexist with background reads on the same Workers`, async () => {
+    fixture({ noLegacy: true });
+    const requests = [];
+    const start = async (worker, caller, scopePaths) => {
+      const readParams = { source: { host: worker, username: "tester", remotePath: "/projects/example" }, scopePaths };
+      const id = `${readMethod}-${worker}-${caller}`;
+      await __test.beginTransferOperation(id, "456:new", false, clientRequestKey(readMethod, readParams),
+        { method: readMethod, params: retryIdentity(readParams) });
+      requests.push(id);
+    };
+    for (const worker of ["NWPU3", "NWPU5"]) await start(worker, "background", ["work_dirs/completed"]);
+    const checks = await Promise.allSettled(Array.from({ length: 4 }, (_, plan) => ["NWPU3", "NWPU5"]
+      .map(worker => start(worker, `plan-${plan}`, ["configs", "models"]))).flat());
+    assert.deepEqual(checks.map(row => row.status), Array(8).fill("fulfilled"));
+    const state = await __test.listTransferOperationState();
+    assert.equal(state.operations.length, 10);
+    assert.ok(state.operations.every(row => row.status === "running" && !row.cancelRequestedAt));
+    for (const id of requests) await __test.finishTransferOperation(id);
+    assert.equal((await __test.listTransferOperationState()).settledOperations.length, 10);
+  });
+}
+
+test("cancelling one metadata read leaves another same-target caller running", async () => {
+  fixture({ noLegacy: true });
+  const readMethod = "sync.projectInventory", readParams = { source: params.source };
+  const requestKey = clientRequestKey(readMethod, readParams);
+  const context = { method: readMethod, params: retryIdentity(readParams) };
+  await __test.beginTransferOperation("read-a", "456:new", false, requestKey, context);
+  await __test.beginTransferOperation("read-b", "456:new", false, requestKey, context);
+  const first = __test.createTransferController({ id: "controller-a", operation: readMethod });
+  const second = __test.createTransferController({ id: "controller-b", operation: readMethod });
+  first.operationId = "read-a"; second.operationId = "read-b";
+  try {
+    const result = await __test.createLocalApiMethods()["transfers.cancel"]({ operationId: "read-a", operationInstanceId: "456:new" });
+    assert.equal(result.cancelled, true);
+    assert.equal(first.status, "cancelled");
+    assert.equal(second.status, "running");
+    const state = await __test.listTransferOperationState();
+    assert.equal(state.operations.find(row => row.operationId === "read-b").status, "running");
+    assert.ok(!state.operations.find(row => row.operationId === "read-b").cancelRequestedAt);
+    await assert.rejects(__test.beginTransferOperation("read-c", "456:new", false, requestKey, context),
+      error => error.apiData?.blockedOperationId === "read-a" && error.apiData?.notStarted === true);
+    first.dispose(); await __test.finishTransferOperation("read-a");
+    await __test.beginTransferOperation("read-c", "456:new", false, requestKey, context);
+    await __test.finishTransferOperation("read-c");
+  } finally {
+    first.dispose(); second.dispose(); await __test.finishTransferOperation("read-b");
+  }
+});
+
+test("inventory API queues four new Plans behind each Worker background scan without replacing callers", async () => {
+  fixture({ noLegacy: true });
+  const api = __test.createLocalApiMethods(), calls = [], active = new Map();
+  __test.setRemoteBatchTransport(async (target, _command, scopes, _timeout, transport) => {
+    assert.equal(transport.remoteMutation, false);
+    assert.equal(active.get(target.host) || 0, 0, "keep the existing per-Worker capacity limit");
+    active.set(target.host, 1);
+    await new Promise(setImmediate);
+    calls.push({ host: target.host, scopes }); active.set(target.host, 0);
+    return JSON.stringify({ files: { [scopes[0]]: { sha256: "a".repeat(64), size: 10 } } });
+  });
+  const requests = ["NWPU3", "NWPU5"].flatMap(host => Array.from({ length: 5 }, (_, index) => {
+    const readParams = { source: { host, username: "tester", port: 22, remotePath: "/projects/example" },
+      scopePaths: [index === 0 ? "work_dirs/completed" : `configs/plan-${index}.yaml`] };
+    return { ...readParams, _operationId: `api-${host}-${index}`, _operationInstanceId: "456:new",
+      _requestKey: clientRequestKey("sync.projectInventory", readParams) };
+  }));
+  try {
+    const outcomes = await Promise.allSettled(requests.map(request => api["sync.projectInventory"](request)));
+    assert.deepEqual(outcomes.map(row => row.status), Array(10).fill("fulfilled"));
+    for (let index = 0; index < requests.length; index++) {
+      assert.deepEqual(Object.keys(outcomes[index].value.files), requests[index].scopePaths);
+    }
+    assert.equal(calls.length, 10);
+    const state = await __test.listTransferOperationState();
+    assert.equal(state.operations.length, 0);
+    assert.equal(state.settledOperations.length, 10);
+    assert.ok(state.settledOperations.every(row => !row.cancelRequestedAt));
+  } finally { __test.setRemoteBatchTransport(null); }
+});
+
+test("metadata concurrency never bypasses unknown receipts, local downloads or remote writers", async () => {
+  for (const [readMethod, remoteMutation, knownContext] of [
+    ["sync.downloadMappedPaths", false, true],
+    ["sync.serverToServerFpsync", true, true],
+    ["sync.projectInventory", true, true],
+    ["sync.projectInventory", false, false],
+  ]) {
+    fixture({ noLegacy: true });
+    const requestKey = clientRequestKey(readMethod, params);
+    const context = knownContext ? { method: readMethod, params: retryIdentity(params) } : undefined;
+    await __test.beginTransferOperation("owner", "456:new", remoteMutation, requestKey, context);
+    await assert.rejects(__test.beginTransferOperation("blocked", "456:new", remoteMutation, requestKey, context),
+      error => error.apiData?.blockedOperationId === "owner" && error.apiData?.notStarted === true);
+    await __test.finishTransferOperation("owner");
+  }
+  const oldRead = downloadFixture({ method: "sync.projectInventory" });
+  await assert.rejects(__test.beginTransferOperation("new-read", "456:new", false, oldRead.requestKey,
+    { method: "sync.projectInventory", params: retryIdentity(oldRead.retryParams) }), /未确认的旧请求/);
+});
 
 test("legacy SIGTERM receipt blocks first, then proven exit permits one fresh dispatch without deleting history", async () => {
   const f = fixture();
