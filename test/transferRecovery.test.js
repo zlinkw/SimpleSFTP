@@ -17,18 +17,22 @@ const key = clientRequestKey(method, params), ledgerKey = "simple-sftp-transfer-
 
 function downloadFixture(options = {}) {
   const downloadMethod = options.method || "sync.downloadMappedPaths";
+  const originalInstanceId = options.originalInstanceId || "123:old";
   const retryParams = { localPath: "C:/projects/example", server: { id: "source", host: "source-host", username: "tester", port: 2222, remotePath: "/projects/example" } };
   const requestKey = clientRequestKey(downloadMethod, retryParams), order = [];
-  const values = new Map([[ledgerKey, [{ operationId: "old-download", operationInstanceId: "123:old", status: "outcomeUnknown",
+  const values = new Map([[ledgerKey, [{ operationId: "old-download", operationInstanceId: originalInstanceId, status: "outcomeUnknown",
     startedAt: new Date().toISOString(), remoteMutation: options.remoteMutation === true, requestKey }]]]);
   const globalState = { get: (name, fallback) => values.get(name) || fallback,
     async update(name, value) { if (options.failPersistence) throw Error("disk locked"); values.set(name, structuredClone(value)); } };
   __test.setTransferSettlementTestContext({ globalState, instanceId: "456:new", recoveryHooks: {
-    async localProof() { order.push("local"); if (options.localBusy) throw Error("LOCAL_TRANSFER_OR_OWNER_STILL_ACTIVE"); },
+    async localProof(instanceId, allowCurrentOwner) {
+      order.push("local"); if (options.localBusy) throw Error("LOCAL_TRANSFER_OR_OWNER_STILL_ACTIVE");
+      return options.localProof?.(instanceId, allowCurrentOwner);
+    },
     async acquire() { throw Error("read-only recovery must not lock remote writers"); },
   } });
   __test.setRemoteBatchTransport(() => { throw Error("read-only recovery must not run remote writer probes"); });
-  const reconcile = (overrides = {}) => __test.createLocalApiMethods()["transfers.reconcile"]({ operationId: "old-download", operationInstanceId: "123:old",
+  const reconcile = (overrides = {}) => __test.createLocalApiMethods()["transfers.reconcile"]({ operationId: "old-download", operationInstanceId: originalInstanceId,
     requestKey, retryMethod: downloadMethod, retryParams, ...overrides });
   return { values, order, requestKey, retryParams, reconcile };
 }
@@ -73,6 +77,30 @@ test("changed read target or a live child cannot be cleared by read-only recover
   __test.trackTransferResource({ once() { return this; } }, "old-download");
   assert.equal((await f.reconcile()).settled, false);
   assert.deepEqual(f.order, []);
+});
+
+test("legacy inventory reconciles while a different Worker inventory continues in the new service", async () => {
+  const oldStartedAt = "2026-10-09T14:55:46.715Z";
+  const census = [
+    { ProcessId: 456, ParentProcessId: 0, Name: "Code.exe", CreationDate: "2026-10-09T15:57:07.733Z" },
+    { ProcessId: 457, ParentProcessId: 456, Name: "ssh.exe", CreationDate: "2026-10-09T16:00:00.000Z" },
+  ];
+  const f = downloadFixture({ method: "sync.projectInventory", originalInstanceId: `123:${oldStartedAt}`,
+    localProof(instanceId, allowCurrentOwner) {
+      return assertLocalProcessesIdle(census, Number(instanceId.split(":")[0]), allowCurrentOwner, 456, Date.parse(oldStartedAt));
+    } });
+  const otherParams = { ...f.retryParams, server: { ...f.retryParams.server, host: "other-worker" } };
+  await __test.beginTransferOperation("other-inventory", "456:new", false, clientRequestKey("sync.projectInventory", otherParams),
+    { method: "sync.projectInventory", params: retryIdentity(otherParams) });
+  assert.equal((await f.reconcile()).settled, true);
+  assert.deepEqual(f.order, ["local", "local"]);
+  const state = await __test.listTransferOperationState();
+  assert.equal(state.operations.find(row => row.operationId === "other-inventory").status, "running");
+  assert.ok(!state.operations.find(row => row.operationId === "other-inventory").cancelRequestedAt);
+  assert.equal(f.values.get(ledgerKey).find(row => row.operationId === "old-download").recovery.kind, "verified-read-transfer-exit");
+  await __test.beginTransferOperation("replacement-read", "456:new", false, f.requestKey,
+    { method: "sync.projectInventory", params: retryIdentity(f.retryParams) });
+  await __test.finishTransferOperation("replacement-read"); await __test.finishTransferOperation("other-inventory");
 });
 
 function fixture(options = {}) {
@@ -318,13 +346,13 @@ test("probe uses the packaged read-only protocol; identities do not carry creden
 });
 
 test("a previous service in the same PID cannot be confused with a drained current-generation request", () => {
-  const current = [{ ProcessId: 123, Name: "Code.exe" }];
+  const current = [{ ProcessId: 123, ParentProcessId: 0, Name: "Code.exe" }];
   assert.throws(() => assertLocalProcessesIdle(current, 123, false, 123), /OWNER_STILL_ACTIVE/);
   assert.doesNotThrow(() => assertLocalProcessesIdle(current, 123, true, 123));
-  assert.throws(() => assertLocalProcessesIdle([{ ProcessId: 999, Name: "Code.exe" }], 999, true, 123), /OWNER_STILL_ACTIVE/);
-  assert.throws(() => assertLocalProcessesIdle([{ ProcessId: 124, Name: "ssh.exe" }], 123, true, 123), /LOCAL_TRANSFER/);
+  assert.throws(() => assertLocalProcessesIdle([{ ProcessId: 999, ParentProcessId: 0, Name: "Code.exe" }], 999, true, 123), /OWNER_STILL_ACTIVE/);
+  assert.throws(() => assertLocalProcessesIdle([{ ProcessId: 124, ParentProcessId: 123, Name: "ssh.exe" }], 123, true, 123), /LOCAL_TRANSFER/);
   assert.throws(() => assertLocalProcessesIdle([{}], 123, false, 123), /UNAVAILABLE/);
-  assert.doesNotThrow(() => assertLocalProcessesIdle([], 999, false, 123));
+  assert.throws(() => assertLocalProcessesIdle([], 999, false, 123), /UNAVAILABLE/);
 });
 
 test("read-only remote census and stage-lock recovery safety gates", () => {

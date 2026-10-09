@@ -36,26 +36,74 @@ function clientRequestKey(method, params) {
   return createHash("sha256").update(JSON.stringify({ method, ...retryIdentity(params) })).digest("hex");
 }
 
-function assertLocalProcessesIdle(rows, oldPid, allowCurrentOwner, currentPid = process.pid) {
-  if (!Array.isArray(rows) || rows.some(row => !Number.isSafeInteger(Number(row?.ProcessId)) || Number(row.ProcessId) <= 0 || typeof row.Name !== "string"))
+function assertLocalProcessesIdle(rows, oldPid, allowCurrentOwner, currentPid = process.pid, oldStartedAt) {
+  if (!Array.isArray(rows) || rows.length > 8192 || rows.some(row => !Number.isSafeInteger(row?.ProcessId) || row.ProcessId < 0
+    || !Number.isSafeInteger(row.ParentProcessId) || row.ParentProcessId < 0 || typeof row.Name !== "string" || !row.Name || row.Name.length > 260))
     throw new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE");
-  const live = rows.filter(row => !(allowCurrentOwner && oldPid === currentPid && Number(row.ProcessId) === currentPid)
-    || /^(ssh|scp|sftp|plink|rsync|tar|gzip|pigz|zstd)\.exe$/i.test(row.Name));
-  if (live.length) throw new Error("LOCAL_TRANSFER_OR_OWNER_STILL_ACTIVE");
+  const processes = new Map(rows.map(row => [row.ProcessId, row]));
+  if (processes.size !== rows.length) throw new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE");
+  const checked = new Set();
+  for (const row of rows) {
+    const chain = new Set();
+    let cursor = row;
+    while (cursor && cursor.ProcessId !== 0 && !checked.has(cursor.ProcessId)) {
+      if (chain.has(cursor.ProcessId)) throw new Error("LOCAL_PROCESS_ANCESTRY_UNAVAILABLE");
+      chain.add(cursor.ProcessId);
+      cursor = cursor.ParentProcessId === 0 ? undefined : processes.get(cursor.ParentProcessId);
+    }
+    for (const id of chain) checked.add(id);
+  }
+  const owner = processes.get(oldPid), createdAt = row => typeof row?.CreationDate === "string" ? Date.parse(row.CreationDate) : NaN;
+  const ownerReused = owner && Number.isFinite(oldStartedAt) && createdAt(owner) > oldStartedAt;
+  if (owner && !ownerReused && !(allowCurrentOwner && oldPid === currentPid))
+    throw new Error("LOCAL_TRANSFER_OR_OWNER_STILL_ACTIVE");
+  let unrelatedTransports = 0;
+  for (const transport of rows.filter(row => /^(ssh|scp|sftp|plink|rsync|tar|gzip|pigz|zstd)\.exe$/i.test(row.Name))) {
+    let cursor = transport, birthChainVerified = true;
+    const seen = new Set();
+    while (true) {
+      if (seen.has(cursor.ProcessId)) throw new Error("LOCAL_PROCESS_ANCESTRY_UNAVAILABLE");
+      seen.add(cursor.ProcessId);
+      if (cursor.ProcessId === oldPid || cursor.ParentProcessId === oldPid) {
+        // A reused owner PID is a different process generation. A child born
+        // before that replacement (or without birth evidence) remains guarded.
+        if (ownerReused && createdAt(cursor) >= createdAt(owner)) break;
+        throw new Error("LOCAL_TRANSFER_OR_OWNER_STILL_ACTIVE");
+      }
+      if (oldPid !== currentPid && cursor.ProcessId === currentPid) {
+        // A transport born under this different, live producer cannot belong
+        // to the abandoned producer. Do not require its exited Windows login
+        // ancestors to remain alive; verify every child/parent generation.
+        if (!birthChainVerified) throw new Error("LOCAL_PROCESS_ANCESTRY_UNAVAILABLE");
+        break;
+      }
+      if (cursor.ProcessId === 0 || cursor.ParentProcessId === 0) break;
+      const parent = processes.get(cursor.ParentProcessId);
+      if (!parent || createdAt(parent) > createdAt(cursor)) throw new Error("LOCAL_PROCESS_ANCESTRY_UNAVAILABLE");
+      birthChainVerified &&= Number.isFinite(createdAt(parent)) && Number.isFinite(createdAt(cursor));
+      cursor = parent;
+    }
+    unrelatedTransports++;
+  }
+  // A complete census must contain this live producer. Empty or filtered
+  // snapshots cannot prove the old owner/children absent.
+  if (!processes.has(currentPid)) throw new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE");
+  return { localOwnerExited: !owner || Boolean(ownerReused), localTransportCount: 0, unrelatedTransportCount: unrelatedTransports };
 }
 
 async function localTransferExitProof(instanceId, allowCurrentOwner = false) {
-  // A missing child count, elapsed time, or a Windows kill(pid, 0) exception
-  // cannot establish that an abandoned transport has exited.
-  const match = /^([1-9][0-9]{0,9}):/.exec(String(instanceId));
-  if (process.platform !== "win32" || !match) throw new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE");
+  // Census the original owner's process tree, not all transports on the PC.
+  // Missing ancestry, a live original owner, and old descendants still deny
+  // replay. Creation time distinguishes a reused PID from the old generation.
+  const match = /^([1-9][0-9]{0,9}):(.+)$/.exec(String(instanceId));
+  const oldStartedAt = match ? Date.parse(match[2]) : NaN;
+  if (process.platform !== "win32" || !match || !Number.isFinite(oldStartedAt)) throw new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE");
   const oldPid = Number(match[1]);
-  const command = `$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $items=@(Get-CimInstance Win32_Process -Filter \"ProcessId=${oldPid} OR Name='ssh.exe' OR Name='scp.exe' OR Name='sftp.exe' OR Name='plink.exe' OR Name='rsync.exe' OR Name='tar.exe' OR Name='gzip.exe' OR Name='pigz.exe' OR Name='zstd.exe'\"); ConvertTo-Json -Compress -InputObject @($items | Select-Object ProcessId,Name)`;
+  const command = `$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $items=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CreationDate); if($items.Count -gt 8192){throw 'LOCAL_PROCESS_PROOF_UNAVAILABLE'}; ConvertTo-Json -Compress -InputObject @($items)`;
   const output = await new Promise((resolve, reject) => execFile("pwsh.exe", ["-NoProfile", "-NonInteractive", "-Command", command],
-    { windowsHide: true, timeout: 6000, maxBuffer: 32768, encoding: "utf8" }, (error, stdout) => error ? reject(new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE")) : resolve(stdout)));
+    { windowsHide: true, timeout: 6000, maxBuffer: 1048576, encoding: "utf8" }, (error, stdout) => error ? reject(new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE")) : resolve(stdout)));
   const rows = JSON.parse(String(output));
-  assertLocalProcessesIdle(rows, oldPid, allowCurrentOwner);
-  return { localOwnerExited: oldPid !== process.pid, localTransportCount: 0 };
+  return assertLocalProcessesIdle(rows, oldPid, allowCurrentOwner, process.pid, oldStartedAt);
 }
 
 function settlementProbeCommand(root, quote) {

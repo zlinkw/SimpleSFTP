@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.63
+
+- Scope abandoned-transfer exit checks to the original producer and its process descendants. A different live producer's verified child transports no longer block legacy inventory reconciliation. Check creation times to distinguish reused PIDs and collect bounded process ancestry without command lines.
+- Retain guards for the live original producer, original descendants, ambiguous or cyclic ancestry, incomplete censuses, remote writers and unverified settlement receipts.
+- Add regressions for an old inventory alongside another Worker read, actual Windows login ancestry, PID reuse, live descendants and invalid process evidence.
+
 ## 0.2.62
 
 - Allow independent live projectInventory, projectTree and projectFileStats requests for the same Worker/root. Multiple Plan preflight checks and background result scans keep separate operation identities and wait for existing transfer capacity without cancelling each other.
