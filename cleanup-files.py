@@ -173,7 +173,11 @@ def open_handles(full):
 
 
 def tracked_dirty(root, rel):
-    git_marker = os.path.join(root, ".git")
+    cursor = root
+    git_marker = os.path.join(cursor, ".git")
+    while not os.path.lexists(git_marker) and cursor != os.path.dirname(cursor):
+        cursor = os.path.dirname(cursor)
+        git_marker = os.path.join(cursor, ".git")
     if not os.path.lexists(git_marker):
         return
     marker = os.lstat(git_marker)

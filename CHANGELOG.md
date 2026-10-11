@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.65
+
+- Protect dirty tracked targets when the workspace is a subdirectory of a Git repository, including Git worktrees. Advertise and bind the required safety capability to cleanup previews.
+
 ## 0.2.64
 
 - Add frozen cleanup previews and separate exact-path confirmations, no-overwrite moves to clean_dir, guarded restore and fixed file/directory deletion executors.

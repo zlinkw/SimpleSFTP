@@ -53,6 +53,11 @@ test('dirty tracked PLAN is retained',()=>{
   for(const args of [['init','-q'],['add','plans/p.yaml']]){const child=spawnSync('git',args,{cwd:base,windowsHide:true,encoding:'utf8',timeout:5000});assert.equal(child.status,0,child.stderr);}
   assert.equal(inspect(base,'plans/p.yaml').error.code,'DIRTY_TRACKED_TARGET');assert.ok(fs.existsSync(path.join(base,'plans/p.yaml')));
 });
+test('workspace below a Git repository retains dirty tracked targets',()=>{
+  const base=root(),workspace=path.join(base,'workspace');write(base,'workspace/plans/p.yaml');
+  for(const args of [['init','-q'],['add','workspace/plans/p.yaml']]){const child=spawnSync('git',args,{cwd:base,windowsHide:true,encoding:'utf8',timeout:5000});assert.equal(child.status,0,child.stderr);}
+  assert.equal(inspect(workspace,'plans/p.yaml').error.code,'DIRTY_TRACKED_TARGET');assert.ok(fs.existsSync(path.join(workspace,'plans/p.yaml')));
+});
 test('dirty tracked PLAN in a Git worktree is protected even when .git is a file',()=>{
   const base=root(),repo=path.join(base,'repository'),worktree=path.join(base,'worktree');fs.mkdirSync(repo);write(repo,'plans/p.yaml','mode: train\n');
   for(const args of [['init','-q'],['add','plans/p.yaml'],['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-q','-m','fixture'],['worktree','add','-q','--detach',worktree]]) {

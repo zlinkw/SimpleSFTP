@@ -43,8 +43,8 @@ class CleanupFileApi {
       rows.push({ ...copy(target), ...result.target, destination: target.destination });
     }
     const row = { token: crypto.randomBytes(24).toString("hex"), operationId: "cleanup-" + crypto.randomBytes(16).toString("hex"), node: copy(node), rootIdentity: identity,
-      action, targets: rows, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
-    row.digest = hash({ node: row.node, rootIdentity: identity, action, targets: rows });
+      action, targets: rows, safety: { gitRepositoryAncestors: true }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
+    row.digest = hash({ node: row.node, rootIdentity: identity, action, targets: rows, safety: row.safety });
     this.previews.set(row.token, copy(row)); // Preview does not write a journal or a remote hash cache.
     return copy(row);
   }
