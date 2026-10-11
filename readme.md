@@ -1,6 +1,6 @@
 # SimpleSFTP
 
-0.2.66 提供 `files.cleanup.inspect/check/verify/preview/confirm/execute/status/settle` 受限接口，供 SimpleExperiment 0.5.273 的 PLAN 清除协调器使用。默认只读预览，移动固定到项目 `clean_dir/<原相对路径>`，无覆盖、保留 SHA256 清单；永久删除必须同批完整路径两次确认，文件/目录固定类型、规范父 cwd 与 `./直接子名称` 门禁不可绕过。Git 检查覆盖祖先仓库和 worktree；预览绑定 `safety.gitRepositoryAncestors: true` 与 `safety.readOnlyReceiptCheck: true` 能力。`check` 仅观察冻结目标和回执，零写入；节点重连后必须由用户审核新的精确目标并确认才能续办。归档目录不参与上传或同步。离线、活动传输、脏受跟踪文件、链接、挂载、共享硬链接、指纹变化和权限错误均阻断；丢失的移动回执可核验结算，未知删除回执不能自动重删。依赖本机 Python/远端 Python 3；本次仅 Windows 临时夹具验证，没有生产清理。完整业务流程与 API 参数见 [SimpleExperiment PLAN 清除说明](https://github.com/zlinkw/SimpleExperiment/blob/master/docs/plan-cleanup.md)。
+0.2.67 提供 `files.cleanup.inspect/check/verify/preview/confirm/execute/status/settle` 受限接口，供 SimpleExperiment 0.5.276 的 PLAN 清除协调器使用。默认只读预览，移动固定到项目 `clean_dir/<原相对路径>`，无覆盖、保留 SHA256 清单；永久删除必须同批完整路径两次确认，文件/目录固定类型、规范父 cwd 与 `./直接子名称` 门禁不可绕过。Git 检查覆盖祖先仓库和 worktree；预览绑定 `safety.gitRepositoryAncestors: true` 与 `safety.readOnlyReceiptCheck: true` 能力。`check` 仅观察冻结目标和回执，零写入；节点重连后必须由用户审核新的精确目标并确认才能续办。归档目录不参与上传或同步。离线、活动传输、脏受跟踪文件、链接、挂载、共享硬链接、指纹变化和权限错误均阻断；丢失的移动回执可核验结算，未知删除回执不能自动重删。依赖本机 Python/远端 Python 3；本次仅 Windows 临时夹具验证，没有生产清理。完整业务流程与 API 参数见 [SimpleExperiment PLAN 清除说明](https://github.com/zlinkw/SimpleExperiment/blob/master/docs/plan-cleanup.md)。
 
 SimpleSFTP 是一个 Windows VS Code 扩展，用于在本地项目和远端 Linux 项目目录之间同步代码、轻量结果和 Agent runtime。本地与远端之间使用系统 `ssh` 和 `tar` 流传输，Worker 之间支持分区并行的 tar 流同步，也不会保存云凭据。
 

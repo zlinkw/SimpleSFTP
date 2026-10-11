@@ -30,6 +30,7 @@ def digest(value):
 
 
 def below(root, value):
+    root, value = os.path.normcase(root), os.path.normcase(value)
     return value != root and os.path.commonpath((root, value)) == root
 
 
@@ -52,7 +53,7 @@ def root_guard(raw):
     if not os.path.isabs(raw) or ".." in raw.replace("\\", "/").split("/"):
         deny("UNSAFE_ROOT")
     root = os.path.abspath(raw)
-    if root == os.path.dirname(root) or root == os.path.expanduser("~"):
+    if root == os.path.dirname(root) or os.path.normcase(root) == os.path.normcase(os.path.expanduser("~")):
         deny("UNSAFE_ROOT")
     cursor = root
     while cursor != os.path.dirname(cursor):
@@ -60,8 +61,12 @@ def root_guard(raw):
         if stat.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & 1024:
             deny("LINK_OR_REPARSE_POINT")
         cursor = os.path.dirname(cursor)
-    if os.path.realpath(root) != root or not os.path.isdir(root):
+    physical = os.path.realpath(root)
+    if os.path.normcase(physical) != os.path.normcase(root) or not os.path.isdir(physical):
         deny("ROOT_IDENTITY_CHANGED")
+    # Keep canonical physical spelling in receipts. Windows drive/filename case
+    # aliases are equivalent only after every ancestor passes link/reparse checks.
+    root = physical
     st = os.stat(root)
     return root, {"path": root, "device": str(st.st_dev), "inode": str(st.st_ino), "machine": socket.gethostname(), "user": str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "")}
 
@@ -88,9 +93,10 @@ def path_guard(root, rel, allow_clean=False, missing=False):
         if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
             deny("UNCERTAIN_TYPE", cursor)
     full = os.path.abspath(cursor)
-    if not below(root, full) or os.path.realpath(full) != full:
+    physical = os.path.realpath(full)
+    if not below(root, physical) or os.path.normcase(physical) != os.path.normcase(full):
         deny("PATH_ESCAPE")
-    return full
+    return physical
 
 
 def contents(root, full, expected_type):

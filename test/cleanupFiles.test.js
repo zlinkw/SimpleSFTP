@@ -52,6 +52,13 @@ test('local preview is zero-write, fixed types and unsafe paths fail closed',()=
   write(base,'root.csv');assert.equal(inspect(base,'root.csv').error.code,'UNSAFE_PARENT');
   assert.equal(run({root:path.parse(base).root,action:'inspect',target:{relativePath:'x',destination:'clean_dir/x',type:'file'}}).error.code,'UNSAFE_ROOT');
 });
+test('Windows path spelling aliases preserve physical root identity and read-only preview safety', {skip:process.platform!=='win32'},()=>{
+  const base=root();write(base,'Output/A.csv','fixture');
+  const original=inspect(base,'Output/A.csv');assert.equal(original.ok,true);
+  const alias=inspect(base.toLowerCase(),'output/a.csv');assert.equal(alias.ok,true,JSON.stringify(alias));
+  assert.deepEqual(alias.rootIdentity,original.rootIdentity);assert.equal(alias.target.absolutePath,original.target.absolutePath);
+  assert.equal(alias.target.fingerprint,original.target.fingerprint);assert.equal(fs.existsSync(path.join(base,'clean_dir')),false);
+});
 test('no-overwrite local move preserves fingerprints, identity and manifest, never visits production roots',()=>{
   const base=root();write(base,'job/attempt/weights.pt','fixture weights');write(base,'job/attempt/metric.csv','value\n1\n');
   const preview=inspect(base,'job/attempt','directory');assert.equal(preview.ok,true);

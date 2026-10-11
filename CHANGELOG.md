@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.67
+
+- Canonicalize Windows drive and filename spelling aliases before freezing cleanup root/target identities. A lower-case VS Code workspace path no longer falsely reports ROOT_IDENTITY_CHANGED.
+- Retain ancestor link/reparse, device, mount, type, fingerprint and direct-parent guards; no case relaxation on case-sensitive platforms. Read-only temporary fixtures only, no production cleanup.
+
 ## 0.2.66
 
 - Add read-only frozen cleanup receipt checks and safe missing-target inspection for reconnect review. Checks do not acquire mutation leases, settle audit state or execute file operations.
