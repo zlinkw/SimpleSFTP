@@ -2,7 +2,7 @@
 	"name": "simple-sftp",
 	"displayName": "SimpleSFTP",
 	"description": "为远端项目创建本地 SFTP 同步工作区，并提供批量文件上传下载与进度反馈。",
-	"version": "0.2.63",
+	"version": "0.2.64",
 	"publisher": "simple-local",
 	"extensionKind": [
 		"ui"
@@ -32,6 +32,8 @@
 		"resource-operation-lease.js",
 		"state-store.js",
 		"workspace-path.js",
+		"cleanup-file-api.js",
+		"cleanup-files.py",
 		"tar-writer.js",
 		"bin/simple-sftp-api.js",
 		"readme.md",

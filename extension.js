@@ -21,6 +21,8 @@ const { execFile, spawn } = require("child_process");
 const { resolveWorkspaceLocation } = require("./workspace-path.js");
 const { toTarPath: tarEntryPath, writeTarEntriesToStream } = require("./tar-writer.js");
 const { LocalApiServer, confirmationRequired, currentApiRequestContext } = require("./api-server.js");
+const { CleanupFileApi, fail: cleanupFail } = require("./cleanup-file-api");
+let cleanupFileApi;
 const {
   HostOperationLeaseConflictError,
   HostOperationLeaseManager,
@@ -39,6 +41,7 @@ const AGENTS_BLOCK_START = "<!-- SIMPLE_SFTP_START -->";
 const AGENTS_BLOCK_END = "<!-- SIMPLE_SFTP_END -->";
 
 const DEFAULT_IGNORES = [
+  "clean_dir",
   ".git",
   ".vscode",
   ".idea",
@@ -262,6 +265,16 @@ function activate(context) {
 }
 
 function startLocalApiServer(context) {
+  cleanupFileApi = new CleanupFileApi({
+    storageRoot: path.join(context.globalStorageUri.fsPath, "cleanup-operations"),
+    transport: cleanupFileTransport,
+    activity: async () => {
+      if ([...activeTransfers.values()].some(row => !["completed", "failed", "cancelled"].includes(row.status))
+        || activeUploadOperations.size || uploadQueues.size) cleanupFail("ACTIVE_TRANSFER");
+    },
+    lease: (node, targets, work) => withFileResourceLease("PLAN 安全清理", node.root, [""],
+      node.kind === "local" ? "local" : remoteResourceServer({ host: node.host, port: node.port }), work),
+  });
   const server = new LocalApiServer({
     name: "SimpleSFTP",
     version: String(PACKAGE_JSON.version || "0.2.0"),
@@ -269,6 +282,12 @@ function startLocalApiServer(context) {
     discoveryPath: path.join(APPDATA, "SimpleSFTP", "api.json"),
     methods: createLocalApiMethods(),
     methodOptions: {
+      "files.cleanup.inspect": { readOnly: true, zeroWrites: true },
+      "files.cleanup.verify": { readOnly: true, completedReceiptRequired: true },
+      "files.cleanup.settle": { frozenApprovalRequired: true, receiptOnly: true, startsNewMoves: false },
+      "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true },
+      "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
+      "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true },
       "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576 },
       "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
       "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, memoryWrapperResults: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024 },
@@ -790,6 +809,7 @@ function directSyncRelativePath(value) {
   const relative = String(value || "").trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
   if (Buffer.byteLength(relative, "utf8") > 4096 || /[:\0\r\n]/.test(relative)) throw new Error("Plan 产物相对路径不安全。");
   if (!relative || relative.startsWith("/") || relative.split("/").some((part) => !part || part === "." || part === "..")) throw new Error("Plan 产物相对路径不安全。");
+  if (relative.split("/").some(part => part.toLowerCase() === "clean_dir")) throw new Error("归档目录不参与同步或收集。");
   if (relative.split("/").some((part) => part.startsWith(".simple-sftp-stage-") || part.includes(".simple-sftp-partial-"))) throw new Error("路径保留给 SimpleSFTP 传输暂存使用。");
   return relative;
 }
@@ -3899,6 +3919,13 @@ function createTransferPreview({ localPath, sftp, operation, detail }) {
 
 function createLocalApiMethods() {
   const methods = {
+    "files.cleanup.verify": params => cleanupFileApi.verify(params),
+    "files.cleanup.settle": params => cleanupFileApi.settle(params),
+    "files.cleanup.inspect": params => cleanupFileApi.inspect(params),
+    "files.cleanup.preview": params => cleanupFileApi.preview(params),
+    "files.cleanup.confirm": params => cleanupFileApi.confirm(params),
+    "files.cleanup.execute": params => cleanupFileApi.execute(params),
+    "files.cleanup.status": params => cleanupFileApi.status(params),
     status: async () => {
       const active = getActiveSharedServer();
       return {
@@ -4729,6 +4756,39 @@ function watchTransferProcess(child, onIdle, fileStep = true, filenames = [], re
   return { dispose: () => idle.dispose(), receive, update };
 }
 
+async function cleanupFileTransport(request) {
+  const node = request.node;
+  let output;
+  const script = fs.readFileSync(path.join(__dirname, "cleanup-files.py"), "utf8");
+  if (node?.kind === "local") {
+    if (!path.isAbsolute(node.root)) cleanupFail("UNSAFE_ROOT");
+    output = await new Promise((resolve, reject) => {
+      const child = spawn(process.platform === "win32" ? "python" : "python3", ["-B", "-X", "utf8", path.join(__dirname, "cleanup-files.py")], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+      let text = "";
+      const timer = setTimeout(() => { child.kill(); reject(new Error("LOCAL_CLEANUP_TIMEOUT")); }, 60000);
+      child.stdout.on("data", chunk => { text += chunk.toString("utf8"); if (text.length > 16 * 1024 * 1024) { child.kill(); reject(new Error("INVENTORY_LIMIT")); } });
+      child.on("error", error => { clearTimeout(timer); reject(error); });
+      child.on("close", code => { clearTimeout(timer); code === 0 ? resolve(text) : reject(new Error("LOCAL_CLEANUP_FAILED")); });
+      child.stdin.on("error", () => {}); child.stdin.end(JSON.stringify(request));
+    });
+  } else {
+    const source = directSyncTarget({ host: node.host, username: node.user, port: node.port, remotePath: node.root }, "清理节点");
+    // Require a current configured identity. Disabled/history nodes remain available in the profile store.
+    const known = readSharedServers().servers.some(row => {
+      try {
+        const target = apiTransferSftp({ server: row });
+        return target.host === source.host && target.username === source.username && target.port === source.port
+          && String(target.remotePath).replace(/\/+$/, "") === source.remotePath;
+      } catch { return false; }
+    });
+    if (!known) cleanupFail("SERVER_IDENTITY_UNVERIFIED");
+    const loader = "import base64;exec(compile(base64.b64decode(" + JSON.stringify(Buffer.from(script, "utf8").toString("base64")) + "),'simple_sftp_cleanup','exec'))";
+    output = await runRemoteBatchSsh(source, `python3 -B -c ${shellQuote(loader)}`, [JSON.stringify(request)], 60000,
+      { remoteMutation: !["inspect", "inventory", "verify"].includes(request.action), stage: "PLAN 安全文件操作" });
+  }
+  return JSON.parse(String(output));
+}
+
 function runSsh(sftp, command, timeout) {
   return new Promise((resolve, reject) => {
     const child = execFile("ssh", getSshArgs(sftp, command), { timeout: 0, windowsHide: true, maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
@@ -5042,6 +5102,7 @@ function parseTimeMs(value) {
 }
 
 function isIgnoredLocalPath(relativePath, ignorePatterns) {
+  if (String(relativePath).replace(/\\/g, "/").split("/").some(part => part.toLowerCase() === "clean_dir")) return true;
   const normalized = toPosixPath(relativePath).replace(/^\/+/, "").replace(/\/+$/, "");
   if (!normalized) return false;
   const lowerPath = normalized.toLowerCase();
@@ -6174,6 +6235,7 @@ function createRemoteDownloadScript(remotePath, downloadScope) {
 
 function getTarExcludeArgs(ignorePatterns) {
   const excludes = new Set();
+  addTarExcludePattern(excludes, "clean_dir");
   for (const pattern of Array.isArray(ignorePatterns) ? ignorePatterns : []) {
     addTarExcludePattern(excludes, pattern);
   }

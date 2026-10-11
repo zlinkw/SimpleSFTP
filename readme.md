@@ -1,5 +1,7 @@
 # SimpleSFTP
 
+0.2.64 增加 `files.cleanup.inspect/verify/preview/confirm/execute/status/settle` 受限接口，供 SimpleExperiment 的 PLAN 清除协调器使用。默认只读预览，移动固定到项目 `clean_dir/<原相对路径>`，无覆盖、保留 SHA256 清单；永久删除必须同批完整路径两次确认，文件/目录固定类型、规范父 cwd 与 `./直接子名称` 门禁不可绕过。归档目录不参与上传或同步。离线、活动传输、脏受跟踪文件、链接、挂载、共享硬链接、指纹变化和权限错误均阻断；丢失的移动回执可核验结算，未知删除回执不能自动重删。依赖本机 Python/远端 Python 3；本次仅 Windows 临时夹具验证，没有生产清理。完整业务流程与 API 参数见 [SimpleExperiment PLAN 清除说明](https://github.com/zlinkw/SimpleExperiment/blob/master/docs/plan-cleanup.md)。
+
 SimpleSFTP 是一个 Windows VS Code 扩展，用于在本地项目和远端 Linux 项目目录之间同步代码、轻量结果和 Agent runtime。本地与远端之间使用系统 `ssh` 和 `tar` 流传输，Worker 之间支持分区并行的 tar 流同步，也不会保存云凭据。
 
 `sync.serverToServerFpsync` 按指定路径比较两端 SHA256，仅传变化文件。稳定文件先取 size/mtime，读完后核对身份；发现变化才退避等待，首次 0.25 秒、最多 1 秒，总时限 15 秒。普通批次同时限制为 80 文件、512 MiB 和命令元数据大小；显式合并传输可跨 Plan 合并文件，但仍受 512 MiB 与元数据界限约束。最多两路流；全局最多两个传输，每个 Worker 最多一个，不同 Worker 可以独立推进。归档内容持续流式处理，不在内存中缓存整个批次。进度中的 completedFiles/totalFiles 与 completedGroups/totalGroups 是整次请求成功完成的文件/分组数，独立于当前 child 的 processedFiles 阶段计数，后续解包不会清零。任一路失败后停止启动新组，等待已启动的资源结算，不报整批完成。`sync.serverToServerBatch` 与 `sync.serverToServer` 的非删除路径复用该实现。无需安装 fpsync，不落盘中间压缩包；目标端独有旧文件只提供精确清理预览，删除仍需单独两次确认。

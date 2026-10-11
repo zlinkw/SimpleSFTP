@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.64
+
+- Add frozen cleanup previews and separate exact-path confirmations, no-overwrite moves to clean_dir, guarded restore and fixed file/directory deletion executors.
+- Validate canonical root/parent identity, hashes, handles, dirty tracked targets, mount/link boundaries and manifests; persist receipts, settle interrupted moves and refuse uncertain deletion receipts. Always exclude clean_dir from synchronization.
+- Validate only temporary local fixtures and mock Workers; no production cleanup or live installation.
+
 ## 0.2.63
 
 - Scope abandoned-transfer exit checks to the original producer and its process descendants. A different live producer's verified child transports no longer block legacy inventory reconciliation. Check creation times to distinguish reused PIDs and collect bounded process ancestry without command lines.
