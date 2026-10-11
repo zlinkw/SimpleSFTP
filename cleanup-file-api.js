@@ -43,14 +43,21 @@ class CleanupFileApi {
       rows.push({ ...copy(target), ...result.target, destination: target.destination });
     }
     const row = { token: crypto.randomBytes(24).toString("hex"), operationId: "cleanup-" + crypto.randomBytes(16).toString("hex"), node: copy(node), rootIdentity: identity,
-      action, targets: rows, safety: { gitRepositoryAncestors: true }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
+      action, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
     row.digest = hash({ node: row.node, rootIdentity: identity, action, targets: rows, safety: row.safety });
     this.previews.set(row.token, copy(row)); // Preview does not write a journal or a remote hash cache.
     return copy(row);
   }
   async inspect(params) {
     if (!params.node?.root || !["file", "directory"].includes(params.target?.type)) fail("INVALID_REQUEST");
-    return this.checked({ node: params.node, root: params.node.root, action: "inventory", target: params.target });
+    return this.checked({ node: params.node, root: params.node.root, action: "inventory", target: params.target, allowMissing: params.allowMissing === true });
+  }
+  /** Read-only observation of a frozen receipt. Never settles audit state or starts a file operation. */
+  async check(params) {
+    const row = await this.read(params.token), index = params.index;
+    if (!Number.isInteger(index) || !row.targets[index]) fail("INVALID_TARGET");
+    return this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity, target: row.targets[index],
+      action: "check", deleted: row.action === "delete", receiptCompleted: row.states[index] === "completed" });
   }
   async confirm(params) {
     const row = await this.read(params.token);

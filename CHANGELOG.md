@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.66
+
+- Add read-only frozen cleanup receipt checks and safe missing-target inspection for reconnect review. Checks do not acquire mutation leases, settle audit state or execute file operations.
+- Advertise and bind the required readOnlyReceiptCheck safety capability. Changed roots, recreated sources and uncertain deletion receipts remain blocked; confirmed move settlement stays a separate operation.
+- Validate temporary fixtures and mock nodes only; no production cleanup.
+
 ## 0.2.65
 
 - Protect dirty tracked targets when the workspace is a subdirectory of a Git repository, including Git worktrees. Advertise and bind the required safety capability to cleanup previews.

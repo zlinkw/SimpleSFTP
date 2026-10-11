@@ -185,7 +185,7 @@ class LocalApiServer {
         return;
       }
       const controller = new AbortController();
-      const readOnly = /\.(list|get|status|schema)$/.test(payload.method) || ["files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.verify"].includes(payload.method) || /^(project\.(inventory|fileStats|tree)|sync\.(?:projectInventory|projectFileStats|projectTree|planLogPaths|listPlanLogs)|transfers\.reconcile)$/.test(payload.method);
+      const readOnly = /\.(list|get|status|schema)$/.test(payload.method) || ["files.cleanup.check", "files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.verify"].includes(payload.method) || /^(project\.(inventory|fileStats|tree)|sync\.(?:projectInventory|projectFileStats|projectTree|planLogPaths|listPlanLogs)|transfers\.reconcile)$/.test(payload.method);
       const cancelRead = () => { if (readOnly) controller.abort(new Error("API_READ_CANCELLED")); };
       request.on("aborted", cancelRead); response.on("close", cancelRead);
       if (request.aborted || response.destroyed) cancelRead();

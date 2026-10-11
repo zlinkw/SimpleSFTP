@@ -12,6 +12,28 @@ function run(request){const child=spawnSync('python',['-B','-X','utf8',engine],{
 function write(base,rel,contents='验证 fixture\n'){fs.mkdirSync(path.dirname(path.join(base,rel)),{recursive:true});fs.writeFileSync(path.join(base,rel),contents,'utf8');}
 function inspect(base,rel,type='file'){return run({root:base,action:'inspect',target:{relativePath:rel,destination:'clean_dir/'+rel,type}});}
 
+test('reconnection receipt checks are zero-write, detect changed sources and never settle an uncertain deletion',()=>{
+  const base=root(),rel='output/a.csv';write(base,rel,'fixture');const preview=inspect(base,rel),target={...preview.target,relativePath:rel,destination:'clean_dir/'+rel,type:'file'};
+  const request={root:base,rootIdentity:preview.rootIdentity,action:'check',target};
+  assert.equal(run(request).state,'pending');assert.equal(fs.existsSync(path.join(base,'clean_dir')),false);
+  assert.equal(run({...request,rootIdentity:{...preview.rootIdentity,inode:'changed'}}).error.code,'ROOT_IDENTITY_CHANGED');
+  assert.equal(run({root:base,action:'inventory',allowMissing:true,target:{relativePath:'output/missing.csv',type:'file'}}).target.missing,true);
+  const moved=run({...request,action:'move',operationId:'fixture-check'});assert.equal(moved.ok,true);
+  const audit=fs.readFileSync(path.join(base,'clean_dir/MANIFEST.md'),'utf8');assert.equal(run(request).state,'completed');assert.equal(fs.readFileSync(path.join(base,'clean_dir/MANIFEST.md'),'utf8'),audit);
+  assert.equal(run({...request,deleted:true}).state,'absent_unverified');assert.equal(run({...request,deleted:true,receiptCompleted:true}).state,'completed');
+  write(base,rel,'new attempt');assert.equal(run(request).error.code,'SOURCE_RECREATED_OR_CHANGED');
+});
+
+test('file API receipt observation starts no mutation, journal or lease and advertises the live read-only contract',async()=>{
+  const base=root(),node={id:'local',kind:'local',root:base},requests=[];
+  const api=new CleanupFileApi({storageRoot:path.join(base,'state'),activity:async()=>{},lease:()=>assert.fail('readonly check cannot lease a mutation'),
+    transport:async request=>{requests.push(request);return {ok:true,rootIdentity:{path:base},...(request.action==='check'?{state:'pending'}:{target:{absolutePath:base+'/output/a.csv',fingerprint:'fp',contentFingerprint:'fp'}})}}});
+  const p=await api.preview({node,targets:[{relativePath:'output/a.csv',type:'file',destination:'clean_dir/output/a.csv'}]});assert.equal(p.safety.readOnlyReceiptCheck,true);
+  assert.equal((await api.check({token:p.token,index:0})).state,'pending');assert.ok(requests.every(request=>['inspect','check'].includes(request.action)));assert.equal(fs.existsSync(path.join(base,'state')),false);
+  const source=fs.readFileSync(require.resolve('../extension.js'),'utf8'),server=fs.readFileSync(require.resolve('../api-server.js'),'utf8');
+  assert.match(source,/"files.cleanup.check": \{ readOnly: true, zeroWrites: true/);assert.ok(server.includes('"files.cleanup.check", "files.cleanup.preview"'));
+});
+
 test('archive exclusion survives custom ignores and explicit artifact paths without executing transfers',()=>{
   const source=fs.readFileSync(require.resolve('../extension.js'),'utf8');
   const extract=name=>{const start=source.indexOf('function '+name+'('),end=source.indexOf('\nfunction ',start+1);assert.ok(start>=0&&end>start);return source.slice(start,end)};

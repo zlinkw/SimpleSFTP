@@ -283,9 +283,10 @@ function startLocalApiServer(context) {
     methods: createLocalApiMethods(),
     methodOptions: {
       "files.cleanup.inspect": { readOnly: true, zeroWrites: true },
+      "files.cleanup.check": { readOnly: true, zeroWrites: true, receiptOnly: true, automaticExecution: false },
       "files.cleanup.verify": { readOnly: true, completedReceiptRequired: true },
       "files.cleanup.settle": { frozenApprovalRequired: true, receiptOnly: true, startsNewMoves: false },
-      "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true },
+      "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true },
       "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
       "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true },
       "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576 },
@@ -3919,6 +3920,7 @@ function createTransferPreview({ localPath, sftp, operation, detail }) {
 
 function createLocalApiMethods() {
   const methods = {
+    "files.cleanup.check": params => cleanupFileApi.check(params),
     "files.cleanup.verify": params => cleanupFileApi.verify(params),
     "files.cleanup.settle": params => cleanupFileApi.settle(params),
     "files.cleanup.inspect": params => cleanupFileApi.inspect(params),
@@ -4784,7 +4786,7 @@ async function cleanupFileTransport(request) {
     if (!known) cleanupFail("SERVER_IDENTITY_UNVERIFIED");
     const loader = "import base64;exec(compile(base64.b64decode(" + JSON.stringify(Buffer.from(script, "utf8").toString("base64")) + "),'simple_sftp_cleanup','exec'))";
     output = await runRemoteBatchSsh(source, `python3 -B -c ${shellQuote(loader)}`, [JSON.stringify(request)], 60000,
-      { remoteMutation: !["inspect", "inventory", "verify"].includes(request.action), stage: "PLAN 安全文件操作" });
+      { remoteMutation: !["check", "inspect", "inventory", "verify"].includes(request.action), stage: "PLAN 安全文件操作" });
   }
   return JSON.parse(String(output));
 }

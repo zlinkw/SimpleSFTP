@@ -369,27 +369,42 @@ def mutation_lock(root):
 def main(request):
     root, identity = root_guard(request["root"])
     action = request["action"]
-    if action not in ("verify", "inventory", "inspect", "move", "delete", "restore", "settle"):
+    if action not in ("check", "verify", "inventory", "inspect", "move", "delete", "restore", "settle"):
         deny("UNKNOWN_ACTION")
     if action == "inventory":
         target = request["target"]
-        full = path_guard(root, target["relativePath"])
+        full = path_guard(root, target["relativePath"], missing=request.get("allowMissing") is True)
+        if not below(root, os.path.dirname(full)):
+            deny("UNSAFE_PARENT")
+        if not os.path.lexists(full):
+            return {"ok": True, "rootIdentity": identity, "target": {"missing": True, "type": target["type"], "absolutePath": full}}
         return {"ok": True, "rootIdentity": identity, "target": {**contents(root, full, target["type"]), "absolutePath": full}}
-    if action in ("settle", "verify"):
+    if action in ("check", "settle", "verify"):
         if request.get("rootIdentity") and request["rootIdentity"] != identity:
             deny("ROOT_IDENTITY_CHANGED")
         target = request["target"]
         source = path_guard(root, target["relativePath"], True, True)
         destination = path_guard(root, target["destination"], True, True)
         if os.path.lexists(source):
+            if action == "check":
+                value = contents(root, source, target["type"])
+                if value["fingerprint"] != target["fingerprint"]:
+                    deny("SOURCE_RECREATED_OR_CHANGED")
+                if os.path.lexists(destination):
+                    deny("DESTINATION_EXISTS")
+                return {"ok": True, "state": "pending", "rootIdentity": identity}
             deny("SOURCE_RECREATED_OR_NOT_MOVED")
         if request.get("deleted") is True:
+            if action == "check":
+                return {"ok": True, "state": "completed" if request.get("receiptCompleted") is True else "absent_unverified", "rootIdentity": identity}
             return {"ok": True, "irreversible": True}
         if not os.path.lexists(destination):
             deny("RECEIPT_UNVERIFIED")
         value = contents(root, destination, target["type"])
         if value["contentFingerprint"] != target["contentFingerprint"] or value["inode"] != target["inode"]:
             deny("CONTENT_CHANGED")
+        if action == "check":
+            return {"ok": True, "state": "completed", "rootIdentity": identity}
         if action == "settle":
             audit(root, {"operationId": request["operationId"], "action": request.get("settledAction", "move"), "phase": "completed-after-settlement", "source": source, "destination": destination, **value})
         return {"ok": True, "rootIdentity": identity, "receipt": value}
