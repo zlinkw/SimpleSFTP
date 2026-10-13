@@ -13,6 +13,7 @@ import urllib.request
 import uuid
 
 AGENT_ACTIVITY_MAX_BYTES = 16 * 1024 * 1024
+AGENT_TERMINAL_TASK_STATES = frozenset(("completed", "failed", "cancelled", "canceled", "stopped", "unavailable"))
 
 
 class AgentLifecycleError(RuntimeError):
@@ -121,6 +122,23 @@ def lifecycle_process(pid):
         return {}
 
 
+def lifecycle_active_tasks(state):
+    """Diagnostic observations only; task activity never gates Agent lifecycle."""
+    active = []
+    for name, key in (("worker_task_snapshot.json", "tasks"), ("distributed_plan_queue.json", "jobs")):
+        try:
+            rows = lifecycle_json(os.path.join(state, name), AGENT_ACTIVITY_MAX_BYTES).get(key, [])
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise ValueError("invalid activity rows")
+        except (OSError, ValueError, AgentLifecycleError):
+            active.append("unverified-activity:" + name)
+            continue
+        for row in rows:
+            if str(row.get("status") or "").strip().lower() not in AGENT_TERMINAL_TASK_STATES:
+                active.append(str(row.get("commandId") or row.get("globalJobId") or "unknown"))
+    return list(dict.fromkeys(active))
+
+
 def lifecycle_legacy_proof(contract, params):
     """Observe legacy ownership without adopting it, signalling or writing."""
     state = contract["stateDir"]
@@ -150,30 +168,31 @@ def lifecycle_legacy_proof(contract, params):
         old_uuids = sorted(str(row.get("uuid") or "") for row in workers[0].get("gpus", []))
         if gpus.returncode or len(indices) != int(workers[0]["totalGpus"]) or old_indices != indices or old_uuids != uuids:
             raise AgentLifecycleError("AGENT_LEGACY_GPU_CONTAINER_CONFLICT")
-    active = []
-    for name, key in (("worker_task_snapshot.json", "tasks"), ("distributed_plan_queue.json", "jobs")):
-        for row in lifecycle_json(os.path.join(state, name), AGENT_ACTIVITY_MAX_BYTES).get(key, []):
-            if row.get("status") not in ("completed", "failed", "cancelled", "unavailable"):
-                active.append(str(row.get("commandId") or row.get("globalJobId") or "unknown"))
-    # An unprocessed legacy command may launch after a restart. Fail closed even
-    # without a materialized task snapshot; validate the original cursor prefix.
+    active = lifecycle_active_tasks(state)
+    # Queue contents/cursors remain untouched. Unprocessed or unreadable activity
+    # is diagnostic; ownership is proved independently of research task state.
     for queue in pathlib.Path(state).glob("worker_commands_*.jsonl"):
-        if queue.is_symlink() or not queue.is_file() or queue.stat().st_size > 4 * 1024 * 1024:
+        if queue.is_symlink() or not queue.is_file():
             raise AgentLifecycleError("AGENT_LEGACY_QUEUE_UNVERIFIED")
-        raw = queue.read_bytes()
-        cursor = lifecycle_json(str(queue)[:-6] + ".cursor.json")
-        count = int(cursor.get("queueSeq") or 0)
-        if count < 0 or count > len(raw.splitlines()):
-            raise AgentLifecycleError("AGENT_LEGACY_QUEUE_UNVERIFIED")
-        stat = queue.stat()
-        prefix = int(cursor.get("prefixLength") or 0)
-        if count and (int(cursor.get("device", -1)) != stat.st_dev or int(cursor.get("inode", -1)) != stat.st_ino
-                      or len(raw) < int(cursor.get("size", -1)) or prefix > len(raw)
-                      or hashlib.sha256(raw[:prefix]).hexdigest() != cursor.get("prefixSha256")):
-            raise AgentLifecycleError("AGENT_LEGACY_QUEUE_UNVERIFIED")
-        for line in raw.splitlines()[count:]:
-            row = json.loads(line)
-            active.append(str(row.get("commandId") or "unprocessed-command"))
+        if queue.stat().st_size > 4 * 1024 * 1024:
+            active.append("unverified-activity:" + queue.name)
+            continue
+        try:
+            raw = queue.read_bytes()
+            cursor = lifecycle_json(str(queue)[:-6] + ".cursor.json")
+            count = int(cursor.get("queueSeq") or 0)
+            stat = queue.stat()
+            prefix = int(cursor.get("prefixLength") or 0)
+            if count < 0 or count > len(raw.splitlines()) or count and (
+                    int(cursor.get("device", -1)) != stat.st_dev or int(cursor.get("inode", -1)) != stat.st_ino
+                    or len(raw) < int(cursor.get("size", -1)) or prefix < 0 or prefix > len(raw)
+                    or hashlib.sha256(raw[:prefix]).hexdigest() != cursor.get("prefixSha256")):
+                raise ValueError("unverified cursor")
+            for line in raw.splitlines()[count:]:
+                row = json.loads(line)
+                active.append(str(row.get("commandId") or "unprocessed-command"))
+        except (OSError, ValueError, AttributeError, AgentLifecycleError):
+            active.append("unverified-activity:" + queue.name)
     health = lifecycle_health(contract, params.get("agentToken") or "")
     script = os.path.join(contract["installDir"], "simple_cluster", "runtime", "cluster_agent.py")
     processes = []
@@ -237,16 +256,17 @@ def lifecycle_legacy_proof(contract, params):
                 raise AgentLifecycleError("AGENT_LEGACY_CONTENT_UNVERIFIED", name)
             inventory.append({"name": name, "type": kind, "device": stat.st_dev, "uid": stat.st_uid})
     # Mutable telemetry bytes are retained, not rewritten. Bind stable session,
-    # directory/file identities, current container and exact process instead.
+    # root identity, current container and exact process instead. Changing task
+    # activity and newly written telemetry names are not confirmation bindings.
     state_stat = os.stat(state)
     if state_stat.st_uid != contract["uid"]:
         raise AgentLifecycleError("AGENT_LEGACY_IDENTITY_UNVERIFIED")
-    proof = {"contract": contract, "session": session, "process": process, "inventory": inventory, "activeTasks": active,
+    proof = {"contract": contract, "session": session, "process": process,
              "stateIdentity": [state_stat.st_dev, state_stat.st_ino, state_stat.st_uid], "runtimeFiles": lifecycle_files(contract, {})}
     digest = hashlib.sha256(json.dumps(proof, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     stable = dict(proof, process={})
     stable_digest = hashlib.sha256(json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    return {"digest": digest, "activeTasks": active, "runningVersion": health.get("runtimeVersion"),
+    return {"digest": digest, "activeTasks": list(dict.fromkeys(active)), "activeTasksBlockRestart": False, "runningVersion": health.get("runtimeVersion"),
             "pid": process.get("pid"), "process": process, "contract": contract, "stableDigest": stable_digest}
 
 
@@ -254,8 +274,6 @@ def lifecycle_migrate(params):
     import fcntl
     contract = lifecycle_contract(params)
     proof = lifecycle_legacy_proof(contract, params)
-    if proof["activeTasks"]:
-        raise AgentLifecycleError("AGENT_ACTIVE_TASK", proof["activeTasks"])
     if not params.get("migrationDigest") or params["migrationDigest"] != proof["digest"]:
         raise AgentLifecycleError("AGENT_MIGRATION_CONFIRM_REQUIRED")
     if lifecycle_json(os.path.join(contract["stateDir"], "agent.owner.json")):
@@ -321,6 +339,25 @@ def lifecycle_verify_running(contract, health, process):
         differences.append("instance")
     if differences:
         raise AgentLifecycleError("AGENT_PROCESS_UNVERIFIED", ",".join(differences))
+    return actual
+
+
+def lifecycle_verify_owned_process(contract, record):
+    """Verify an unresponsive auxiliary process without relying on its HTTP health."""
+    actual = lifecycle_process(record.get("pid", 0))
+    if not actual or actual != record.get("process") or actual["uid"] != contract["uid"] or actual["pid"] <= 1 or actual["pid"] == os.getpid():
+        raise AgentLifecycleError("AGENT_PROCESS_UNVERIFIED")
+    script = os.path.join(contract["installDir"], "simple_cluster", "runtime", "cluster_agent.py")
+    argv = actual["argv"]
+    wanted = {"--project-dir": contract["projectDir"], "--mode": contract["mode"], "--host": contract["host"], "--port": str(contract["port"]), "--worker-id": contract["workerId"]}
+    if len(argv) != 3 + 2 * len(wanted) or argv[1:3] != [script, "serve"] or dict(zip(argv[3::2], argv[4::2])) != wanted:
+        raise AgentLifecycleError("AGENT_PROCESS_UNVERIFIED")
+    if any(os.readlink("/proc/" + str(actual["pid"]) + "/ns/" + name) != os.readlink("/proc/self/ns/" + name) for name in ("pid", "mnt")):
+        raise AgentLifecycleError("AGENT_PROCESS_UNVERIFIED")
+    with open("/proc/" + str(actual["pid"]) + "/environ", "rb") as stream:
+        env = dict(part.split(b"=", 1) for part in stream.read(1024 * 1024).split(b"\0") if b"=" in part)
+    if not record.get("nonce") or env.get(b"SIMPLE_EXPERIMENT_AGENT_NONCE", b"").decode() != record["nonce"] or env.get(b"SIMPLE_EXPERIMENT_AGENT_INSTALL_DIR", b"").decode() != contract["installDir"]:
+        raise AgentLifecycleError("AGENT_PROCESS_UNVERIFIED")
     return actual
 
 
@@ -420,14 +457,9 @@ def lifecycle_inspect(params):
     if health:
         lifecycle_verify_running(contract, health, record)
     elif actual:
-        if actual != record.get("process"):
-            raise AgentLifecycleError("AGENT_PROCESS_UNVERIFIED")
-        raise AgentLifecycleError("AGENT_UNHEALTHY_OWNED_PROCESS", str(actual["pid"]))
-    tasks = lifecycle_json(os.path.join(contract["stateDir"], "worker_task_snapshot.json"), AGENT_ACTIVITY_MAX_BYTES).get("tasks", [])
-    tasks += lifecycle_json(os.path.join(contract["stateDir"], "distributed_plan_queue.json"), AGENT_ACTIVITY_MAX_BYTES).get("jobs", [])
-    active = [str(row.get("commandId") or row.get("globalJobId") or "unknown") for row in tasks
-              if row.get("status") not in ("completed", "failed", "cancelled", "unavailable")]
-    return {"ok": True, "status": "running" if health else "absent", "contract": contract, "activeTasks": active,
+        lifecycle_verify_owned_process(contract, record)
+    active = lifecycle_active_tasks(contract["stateDir"])
+    return {"ok": True, "status": "running" if health else "unhealthy" if actual else "absent", "contract": contract, "activeTasks": active, "activeTasksBlockRestart": False,
             "identity": health.get("agentIdentity"), "runningVersion": health.get("runtimeVersion"), "files": files}
 
 
@@ -455,27 +487,21 @@ def lifecycle_control(params):
         record = lifecycle_json(record_path)
         version = str(params.get("expectedVersion") or "")
         if action != "stop":
-            if before["status"] != "running" and before.get("activeTasks"):
-                raise AgentLifecycleError("AGENT_ACTIVE_TASK", before["activeTasks"])
             proofs = lifecycle_files(contract, params)
             if not version or any(not proofs.get(name) or proofs[name] != (params.get("files") or {}).get(name) for name in proofs):
                 raise AgentLifecycleError("AGENT_RUNTIME_PROOF_REQUIRED")
-        if before["status"] == "running":
+        if before["status"] in ("running", "unhealthy"):
             identity = before["identity"]
-            if action == "ensure" and before["runningVersion"] == version:
+            if action == "ensure" and before["status"] == "running" and before["runningVersion"] == version:
                 lifecycle_files(contract, params)
                 if identity.get("runtimeFiles") != params.get("files"):
                     raise AgentLifecycleError("AGENT_RUNNING_HASH_MISMATCH")
                 return dict(before, reused=True)
-            if action == "ensure":
+            if action == "ensure" and before["status"] == "running":
                 raise AgentLifecycleError("AGENT_RUNNING_VERSION_MISMATCH", str(before["runningVersion"]))
-            # Refuse restart while the Agent has outstanding accepted/queued jobs.
-            tasks = lifecycle_json(os.path.join(contract["stateDir"], "worker_task_snapshot.json"), AGENT_ACTIVITY_MAX_BYTES).get("tasks", [])
-            tasks += lifecycle_json(os.path.join(contract["stateDir"], "distributed_plan_queue.json"), AGENT_ACTIVITY_MAX_BYTES).get("jobs", [])
-            for task in tasks:
-                if task.get("status") not in ("completed", "failed", "cancelled", "unavailable"):
-                    raise AgentLifecycleError("AGENT_ACTIVE_TASK", str(task.get("commandId") or "unknown"))
-            actual = lifecycle_verify_running(contract, lifecycle_health(contract, params.get("agentToken") or ""), record)
+            # Research tasks never block an auxiliary-only stop/restart.
+            health = lifecycle_health(contract, params.get("agentToken") or "")
+            actual = lifecycle_verify_running(contract, health, record) if health else lifecycle_verify_owned_process(contract, record)
             if actual["pid"] <= 1 or actual["pid"] == os.getpid():
                 raise AgentLifecycleError("AGENT_PROCESS_UNVERIFIED")
             # A pidfd pins the verified process against PID reuse. Never kill descendants.

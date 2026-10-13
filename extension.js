@@ -283,7 +283,7 @@ function startLocalApiServer(context) {
     discoveryPath: path.join(APPDATA, "SimpleSFTP", "api.json"),
     methods: createLocalApiMethods(),
     methodOptions: {
-      "agents.lifecycle": { actions: ["inspect", "ensure", "stop", "restart", "migrate"], independentService: 1, ownerVerifiedPidfdOnly: true, runtimeHashProof: true, inspectZeroWrites: true, researchEnvironmentManagement: "external", agentResearchEnvironmentValidation: false, legacyMigration: { explicitFrozenDigest: true, noActiveJobs: true, preservesState: true } },
+      "agents.lifecycle": { actions: ["inspect", "ensure", "stop", "restart", "migrate"], independentService: 1, ownerVerifiedPidfdOnly: true, runtimeHashProof: true, inspectZeroWrites: true, activeTasksBlockRestart: false, restartPreservesTasks: true, researchEnvironmentManagement: "external", agentResearchEnvironmentValidation: false, legacyMigration: { explicitFrozenDigest: true, noActiveJobs: false, preservesState: true } },
       "files.cleanup.inspect": { readOnly: true, zeroWrites: true },
       "files.cleanup.check": { readOnly: true, zeroWrites: true, receiptOnly: true, automaticExecution: false },
       "files.cleanup.verify": { readOnly: true, completedReceiptRequired: true },
