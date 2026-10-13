@@ -216,7 +216,32 @@ def lifecycle_service_guard(args, version):
 
 def lifecycle_inspect(params):
     contract = lifecycle_contract(params)
-    lifecycle_check_owner(contract)
+    try:
+        lifecycle_check_owner(contract)
+    except AgentLifecycleError as error:
+        if error.code != "AGENT_LEGACY_STATE_UNVERIFIED":
+            raise
+        # Read-only, fixed small metadata evidence. Never adopt legacy state or
+        # expose process commands, credentials, arbitrary files or entire configs.
+        fields = {"agent.session.json": ("agentVersion", "startedAt", "agentInstallDir", "agentStateDir", "tokenConfigured"),
+                  "worker_availability.json": ("schemaVersion", "workerId", "projectId", "projectRoot", "generatedAt", "agentVersion", "status"),
+                  "gpu_snapshot.json": ("schemaVersion", "workerId", "projectId", "projectRoot", "generatedAt", "agentVersion")}
+        metadata = []
+        for name, allowed in fields.items():
+            filename = os.path.join(contract["stateDir"], name)
+            value = lifecycle_json(filename)
+            if not os.path.exists(filename):
+                continue
+            with open(filename, "rb") as stream:
+                raw = stream.read(65537)
+            if len(raw) > 65536:
+                raise AgentLifecycleError("AGENT_OWNER_INVALID", filename)
+            metadata.append({"path": filename, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                             "values": {key: value[key] for key in allowed if key in value}})
+        health = lifecycle_health(contract, params.get("agentToken") or "")
+        return {"ok": False, "code": error.code, "error": str(error), "evidence": {
+            "stateDir": contract["stateDir"], "metadata": metadata, "requiresExplicitMigration": True,
+            "health": {key: health[key] for key in ("projectRoot", "agentStateDir", "agentInstallDir", "runtimeVersion", "mode", "startedAt") if key in health}}}
     files = lifecycle_files(contract, {**params, "files": {}})
     health = lifecycle_health(contract, params.get("agentToken") or "")
     record = lifecycle_json(os.path.join(contract["stateDir"], "agent.process.json"))
