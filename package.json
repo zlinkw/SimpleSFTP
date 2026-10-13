@@ -2,7 +2,7 @@
 	"name": "simple-sftp",
 	"displayName": "SimpleSFTP",
 	"description": "为远端项目创建本地 SFTP 同步工作区，并提供批量文件上传下载与进度反馈。",
-	"version": "0.2.69",
+	"version": "0.2.70",
 	"publisher": "simple-local",
 	"extensionKind": [
 		"ui"
@@ -10,7 +10,7 @@
 	"license": "MIT",
 	"scripts": {
 		"test": "node scripts/test-serial.js",
-		"build": "node scripts/verify-runtime.js && node --test --test-force-exit --test-timeout 20000 test/formalJobCleanupOwner.test.js && node --test --test-force-exit --test-timeout 20000 test/pairedUpdateDrain.test.js",
+		"build": "node scripts/verify-runtime.js && node --test --test-force-exit --test-timeout 20000 test/formalJobCleanupOwner.test.js && node --test --test-force-exit --test-timeout 20000 test/pairedUpdateDrain.test.js && node --test --test-force-exit --test-timeout 20000 test/agentLifecycle.test.js",
 		"package": "npm run build && node scripts/package-vsix.js",
 		"install:latest": "pwsh.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/install-latest.ps1"
 	},
@@ -37,7 +37,9 @@
 		"tar-writer.js",
 		"bin/simple-sftp-api.js",
 		"readme.md",
-		"LICENSE.txt"
+		"LICENSE.txt",
+		"agent-lifecycle.js",
+		"agent-lifecycle.py"
 	],
 	"engines": {
 		"vscode": "^1.80.0"
@@ -57,7 +59,8 @@
 		"onCommand:simpleSftp.uploadWorkspace",
 		"onCommand:simpleSftp.uploadFiles",
 		"onCommand:simpleSftp.markHandoffReady",
-		"onCommand:simpleSftp.configureDownloadScope"
+		"onCommand:simpleSftp.configureDownloadScope",
+		"onCommand:simpleSftp.agentLifecycle"
 	],
 	"main": "./extension.js",
 	"contributes": {

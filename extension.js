@@ -182,6 +182,7 @@ function activate(context) {
     "simpleSftp.uploadFiles",
     (options) => uploadFiles(options)
   );
+  context.subscriptions.push(vscode.commands.registerCommand("simpleSftp.agentLifecycle", options => agentLifecycle(options)));
   const selectServerCommand = vscode.commands.registerCommand(
     "simpleSftp.selectServer",
     () => selectServer()
@@ -282,6 +283,7 @@ function startLocalApiServer(context) {
     discoveryPath: path.join(APPDATA, "SimpleSFTP", "api.json"),
     methods: createLocalApiMethods(),
     methodOptions: {
+      "agents.lifecycle": { actions: ["inspect", "ensure", "stop", "restart"], independentService: 1, ownerVerifiedPidfdOnly: true, runtimeHashProof: true, inspectZeroWrites: true },
       "files.cleanup.inspect": { readOnly: true, zeroWrites: true },
       "files.cleanup.check": { readOnly: true, zeroWrites: true, receiptOnly: true, automaticExecution: false },
       "files.cleanup.verify": { readOnly: true, completedReceiptRequired: true },
@@ -3918,8 +3920,20 @@ function createTransferPreview({ localPath, sftp, operation, detail }) {
   };
 }
 
+async function agentLifecycle(options = {}) {
+  const protocol = require("./agent-lifecycle.js");
+  const payload = protocol.agentPayload(options);
+  const sftp = apiTransferSftp(options);
+  if (!sftp.host) throw new Error("AGENT_TRANSPORT_REQUIRED");
+  if (payload.action !== "inspect" && (options.confirm !== true || options.pathConfirmed !== true))
+    throw confirmationRequired({ method: "agents.lifecycle", target: { host: sftp.host, port: sftp.port, user: sftp.username },
+      payload: { ...payload, agentToken: undefined }, requires: ["confirm", "pathConfirmed"] });
+  return protocol.runAgentRemote(getSshArgs(sftp, protocol.agentRemoteCommand()), payload);
+}
+
 function createLocalApiMethods() {
   const methods = {
+    "agents.lifecycle": params => agentLifecycle(params),
     "files.cleanup.check": params => cleanupFileApi.check(params),
     "files.cleanup.verify": params => cleanupFileApi.verify(params),
     "files.cleanup.settle": params => cleanupFileApi.settle(params),
