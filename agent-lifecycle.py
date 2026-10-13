@@ -19,13 +19,16 @@ class AgentLifecycleError(RuntimeError):
         super().__init__(code + (": " + str(detail) if detail else ""))
 
 
-def lifecycle_json(path):
+def lifecycle_json(path, max_bytes=65536):
     if not os.path.exists(path):
         return {}
-    if os.path.islink(path) or not os.path.isfile(path) or os.stat(path).st_size > 65536:
+    if os.path.islink(path) or not os.path.isfile(path) or os.stat(path).st_size > max_bytes:
         raise AgentLifecycleError("AGENT_OWNER_INVALID", path)
-    with open(path, encoding="utf-8") as stream:
-        value = json.load(stream)
+    with open(path, "rb") as stream:
+        raw = stream.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise AgentLifecycleError("AGENT_OWNER_INVALID", path)
+    value = json.loads(raw.decode("utf-8"))
     if not isinstance(value, dict):
         raise AgentLifecycleError("AGENT_OWNER_INVALID", path)
     return value
@@ -114,6 +117,156 @@ def lifecycle_process(pid):
                 "uid": base.stat().st_uid}
     except (OSError, ValueError, IndexError):
         return {}
+
+
+def lifecycle_legacy_proof(contract, params):
+    """Observe legacy ownership without adopting it, signalling or writing."""
+    state = contract["stateDir"]
+    session = lifecycle_json(os.path.join(state, "agent.session.json"))
+    if session.get("agentInstallDir") != contract["installDir"] or session.get("agentStateDir") != state:
+        raise AgentLifecycleError("AGENT_LEGACY_IDENTITY_UNVERIFIED")
+    availability = lifecycle_json(os.path.join(state, "worker_availability.json"))
+    workers = availability.get("workers", [])
+    if contract["mode"] == "worker_telemetry" and (len(workers) != 1 or workers[0].get("workerId") != contract["workerId"]):
+        raise AgentLifecycleError("AGENT_LEGACY_WORKER_CONFLICT")
+    if workers and int(workers[0].get("totalGpus") or 0) > 0:
+        # A CPU fallback container must never claim the former GPU container's state.
+        try:
+            gpus = subprocess.run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"], capture_output=True, text=True, timeout=3)
+            indices = sorted(int(line.strip()) for line in gpus.stdout.splitlines() if line.strip())
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            raise AgentLifecycleError("AGENT_LEGACY_GPU_CONTAINER_CONFLICT")
+        old_indices = sorted(int(row["index"]) for row in workers[0].get("gpus", []) if "index" in row)
+        if gpus.returncode or len(indices) != int(workers[0]["totalGpus"]) or old_indices and old_indices != indices:
+            raise AgentLifecycleError("AGENT_LEGACY_GPU_CONTAINER_CONFLICT")
+    active = []
+    for name, key in (("worker_task_snapshot.json", "tasks"), ("distributed_plan_queue.json", "jobs")):
+        for row in lifecycle_json(os.path.join(state, name), 4 * 1024 * 1024).get(key, []):
+            if row.get("status") not in ("completed", "failed", "cancelled", "unavailable"):
+                active.append(str(row.get("commandId") or row.get("globalJobId") or "unknown"))
+    # An unprocessed legacy command may launch after a restart. Fail closed even
+    # without a materialized task snapshot; validate the original cursor prefix.
+    for queue in pathlib.Path(state).glob("worker_commands_*.jsonl"):
+        if queue.is_symlink() or not queue.is_file() or queue.stat().st_size > 4 * 1024 * 1024:
+            raise AgentLifecycleError("AGENT_LEGACY_QUEUE_UNVERIFIED")
+        raw = queue.read_bytes()
+        cursor = lifecycle_json(str(queue)[:-6] + ".cursor.json")
+        count = int(cursor.get("queueSeq") or 0)
+        if count < 0 or count > len(raw.splitlines()):
+            raise AgentLifecycleError("AGENT_LEGACY_QUEUE_UNVERIFIED")
+        stat = queue.stat()
+        prefix = int(cursor.get("prefixLength") or 0)
+        if count and (int(cursor.get("device", -1)) != stat.st_dev or int(cursor.get("inode", -1)) != stat.st_ino
+                      or len(raw) < int(cursor.get("size", -1)) or prefix > len(raw)
+                      or hashlib.sha256(raw[:prefix]).hexdigest() != cursor.get("prefixSha256")):
+            raise AgentLifecycleError("AGENT_LEGACY_QUEUE_UNVERIFIED")
+        for line in raw.splitlines()[count:]:
+            row = json.loads(line)
+            active.append(str(row.get("commandId") or "unprocessed-command"))
+    health = lifecycle_health(contract, params.get("agentToken") or "")
+    script = os.path.join(contract["installDir"], "simple_cluster", "runtime", "cluster_agent.py")
+    processes = []
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        actual = lifecycle_process(entry.name)
+        argv = actual.get("argv", [])
+        if len(argv) >= 3 and argv[1] == script and argv[2] == "serve" and actual.get("uid") == contract["uid"] and "--project-dir" in argv and argv[argv.index("--project-dir") + 1] == contract["projectDir"]:
+            processes.append(actual)
+    if len(processes) > 1 or bool(processes) != bool(health):
+        raise AgentLifecycleError("AGENT_LEGACY_PROCESS_UNVERIFIED")
+    process = processes[0] if processes else {}
+    if process:
+        if process["pid"] <= 1 or any(os.readlink("/proc/" + str(process["pid"]) + "/ns/" + name) != os.readlink("/proc/self/ns/" + name) for name in ("pid", "mnt")):
+            raise AgentLifecycleError("AGENT_LEGACY_CONTAINER_CONFLICT")
+        wanted = {"--project-dir": contract["projectDir"], "--mode": contract["mode"], "--host": contract["host"], "--port": str(contract["port"])}
+        if contract["mode"] == "worker_telemetry":
+            wanted["--worker-id"] = contract["workerId"]
+        tail = process["argv"][3:]
+        if len(tail) % 2 or len(tail) != 2 * len(wanted) or dict(zip(tail[::2], tail[1::2])) != wanted:
+            raise AgentLifecycleError("AGENT_LEGACY_PROCESS_UNVERIFIED")
+        if process["exe"] != os.path.realpath(lifecycle_python(contract)):
+            raise AgentLifecycleError("AGENT_LEGACY_CONDA_CONFLICT")
+        with open("/proc/" + str(process["pid"]) + "/environ", "rb") as stream:
+            env = dict(part.split(b"=", 1) for part in stream.read(1024 * 1024).split(b"\0") if b"=" in part)
+        if env.get(b"SIMPLE_EXPERIMENT_AGENT_INSTALL_DIR", b"").decode() != contract["installDir"] or env.get(b"SIMPLE_EXPERIMENT_CONDA_ENV", b"").decode() != contract["condaEnv"]:
+            raise AgentLifecycleError("AGENT_LEGACY_PROCESS_UNVERIFIED")
+        for key, wanted_value in {"projectRoot": contract["projectDir"], "agentInstallDir": contract["installDir"], "agentStateDir": state,
+                                  "runtimeVersion": session.get("agentVersion"), "startedAt": session.get("startedAt"),
+                                  "mode": "worker_telemetry" if contract["mode"] == "worker_telemetry" else "realtime"}.items():
+            if health.get(key) != wanted_value:
+                raise AgentLifecycleError("AGENT_LEGACY_HEALTH_CONFLICT", key)
+        # Bind the responding listener to this exact PID, beyond port/argv matching.
+        inodes = set()
+        for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+            for line in pathlib.Path(table).read_text().splitlines()[1:]:
+                cols = line.split()
+                if cols[3] == "0A" and int(cols[1].split(":")[1], 16) == contract["port"] and int(cols[7]) == contract["uid"]:
+                    inodes.add("socket:[" + cols[9] + "]")
+        fds = pathlib.Path("/proc") / str(process["pid"]) / "fd"
+        if not any(os.readlink(fd) in inodes for fd in fds.iterdir()):
+            raise AgentLifecycleError("AGENT_LEGACY_LISTENER_UNVERIFIED")
+    inventory = []
+    for entry in sorted(pathlib.Path(state).iterdir()):
+        if entry.is_symlink() or not entry.is_file() or entry.stat().st_uid != contract["uid"]:
+            raise AgentLifecycleError("AGENT_LEGACY_CONTENT_UNVERIFIED", entry.name)
+        stat = entry.stat()
+        inventory.append({"name": entry.name, "device": stat.st_dev, "uid": stat.st_uid})
+    # Mutable telemetry bytes are retained, not rewritten. Bind stable session,
+    # directory/file identities, current container and exact process instead.
+    state_stat = os.stat(state)
+    if state_stat.st_uid != contract["uid"]:
+        raise AgentLifecycleError("AGENT_LEGACY_IDENTITY_UNVERIFIED")
+    proof = {"contract": contract, "session": session, "process": process, "inventory": inventory, "activeTasks": active,
+             "stateIdentity": [state_stat.st_dev, state_stat.st_ino, state_stat.st_uid], "runtimeFiles": lifecycle_files(contract, {})}
+    digest = hashlib.sha256(json.dumps(proof, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    stable = dict(proof, process={})
+    stable_digest = hashlib.sha256(json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {"digest": digest, "activeTasks": active, "runningVersion": health.get("runtimeVersion"),
+            "pid": process.get("pid"), "process": process, "contract": contract, "stableDigest": stable_digest}
+
+
+def lifecycle_migrate(params):
+    import fcntl
+    contract = lifecycle_contract(params)
+    proof = lifecycle_legacy_proof(contract, params)
+    if proof["activeTasks"]:
+        raise AgentLifecycleError("AGENT_ACTIVE_TASK", proof["activeTasks"])
+    if not params.get("migrationDigest") or params["migrationDigest"] != proof["digest"]:
+        raise AgentLifecycleError("AGENT_MIGRATION_CONFIRM_REQUIRED")
+    if lifecycle_json(os.path.join(contract["stateDir"], "agent.owner.json")):
+        raise AgentLifecycleError("AGENT_MIGRATION_ALREADY_CHANGED")
+    lock_fd = os.open(os.path.join(contract["installDir"], "agent-control.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(lock_fd, "a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        current = lifecycle_legacy_proof(contract, params)
+        if current["digest"] != proof["digest"]:
+            raise AgentLifecycleError("AGENT_MIGRATION_PREVIEW_CHANGED")
+        process = current["process"]
+        if process:
+            if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+                raise AgentLifecycleError("AGENT_PIDFD_REQUIRED")
+            fd = os.pidfd_open(process["pid"])
+            try:
+                if lifecycle_process(process["pid"]) != process:
+                    raise AgentLifecycleError("AGENT_PROCESS_CHANGED")
+                signal.pidfd_send_signal(fd, signal.SIGTERM)
+                deadline = time.monotonic() + 5
+                while lifecycle_process(process["pid"]) and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                if lifecycle_process(process["pid"]) or lifecycle_health(contract, params.get("agentToken") or ""):
+                    raise AgentLifecycleError("AGENT_STOP_UNCONFIRMED")
+            finally:
+                os.close(fd)
+        if lifecycle_contract(params) != contract or lifecycle_legacy_proof(contract, params)["stableDigest"] != current["stableDigest"]:
+            raise AgentLifecycleError("AGENT_MIGRATION_PREVIEW_CHANGED")
+        owner = os.path.join(contract["stateDir"], "agent.owner.json")
+        fd = os.open(owner, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(contract, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+    return {"ok": True, "status": "migrated", "stoppedPid": process.get("pid"), "contract": contract}
 
 
 def lifecycle_health(contract, token=""):
@@ -239,8 +392,14 @@ def lifecycle_inspect(params):
             metadata.append({"path": filename, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
                              "values": {key: value[key] for key in allowed if key in value}})
         health = lifecycle_health(contract, params.get("agentToken") or "")
+        try:
+            migration = lifecycle_legacy_proof(contract, params)
+            migration.pop("process")
+        except Exception as failure:
+            migration = {"blocked": getattr(failure, "code", "AGENT_LEGACY_PROOF_FAILED")}
         return {"ok": False, "code": error.code, "error": str(error), "evidence": {
             "stateDir": contract["stateDir"], "metadata": metadata, "requiresExplicitMigration": True,
+            "migration": migration,
             "health": {key: health[key] for key in ("projectRoot", "agentStateDir", "agentInstallDir", "runtimeVersion", "mode", "startedAt") if key in health}}}
     files = lifecycle_files(contract, {**params, "files": {}})
     health = lifecycle_health(contract, params.get("agentToken") or "")
@@ -252,8 +411,8 @@ def lifecycle_inspect(params):
         if actual != record.get("process"):
             raise AgentLifecycleError("AGENT_PROCESS_UNVERIFIED")
         raise AgentLifecycleError("AGENT_UNHEALTHY_OWNED_PROCESS", str(actual["pid"]))
-    tasks = lifecycle_json(os.path.join(contract["stateDir"], "worker_task_snapshot.json")).get("tasks", [])
-    tasks += lifecycle_json(os.path.join(contract["stateDir"], "distributed_plan_queue.json")).get("jobs", [])
+    tasks = lifecycle_json(os.path.join(contract["stateDir"], "worker_task_snapshot.json"), 4 * 1024 * 1024).get("tasks", [])
+    tasks += lifecycle_json(os.path.join(contract["stateDir"], "distributed_plan_queue.json"), 4 * 1024 * 1024).get("jobs", [])
     active = [str(row.get("commandId") or row.get("globalJobId") or "unknown") for row in tasks
               if row.get("status") not in ("completed", "failed", "cancelled", "unavailable")]
     return {"ok": True, "status": "running" if health else "absent", "contract": contract, "activeTasks": active,
@@ -265,6 +424,8 @@ def lifecycle_control(params):
     action = params.get("action", "inspect")
     if action == "inspect":
         return lifecycle_inspect(params)
+    if action == "migrate":
+        return lifecycle_migrate(params)
     if action not in ("ensure", "stop", "restart"):
         raise AgentLifecycleError("AGENT_ACTION_INVALID")
     contract = lifecycle_contract(params)
@@ -298,8 +459,8 @@ def lifecycle_control(params):
             if action == "ensure":
                 raise AgentLifecycleError("AGENT_RUNNING_VERSION_MISMATCH", str(before["runningVersion"]))
             # Refuse restart while the Agent has outstanding accepted/queued jobs.
-            tasks = lifecycle_json(os.path.join(contract["stateDir"], "worker_task_snapshot.json")).get("tasks", [])
-            tasks += lifecycle_json(os.path.join(contract["stateDir"], "distributed_plan_queue.json")).get("jobs", [])
+            tasks = lifecycle_json(os.path.join(contract["stateDir"], "worker_task_snapshot.json"), 4 * 1024 * 1024).get("tasks", [])
+            tasks += lifecycle_json(os.path.join(contract["stateDir"], "distributed_plan_queue.json"), 4 * 1024 * 1024).get("jobs", [])
             for task in tasks:
                 if task.get("status") not in ("completed", "failed", "cancelled", "unavailable"):
                     raise AgentLifecycleError("AGENT_ACTIVE_TASK", str(task.get("commandId") or "unknown"))
@@ -351,6 +512,8 @@ def lifecycle_control(params):
                 lifecycle_verify_running(contract, health, process)
                 if health.get("runtimeVersion") != version or health.get("agentIdentity", {}).get("version") != version:
                     raise AgentLifecycleError("AGENT_RUNNING_VERSION_MISMATCH", health.get("runtimeVersion"))
+                if health.get("agentIdentity", {}).get("runtimeFiles") != params.get("files"):
+                    raise AgentLifecycleError("AGENT_RUNNING_HASH_MISMATCH")
                 lifecycle_save(record_path, process)
                 return dict(lifecycle_inspect(params), reused=False)
             time.sleep(0.1)

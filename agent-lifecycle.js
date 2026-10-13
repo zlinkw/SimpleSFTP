@@ -4,20 +4,21 @@ const zlib = require('node:zlib');
 const { spawn } = require('node:child_process');
 
 function validateAgentRequest(params) {
-  if (!['inspect','ensure','stop','restart'].includes(params.action)) throw new Error('AGENT_ACTION_INVALID');
+  if (!['inspect','ensure','stop','restart','migrate'].includes(params.action)) throw new Error('AGENT_ACTION_INVALID');
   for (const key of ['projectDir','installDir']) {
     const value = params[key];
     if (typeof value !== 'string' || !value.startsWith('/') || value === '/' || /[\r\n\0*?]/.test(value) || value.split('/').includes('..')) throw new Error('AGENT_PATH_INVALID: '+key);
   }
   if (!['worker_telemetry','hub_control'].includes(params.mode) || (params.mode === 'worker_telemetry' && !params.workerId)) throw new Error('AGENT_IDENTITY_REQUIRED');
   if (!Number.isInteger(params.port) || params.port < 1 || params.port > 65535) throw new Error('AGENT_BIND_INVALID');
-  if (params.action !== 'inspect' && params.action !== 'stop' && (!params.expectedVersion || !['cluster_agent.py','cluster_scheduler.py'].every(name=>/^[a-f0-9]{64}$/.test(params.files?.[name]||'')))) throw new Error('AGENT_RUNTIME_PROOF_REQUIRED');
+  if (params.action === 'migrate' && !/^[a-f0-9]{64}$/.test(params.migrationDigest||'')) throw new Error('AGENT_MIGRATION_CONFIRM_REQUIRED');
+  if (['ensure','restart'].includes(params.action) && (!params.expectedVersion || !['cluster_agent.py','cluster_scheduler.py'].every(name=>/^[a-f0-9]{64}$/.test(params.files?.[name]||'')))) throw new Error('AGENT_RUNTIME_PROOF_REQUIRED');
 }
 
 function agentPayload(params) {
   validateAgentRequest(params);
   // Fixed allowlist: no caller-supplied program, command, cwd, signal or environment.
-  return Object.fromEntries(['action','projectDir','installDir','mode','workerId','host','port','condaEnv','expectedVersion','files','sessionPrefix','agentToken'].map(key=>[key,params[key]]));
+  return Object.fromEntries(['action','projectDir','installDir','mode','workerId','host','port','condaEnv','expectedVersion','files','sessionPrefix','agentToken','migrationDigest'].map(key=>[key,params[key]]));
 }
 
 function agentRemoteCommand() {

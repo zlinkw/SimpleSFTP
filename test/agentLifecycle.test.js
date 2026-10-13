@@ -7,5 +7,8 @@ test('restricted lifecycle transport allows no caller commands/env and preserves
  assert.throws(()=>agentPayload({...p,action:'kill'}),/AGENT_ACTION_INVALID/);
  assert.throws(()=>agentPayload({...p,installDir:'/srv/../agent'}),/AGENT_PATH_INVALID/);
  assert.throws(()=>agentPayload({...p,action:'restart'}),/AGENT_RUNTIME_PROOF_REQUIRED/);
+ assert.throws(()=>agentPayload({...p,action:'migrate'}),/AGENT_MIGRATION_CONFIRM_REQUIRED/);
+ const migration=agentPayload({...p,action:'migrate',migrationDigest:'a'.repeat(64),signal:'SIGKILL'});
+ assert.equal(migration.migrationDigest,'a'.repeat(64));assert.ok(!('signal'in migration));
  assert.match(agentRemoteCommand(),/^python3 -c /);
 });
