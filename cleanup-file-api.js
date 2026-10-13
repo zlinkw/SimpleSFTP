@@ -5,6 +5,12 @@ const path = require("node:path");
 const { atomicWriteText } = require("./state-store");
 const hash = value => crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const copy = value => JSON.parse(JSON.stringify(value));
+function cleanupRemoteLoader(source) {
+  const packed = require('node:zlib').deflateSync(Buffer.from(source,'utf8')).toString('base64');
+  const command = 'import base64,zlib;exec(compile(zlib.decompress(base64.b64decode(' + JSON.stringify(packed) + ')),\'simple_sftp_cleanup\',\'exec\'))';
+  if(command.length > 20000) fail('REMOTE_LOADER_TOO_LARGE');
+  return command;
+}
 function fail(code, message = code) { const error = new Error(message); error.code = code; error.apiCode = code === "CONFIRM_REQUIRED" ? 2001 : 2010; error.apiData = { code }; throw error; }
 
 /** A path capability authorizes one frozen batch, never a later or remembered path. */
@@ -144,4 +150,4 @@ class CleanupFileApi {
     return this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity, target, action: "verify", deleted: row.action === "delete" });
   }
 }
-module.exports = { CleanupFileApi, fail, hash };
+module.exports = { CleanupFileApi, fail, hash, cleanupRemoteLoader };

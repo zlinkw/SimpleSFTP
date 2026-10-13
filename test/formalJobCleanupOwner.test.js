@@ -5,6 +5,29 @@ const path = require('node:path');
 const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 const guard = path.resolve(__dirname, '../cleanup-files.py');
+test('remote inspection loader fits Windows argv limits and preserves the exact UTF-8 safety controller', () => {
+  const { cleanupRemoteLoader } = require('../cleanup-file-api');
+  const source = fs.readFileSync(guard, 'utf8');
+  const loader = cleanupRemoteLoader ? cleanupRemoteLoader(source) :
+    'import base64;exec(compile(base64.b64decode(' + JSON.stringify(Buffer.from(source,'utf8').toString('base64')) + '),\'simple_sftp_cleanup\',\'exec\'))';
+  assert.ok(loader.length < 20000, 'loader exceeds the Windows SSH command budget');
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'simple-cleanup-loader-readonly-')));
+  fs.mkdirSync(path.join(root,'state'));
+  fs.writeFileSync(path.join(root, 'state/retained.txt'), 'retain 中文 bytes', 'utf8');
+  const script = path.join(root, 'loader.py');
+  fs.writeFileSync(script, loader, 'utf8');
+  const result = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-B', '-X', 'utf8', script], {
+    input: JSON.stringify({root,action:'inventory',target:{type:'file',relativePath:'state/retained.txt'}}),
+    encoding:'utf8',timeout:10000,windowsHide:true});
+  assert.equal(result.status,0,result.stderr);
+  const report=JSON.parse(result.stdout);
+  assert.equal(report.ok,true,JSON.stringify(report));
+  assert.equal(fs.readFileSync(path.join(root,'state/retained.txt'),'utf8'),'retain 中文 bytes');
+  assert.equal(fs.existsSync(path.join(root,'clean_dir')),false);
+  const packed = JSON.parse(/base64\.b64decode\(("[^"]+")\)/.exec(loader)[1]);
+  assert.equal(require('node:zlib').inflateSync(Buffer.from(packed,'base64')).toString('utf8'),source);
+  assert.match(fs.readFileSync(path.resolve(__dirname,'../extension.js'),'utf8'),/const loader = cleanupRemoteLoader\(script\)/);
+});
 function fixture() {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'simple-formal-owner-readonly-')));
   const owner = { workflowId: 'workflow', commandId: 'command', globalJobId: 'workflow:1', index: 1, case: 'case', seed: 42,

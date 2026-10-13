@@ -21,7 +21,7 @@ const { execFile, spawn } = require("child_process");
 const { resolveWorkspaceLocation } = require("./workspace-path.js");
 const { toTarPath: tarEntryPath, writeTarEntriesToStream } = require("./tar-writer.js");
 const { LocalApiServer, confirmationRequired, currentApiRequestContext } = require("./api-server.js");
-const { CleanupFileApi, fail: cleanupFail } = require("./cleanup-file-api");
+const { CleanupFileApi, fail: cleanupFail, cleanupRemoteLoader } = require("./cleanup-file-api");
 let cleanupFileApi;
 const {
   HostOperationLeaseConflictError,
@@ -4798,7 +4798,7 @@ async function cleanupFileTransport(request) {
       } catch { return false; }
     });
     if (!known) cleanupFail("SERVER_IDENTITY_UNVERIFIED");
-    const loader = "import base64;exec(compile(base64.b64decode(" + JSON.stringify(Buffer.from(script, "utf8").toString("base64")) + "),'simple_sftp_cleanup','exec'))";
+    const loader = cleanupRemoteLoader(script);
     output = await runRemoteBatchSsh(source, `python3 -B -c ${shellQuote(loader)}`, [JSON.stringify(request)], 60000,
       { remoteMutation: !["check", "inspect", "inventory", "verify"].includes(request.action), stage: "PLAN 安全文件操作" });
   }
