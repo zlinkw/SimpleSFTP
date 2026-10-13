@@ -1,9 +1,11 @@
-"""Restricted auxiliary Agent lifecycle protocol. Never signals process groups or tmux."""
+"""Agent lifecycle in the user's assigned tmux window. Never signals PIDs."""
 import contextlib
 import hashlib
 import json
 import os
 import pathlib
+import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -139,6 +141,79 @@ def lifecycle_active_tasks(state):
     return list(dict.fromkeys(active))
 
 
+def lifecycle_tmux_config(params):
+    prefix = re.sub(r"[^a-z0-9._-]+", "-", str(params.get("sessionPrefix") or "simple").strip().lower()).strip("-")[:32]
+    if not prefix or not prefix[0].isalnum():
+        prefix = "simple"
+    worker = re.sub(r"[^a-z0-9._-]+", "-", str(params.get("workerId") or "worker").strip().lower()).strip("-") or "worker"
+    default = prefix + ("-hub-agent" if params.get("mode") == "hub_control" else "-worker-" + worker + "-agent")
+    session = str(params.get("tmuxSession") or default)
+    window = str(params.get("tmuxWindow") or "agent")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}-agent", session) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}", window):
+        raise AgentLifecycleError("AGENT_TMUX_TARGET_INVALID")
+    return {"session": session, "window": window}
+
+
+def lifecycle_tmux_run(args, allow_absent=False):
+    env = dict(os.environ)
+    env.pop("TMUX", None)
+    # Even a read-only tmux client creates its default socket directory when it
+    # is absent. Avoid invoking that client during a zero-write inspection.
+    socket_root = os.path.join(env.get("TMUX_TMPDIR") or "/tmp", "tmux-" + str(os.getuid()))
+    if allow_absent and not os.path.exists(os.path.join(socket_root, "default")):
+        return ""
+    try:
+        result = subprocess.run(["tmux", *args], capture_output=True, text=True, encoding="utf-8", env=env, timeout=3)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise AgentLifecycleError("AGENT_TMUX_UNAVAILABLE", type(error).__name__)
+    if result.returncode:
+        if allow_absent and any(text in result.stderr.lower() for text in ("no server running", "no sessions", "can't find session", "no such file or directory")):
+            return ""
+        raise AgentLifecycleError("AGENT_TMUX_COMMAND_FAILED", result.stderr.strip()[:500])
+    if len(result.stdout) > 65536:
+        raise AgentLifecycleError("AGENT_TMUX_OUTPUT_LIMIT")
+    return result.stdout.strip()
+
+
+def lifecycle_tmux_window(params, legacy=False):
+    target = lifecycle_tmux_config(params)
+    raw = lifecycle_tmux_run(["list-windows", "-t", "=" + target["session"], "-F", "#{pid}\t#{session_name}\t#{window_id}\t#{window_name}"], allow_absent=True)
+    if not raw:
+        return {}
+    rows = []
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4 or parts[1] != target["session"] or not re.fullmatch(r"@[0-9]+", parts[2]):
+            raise AgentLifecycleError("AGENT_TMUX_TARGET_INVALID")
+        rows.append(dict(zip(("server", "session", "windowId", "windowName"), parts)))
+    matches = [row for row in rows if row["windowName"] == target["window"]]
+    if len(matches) == 1:
+        return matches[0]
+    if legacy and not matches and len(rows) == 1:
+        # Historical dedicated Agent sessions used the shell's default name.
+        return rows[0]
+    if matches:
+        raise AgentLifecycleError("AGENT_TMUX_WINDOW_AMBIGUOUS", target["session"])
+    return {}
+
+
+def lifecycle_close_tmux(params, expected):
+    if not expected:
+        return {}
+    current = lifecycle_tmux_window(params, legacy=expected["windowName"] != lifecycle_tmux_config(params)["window"])
+    if current != expected:
+        raise AgentLifecycleError("AGENT_TMUX_WINDOW_CHANGED")
+    # Close only the frozen window id, never the session/server or any PID.
+    lifecycle_tmux_run(["kill-window", "-t", current["windowId"]])
+    deadline = time.monotonic() + 5
+    contract = lifecycle_contract(params)
+    while time.monotonic() < deadline:
+        if not lifecycle_health(contract, params.get("agentToken") or ""):
+            return current
+        time.sleep(.1)
+    raise AgentLifecycleError("AGENT_TMUX_STOP_UNCONFIRMED", "assigned window closed, Agent still responds")
+
+
 def lifecycle_legacy_proof(contract, params):
     """Observe legacy ownership without adopting it, signalling or writing."""
     state = contract["stateDir"]
@@ -194,80 +269,30 @@ def lifecycle_legacy_proof(contract, params):
         except (OSError, ValueError, AttributeError, AgentLifecycleError):
             active.append("unverified-activity:" + queue.name)
     health = lifecycle_health(contract, params.get("agentToken") or "")
-    script = os.path.join(contract["installDir"], "simple_cluster", "runtime", "cluster_agent.py")
-    processes = []
-    for entry in pathlib.Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        actual = lifecycle_process(entry.name)
-        argv = actual.get("argv", [])
-        if len(argv) >= 3 and argv[1] == script and argv[2] == "serve" and actual.get("uid") == contract["uid"] and "--project-dir" in argv and argv[argv.index("--project-dir") + 1] == contract["projectDir"]:
-            processes.append(actual)
-    if len(processes) > 1 or bool(processes) != bool(health):
-        raise AgentLifecycleError("AGENT_LEGACY_PROCESS_UNVERIFIED")
-    process = processes[0] if processes else {}
-    if process:
-        if process["pid"] <= 1 or any(os.readlink("/proc/" + str(process["pid"]) + "/ns/" + name) != os.readlink("/proc/self/ns/" + name) for name in ("pid", "mnt")):
-            raise AgentLifecycleError("AGENT_LEGACY_CONTAINER_CONFLICT")
-        wanted = {"--project-dir": contract["projectDir"], "--mode": contract["mode"], "--host": contract["host"], "--port": str(contract["port"])}
-        if contract["mode"] == "worker_telemetry":
-            wanted["--worker-id"] = contract["workerId"]
-        tail = process["argv"][3:]
-        if len(tail) % 2 or len(tail) != 2 * len(wanted) or dict(zip(tail[::2], tail[1::2])) != wanted:
-            raise AgentLifecycleError("AGENT_LEGACY_PROCESS_UNVERIFIED")
-        # Ownership binds the actual process, listener and project. Research
-        # Conda selection is per-job configuration, not an Agent admission gate.
-        with open("/proc/" + str(process["pid"]) + "/environ", "rb") as stream:
-            env = dict(part.split(b"=", 1) for part in stream.read(1024 * 1024).split(b"\0") if b"=" in part)
-        if env.get(b"SIMPLE_EXPERIMENT_AGENT_INSTALL_DIR", b"").decode() != contract["installDir"]:
-            raise AgentLifecycleError("AGENT_LEGACY_PROCESS_UNVERIFIED")
+    window = lifecycle_tmux_window(params, legacy=bool(health))
+    if health:
+        if not window:
+            raise AgentLifecycleError("AGENT_TMUX_WINDOW_MISSING", lifecycle_tmux_config(params)["session"])
         for key, wanted_value in {"projectRoot": contract["projectDir"], "agentInstallDir": contract["installDir"], "agentStateDir": state,
                                   "runtimeVersion": session.get("agentVersion"), "startedAt": session.get("startedAt"),
                                   "mode": "worker_telemetry" if contract["mode"] == "worker_telemetry" else "realtime"}.items():
             if health.get(key) != wanted_value:
                 raise AgentLifecycleError("AGENT_LEGACY_HEALTH_CONFLICT", key)
-        # Bind the responding listener to this exact PID, beyond port/argv matching.
-        inodes = set()
-        for table in ("/proc/net/tcp", "/proc/net/tcp6"):
-            for line in pathlib.Path(table).read_text().splitlines()[1:]:
-                cols = line.split()
-                if cols[3] == "0A" and int(cols[1].split(":")[1], 16) == contract["port"] and int(cols[7]) == contract["uid"]:
-                    inodes.add("socket:[" + cols[9] + "]")
-        fds = pathlib.Path("/proc") / str(process["pid"]) / "fd"
-        if not any(os.readlink(fd) in inodes for fd in fds.iterdir()):
-            raise AgentLifecycleError("AGENT_LEGACY_LISTENER_UNVERIFIED")
-    inventory = []
-    state_device = os.stat(state).st_dev
-    pending = [pathlib.Path(state)]
-    while pending:
-        for entry in sorted(pending.pop().iterdir()):
-            name = str(entry.relative_to(state))
-            stat = entry.lstat()
-            if len(inventory) >= 10000 or entry.is_symlink() or stat.st_uid != contract["uid"] or stat.st_dev != state_device:
-                raise AgentLifecycleError("AGENT_LEGACY_CONTENT_UNVERIFIED", name)
-            if entry.is_dir():
-                if entry.parent == pathlib.Path(state) and entry.name not in ("actions", "cluster_scheduler", "live_output"):
-                    raise AgentLifecycleError("AGENT_LEGACY_CONTENT_UNVERIFIED", name)
-                pending.append(entry)
-                kind = "directory"
-            elif entry.is_file():
-                kind = "file"
-            else:
-                raise AgentLifecycleError("AGENT_LEGACY_CONTENT_UNVERIFIED", name)
-            inventory.append({"name": name, "type": kind, "device": stat.st_dev, "uid": stat.st_uid})
-    # Mutable telemetry bytes are retained, not rewritten. Bind stable session,
-    # root identity, current container and exact process instead. Changing task
+    # Closing the assigned window neither traverses nor modifies task history.
+    # Arbitrary history filenames/counts must not become Agent lifecycle gates.
+    # Bind the configured tmux window and stable service/root/container identity.
+    # Mutable telemetry bytes are retained, not rewritten. Changing task
     # activity and newly written telemetry names are not confirmation bindings.
     state_stat = os.stat(state)
     if state_stat.st_uid != contract["uid"]:
         raise AgentLifecycleError("AGENT_LEGACY_IDENTITY_UNVERIFIED")
-    proof = {"contract": contract, "session": session, "process": process,
+    proof = {"contract": contract, "session": session, "tmuxWindow": window,
              "stateIdentity": [state_stat.st_dev, state_stat.st_ino, state_stat.st_uid], "runtimeFiles": lifecycle_files(contract, {})}
     digest = hashlib.sha256(json.dumps(proof, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    stable = dict(proof, process={})
+    stable = dict(proof, tmuxWindow={})
     stable_digest = hashlib.sha256(json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return {"digest": digest, "activeTasks": list(dict.fromkeys(active)), "activeTasksBlockRestart": False, "runningVersion": health.get("runtimeVersion"),
-            "pid": process.get("pid"), "process": process, "contract": contract, "stableDigest": stable_digest}
+            "tmuxWindow": window, "contract": contract, "stableDigest": stable_digest}
 
 
 def lifecycle_migrate(params):
@@ -284,22 +309,7 @@ def lifecycle_migrate(params):
         current = lifecycle_legacy_proof(contract, params)
         if current["digest"] != proof["digest"]:
             raise AgentLifecycleError("AGENT_MIGRATION_PREVIEW_CHANGED")
-        process = current["process"]
-        if process:
-            if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
-                raise AgentLifecycleError("AGENT_PIDFD_REQUIRED")
-            fd = os.pidfd_open(process["pid"])
-            try:
-                if lifecycle_process(process["pid"]) != process:
-                    raise AgentLifecycleError("AGENT_PROCESS_CHANGED")
-                signal.pidfd_send_signal(fd, signal.SIGTERM)
-                deadline = time.monotonic() + 5
-                while lifecycle_process(process["pid"]) and time.monotonic() < deadline:
-                    time.sleep(0.1)
-                if lifecycle_process(process["pid"]) or lifecycle_health(contract, params.get("agentToken") or ""):
-                    raise AgentLifecycleError("AGENT_STOP_UNCONFIRMED")
-            finally:
-                os.close(fd)
+        closed = lifecycle_close_tmux(params, current["tmuxWindow"])
         if lifecycle_contract(params) != contract or lifecycle_legacy_proof(contract, params)["stableDigest"] != current["stableDigest"]:
             raise AgentLifecycleError("AGENT_MIGRATION_PREVIEW_CHANGED")
         owner = os.path.join(contract["stateDir"], "agent.owner.json")
@@ -308,7 +318,7 @@ def lifecycle_migrate(params):
             json.dump(contract, stream, ensure_ascii=False)
             stream.flush()
             os.fsync(stream.fileno())
-    return {"ok": True, "status": "migrated", "stoppedPid": process.get("pid"), "contract": contract}
+    return {"ok": True, "status": "migrated", "closedTmuxWindow": closed, "contract": contract}
 
 
 def lifecycle_health(contract, token=""):
@@ -332,33 +342,11 @@ def lifecycle_verify_running(contract, health, process):
     differences = [key for key in contract if key != "condaEnv" and instance.get(key) != contract[key]]
     if health.get("agentLifecycleProtocol") != 1 or health.get("schemaVersion") != 1:
         differences.append("capabilities")
-    actual = lifecycle_process(process.get("pid", 0))
-    if not process or not actual or actual != process.get("process"):
-        differences.append("processIdentity")
-    if instance.get("pid") != process.get("pid") or instance.get("nonce") != process.get("nonce"):
+    if process.get("nonce") and instance.get("nonce") != process["nonce"]:
         differences.append("instance")
     if differences:
         raise AgentLifecycleError("AGENT_PROCESS_UNVERIFIED", ",".join(differences))
-    return actual
-
-
-def lifecycle_verify_owned_process(contract, record):
-    """Verify an unresponsive auxiliary process without relying on its HTTP health."""
-    actual = lifecycle_process(record.get("pid", 0))
-    if not actual or actual != record.get("process") or actual["uid"] != contract["uid"] or actual["pid"] <= 1 or actual["pid"] == os.getpid():
-        raise AgentLifecycleError("AGENT_PROCESS_UNVERIFIED")
-    script = os.path.join(contract["installDir"], "simple_cluster", "runtime", "cluster_agent.py")
-    argv = actual["argv"]
-    wanted = {"--project-dir": contract["projectDir"], "--mode": contract["mode"], "--host": contract["host"], "--port": str(contract["port"]), "--worker-id": contract["workerId"]}
-    if len(argv) != 3 + 2 * len(wanted) or argv[1:3] != [script, "serve"] or dict(zip(argv[3::2], argv[4::2])) != wanted:
-        raise AgentLifecycleError("AGENT_PROCESS_UNVERIFIED")
-    if any(os.readlink("/proc/" + str(actual["pid"]) + "/ns/" + name) != os.readlink("/proc/self/ns/" + name) for name in ("pid", "mnt")):
-        raise AgentLifecycleError("AGENT_PROCESS_UNVERIFIED")
-    with open("/proc/" + str(actual["pid"]) + "/environ", "rb") as stream:
-        env = dict(part.split(b"=", 1) for part in stream.read(1024 * 1024).split(b"\0") if b"=" in part)
-    if not record.get("nonce") or env.get(b"SIMPLE_EXPERIMENT_AGENT_NONCE", b"").decode() != record["nonce"] or env.get(b"SIMPLE_EXPERIMENT_AGENT_INSTALL_DIR", b"").decode() != contract["installDir"]:
-        raise AgentLifecycleError("AGENT_PROCESS_UNVERIFIED")
-    return actual
+    return instance
 
 
 def lifecycle_python(contract):
@@ -443,7 +431,6 @@ def lifecycle_inspect(params):
         health = lifecycle_health(contract, params.get("agentToken") or "")
         try:
             migration = lifecycle_legacy_proof(contract, params)
-            migration.pop("process")
         except Exception as failure:
             migration = {"blocked": getattr(failure, "code", "AGENT_LEGACY_PROOF_FAILED"), "errorType": type(failure).__name__}
         return {"ok": False, "code": error.code, "error": str(error), "evidence": {
@@ -452,14 +439,13 @@ def lifecycle_inspect(params):
             "health": {key: health[key] for key in ("projectRoot", "agentStateDir", "agentInstallDir", "runtimeVersion", "mode", "startedAt") if key in health}}}
     files = lifecycle_files(contract, {**params, "files": {}})
     health = lifecycle_health(contract, params.get("agentToken") or "")
-    record = lifecycle_json(os.path.join(contract["stateDir"], "agent.process.json"))
-    actual = lifecycle_process(record.get("pid", 0))
+    window = lifecycle_tmux_window(params)
     if health:
-        lifecycle_verify_running(contract, health, record)
-    elif actual:
-        lifecycle_verify_owned_process(contract, record)
+        if not window:
+            raise AgentLifecycleError("AGENT_TMUX_WINDOW_MISSING", lifecycle_tmux_config(params)["session"])
+        lifecycle_verify_running(contract, health, {})
     active = lifecycle_active_tasks(contract["stateDir"])
-    return {"ok": True, "status": "running" if health else "unhealthy" if actual else "absent", "contract": contract, "activeTasks": active, "activeTasksBlockRestart": False,
+    return {"ok": True, "status": "running" if health else "unhealthy" if window else "absent", "contract": contract, "tmuxWindow": window, "activeTasks": active, "activeTasksBlockRestart": False,
             "identity": health.get("agentIdentity"), "runningVersion": health.get("runtimeVersion"), "files": files}
 
 
@@ -484,7 +470,7 @@ def lifecycle_control(params):
             raise AgentLifecycleError("AGENT_LIFECYCLE_BUSY")
         before = lifecycle_inspect(params)
         record_path = os.path.join(contract["stateDir"], "agent.process.json")
-        record = lifecycle_json(record_path)
+        closed = {}
         version = str(params.get("expectedVersion") or "")
         if action != "stop":
             proofs = lifecycle_files(contract, params)
@@ -499,63 +485,45 @@ def lifecycle_control(params):
                 return dict(before, reused=True)
             if action == "ensure" and before["status"] == "running":
                 raise AgentLifecycleError("AGENT_RUNNING_VERSION_MISMATCH", str(before["runningVersion"]))
-            # Research tasks never block an auxiliary-only stop/restart.
-            health = lifecycle_health(contract, params.get("agentToken") or "")
-            actual = lifecycle_verify_running(contract, health, record) if health else lifecycle_verify_owned_process(contract, record)
-            if actual["pid"] <= 1 or actual["pid"] == os.getpid():
-                raise AgentLifecycleError("AGENT_PROCESS_UNVERIFIED")
-            # A pidfd pins the verified process against PID reuse. Never kill descendants.
-            if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
-                raise AgentLifecycleError("AGENT_PIDFD_REQUIRED")
-            fd = os.pidfd_open(actual["pid"])
-            try:
-                if lifecycle_process(actual["pid"]) != actual:
-                    raise AgentLifecycleError("AGENT_PROCESS_CHANGED")
-                signal.pidfd_send_signal(fd, signal.SIGTERM)
-                deadline = time.monotonic() + 5
-                while lifecycle_process(actual["pid"]) and time.monotonic() < deadline:
-                    time.sleep(0.1)
-                if lifecycle_process(actual["pid"]):
-                    raise AgentLifecycleError("AGENT_STOP_UNCONFIRMED")
-            finally:
-                os.close(fd)
+            closed = lifecycle_close_tmux(params, before["tmuxWindow"])
         if action == "stop":
-            return {"ok": True, "status": "stopped", "stoppedPid": record.get("pid"), "contract": contract}
+            return {"ok": True, "status": "stopped", "closedTmuxWindow": closed, "contract": contract}
         files = lifecycle_files(contract, params)
         if not version or any(not files.get(name) or files[name] != (params.get("files") or {}).get(name) for name in files):
             raise AgentLifecycleError("AGENT_RUNTIME_PROOF_REQUIRED")
         python = lifecycle_python(contract)
         script = os.path.join(contract["installDir"], "simple_cluster", "runtime", "cluster_agent.py")
-        env = dict(os.environ)
-        env.update(SIMPLE_EXPERIMENT_AGENT_INSTALL_DIR=contract["installDir"], SIMPLE_EXPERIMENT_CONDA_ENV=contract["condaEnv"],
-                   SIMPLE_EXPERIMENT_AGENT_NONCE=uuid.uuid4().hex, SIMPLE_EXPERIMENT_REMOTE_TMUX_SESSION_PREFIX=str(params.get("sessionPrefix") or "simple"))
-        env["SIMPLE_EXPERIMENT_AGENT_TOKEN"] = str(params.get("agentToken") or "")
-        # No inherited alternate state directory or hidden uplink may redirect ownership.
-        env.pop("SIMPLE_EXPERIMENT_AGENT_STATE_DIR", None)
-        env.pop("SIMPLE_EXPERIMENT_HUB_UPLINK_URL", None)
+        nonce = uuid.uuid4().hex
+        env = {"SIMPLE_EXPERIMENT_AGENT_INSTALL_DIR": contract["installDir"], "SIMPLE_EXPERIMENT_CONDA_ENV": contract["condaEnv"],
+               "SIMPLE_EXPERIMENT_AGENT_NONCE": nonce, "SIMPLE_EXPERIMENT_REMOTE_TMUX_SESSION_PREFIX": str(params.get("sessionPrefix") or "simple"),
+               "SIMPLE_EXPERIMENT_AGENT_TOKEN": str(params.get("agentToken") or "")}
         os.makedirs(os.path.join(contract["installDir"], "logs"), exist_ok=True)
         log = os.path.join(contract["installDir"], "logs", "agent-lifecycle.log")
-        with open(log, "ab") as stream:
-            child = subprocess.Popen([python, script, "serve", "--project-dir", contract["projectDir"], "--mode", contract["mode"],
-                                     "--worker-id", contract["workerId"], "--host", contract["host"], "--port", str(contract["port"])],
-                                     cwd=contract["projectDir"], env=env, stdin=subprocess.DEVNULL, stdout=stream, stderr=stream, start_new_session=True)
+        command = "unset SIMPLE_EXPERIMENT_AGENT_STATE_DIR SIMPLE_EXPERIMENT_HUB_UPLINK_URL; exec env " + " ".join(shlex.quote(key + "=" + value) for key, value in env.items())
+        command += " " + " ".join(shlex.quote(value) for value in [python, script, "serve", "--project-dir", contract["projectDir"], "--mode", contract["mode"],
+                                "--worker-id", contract["workerId"], "--host", contract["host"], "--port", str(contract["port"])])
+        command += " >> " + shlex.quote(log) + " 2>&1"
+        target = lifecycle_tmux_config(params)
+        existing = lifecycle_tmux_run(["list-windows", "-t", "=" + target["session"], "-F", "#{window_id}"], allow_absent=True)
+        args = ["new-window", "-d", "-t", "=" + target["session"]] if existing else ["new-session", "-d", "-s", target["session"]]
+        lifecycle_tmux_run([*args, "-n", target["window"], "-c", contract["projectDir"], command])
+        launched = lifecycle_tmux_window(params)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            if child.poll() is not None:
-                raise AgentLifecycleError("AGENT_START_FAILED", {"exitCode": child.returncode, "log": log})
+            if lifecycle_tmux_window(params) != launched or not launched:
+                raise AgentLifecycleError("AGENT_START_FAILED", {"tmuxWindow": launched, "log": log})
             health = lifecycle_health(contract, params.get("agentToken") or "")
             if health:
-                process = {"pid": child.pid, "nonce": env["SIMPLE_EXPERIMENT_AGENT_NONCE"], "process": lifecycle_process(child.pid)}
+                process = {"nonce": nonce, "tmuxWindow": launched}
                 lifecycle_verify_running(contract, health, process)
                 if health.get("runtimeVersion") != version or health.get("agentIdentity", {}).get("version") != version:
                     raise AgentLifecycleError("AGENT_RUNNING_VERSION_MISMATCH", health.get("runtimeVersion"))
                 if health.get("agentIdentity", {}).get("runtimeFiles") != params.get("files"):
                     raise AgentLifecycleError("AGENT_RUNNING_HASH_MISMATCH")
-                lifecycle_save(record_path, process)
-                return dict(lifecycle_inspect(params), reused=False)
+                return dict(lifecycle_inspect(params), reused=False, closedTmuxWindow=closed)
             time.sleep(0.1)
         # Leave the single identified launch intact for explicit inspect/recovery; no retry.
-        raise AgentLifecycleError("AGENT_START_UNCONFIRMED", {"pid": child.pid, "log": log})
+        raise AgentLifecycleError("AGENT_START_UNCONFIRMED", {"tmuxWindow": launched, "log": log})
 
 
 def lifecycle_main(params=None):

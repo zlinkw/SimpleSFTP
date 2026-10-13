@@ -11,6 +11,7 @@ function validateAgentRequest(params) {
   }
   if (!['worker_telemetry','hub_control'].includes(params.mode) || (params.mode === 'worker_telemetry' && !params.workerId)) throw new Error('AGENT_IDENTITY_REQUIRED');
   if (!Number.isInteger(params.port) || params.port < 1 || params.port > 65535) throw new Error('AGENT_BIND_INVALID');
+  if (params.tmuxSession && !/^[a-z0-9][a-z0-9._-]{0,127}-agent$/.test(params.tmuxSession) || params.tmuxWindow && !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(params.tmuxWindow)) throw new Error('AGENT_TMUX_TARGET_INVALID');
   if (params.action === 'migrate' && !/^[a-f0-9]{64}$/.test(params.migrationDigest||'')) throw new Error('AGENT_MIGRATION_CONFIRM_REQUIRED');
   if (['ensure','restart'].includes(params.action) && (!params.expectedVersion || !['cluster_agent.py','cluster_scheduler.py'].every(name=>/^[a-f0-9]{64}$/.test(params.files?.[name]||'')))) throw new Error('AGENT_RUNTIME_PROOF_REQUIRED');
 }
@@ -18,7 +19,7 @@ function validateAgentRequest(params) {
 function agentPayload(params) {
   validateAgentRequest(params);
   // Fixed allowlist: no caller-supplied program, command, cwd, signal or environment.
-  return Object.fromEntries(['action','projectDir','installDir','mode','workerId','host','port','condaEnv','expectedVersion','files','sessionPrefix','agentToken','migrationDigest'].map(key=>[key,params[key]]));
+  return Object.fromEntries(['action','projectDir','installDir','mode','workerId','host','port','condaEnv','expectedVersion','files','sessionPrefix','tmuxSession','tmuxWindow','agentToken','migrationDigest'].map(key=>[key,params[key]]));
 }
 
 function agentRemoteCommand() {

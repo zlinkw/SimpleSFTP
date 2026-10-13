@@ -11,4 +11,8 @@ test('restricted lifecycle transport allows no caller commands/env and preserves
  const migration=agentPayload({...p,action:'migrate',migrationDigest:'a'.repeat(64),signal:'SIGKILL'});
  assert.equal(migration.migrationDigest,'a'.repeat(64));assert.ok(!('signal'in migration));
  assert.match(agentRemoteCommand(),/^python3 -c /);
+ const window=agentPayload({...p,tmuxSession:'configured-worker-agent',tmuxWindow:'agent'});
+ assert.equal(window.tmuxSession,'configured-worker-agent');assert.equal(window.tmuxWindow,'agent');
+ assert.throws(()=>agentPayload({...p,tmuxSession:'user-gpu-0'}),/AGENT_TMUX_TARGET_INVALID/);
+ assert.throws(()=>agentPayload({...p,tmuxWindow:'*'}),/AGENT_TMUX_TARGET_INVALID/);
 });
