@@ -497,9 +497,14 @@ def lifecycle_control(params):
         env = {"SIMPLE_EXPERIMENT_AGENT_INSTALL_DIR": contract["installDir"], "SIMPLE_EXPERIMENT_CONDA_ENV": contract["condaEnv"],
                "SIMPLE_EXPERIMENT_AGENT_NONCE": nonce, "SIMPLE_EXPERIMENT_REMOTE_TMUX_SESSION_PREFIX": str(params.get("sessionPrefix") or "simple"),
                "SIMPLE_EXPERIMENT_AGENT_TOKEN": str(params.get("agentToken") or "")}
+        # Do not inherit a previous tmux server shell's GPU/container binding.
+        # Preserve only this controller's binding in this one Agent command.
+        for key in ("CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "TMUX_TMPDIR"):
+            if key in os.environ:
+                env[key] = os.environ[key]
         os.makedirs(os.path.join(contract["installDir"], "logs"), exist_ok=True)
         log = os.path.join(contract["installDir"], "logs", "agent-lifecycle.log")
-        command = "unset SIMPLE_EXPERIMENT_AGENT_STATE_DIR SIMPLE_EXPERIMENT_HUB_UPLINK_URL; exec env " + " ".join(shlex.quote(key + "=" + value) for key, value in env.items())
+        command = "unset SIMPLE_EXPERIMENT_AGENT_STATE_DIR SIMPLE_EXPERIMENT_HUB_UPLINK_URL CUDA_VISIBLE_DEVICES NVIDIA_VISIBLE_DEVICES TMUX_TMPDIR; exec env " + " ".join(shlex.quote(key + "=" + value) for key, value in env.items())
         command += " " + " ".join(shlex.quote(value) for value in [python, script, "serve", "--project-dir", contract["projectDir"], "--mode", contract["mode"],
                                 "--worker-id", contract["workerId"], "--host", contract["host"], "--port", str(contract["port"])])
         command += " >> " + shlex.quote(log) + " 2>&1"
