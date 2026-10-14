@@ -295,13 +295,17 @@ def manifest_records(root, full, value):
 
 
 def inspect(root, target, archived=False):
+    path_only = target.get("authorizationMode") == "confirmed_paths"
+    if path_only:
+        target = {key: value for key, value in target.items() if key not in ("expectedOwner", "expectedSha256")}
     rel = relative(target["relativePath"])
     full = path_guard(root, rel, archived)
     if not below(root, os.path.dirname(full)):
         deny("UNSAFE_PARENT")
     if archived and (not rel.startswith("clean_dir/") or rel == "clean_dir/MANIFEST.md" or rel.startswith("clean_dir/.operations/")):
         deny("PROTECTED_PATH")
-    tracked_dirty(root, rel)
+    if not path_only:
+        tracked_dirty(root, rel)
     value = contents(root, full, target["type"])
     if target.get("expectedSha256") and (target["type"] != "file" or value["inventory"][0].get("sha256") != target["expectedSha256"]):
         deny("OWNERSHIP_HASH_MISMATCH")
@@ -364,13 +368,15 @@ def inspect(root, target, archived=False):
                         expected = owner["outputDir"].replace("\\", "/").rstrip("/")
                         if recorded not in (expected, full.replace(os.sep, "/")):
                             deny("OWNERSHIP_MISMATCH", name + ":" + key)
-    if target.get("activityEvidenceMode") == "managed_tmux":
+    if path_only:
+        handle_warnings = []
+    elif target.get("activityEvidenceMode") == "managed_tmux":
         managed_active(root, target, full, value)
         handle_warnings = []
     else:
         handle_warnings = open_handles(full)
     destination = path_guard(root, target["destination"], True, True)
-    if os.path.lexists(destination):
+    if not path_only and os.path.lexists(destination):
         deny("DESTINATION_EXISTS")
     return {**value, "references": references, "manifests": manifest_records(root, full, value), "handleWarnings": handle_warnings, "absolutePath": full, "parent": os.path.dirname(full), "leaf": os.path.basename(full), "destination": destination}
 
@@ -608,6 +614,9 @@ def main(request):
     if expected_owner is not None and not isinstance(expected_owner, dict):
         deny("OWNERSHIP_UNVERIFIED")
     action = request["action"]
+    if request.get("target", {}).get("authorizationMode") == "confirmed_paths":
+        if action in ("move", "restore", "settle") or action in ("managed-start", "managed-observe") and request.get("cleanupAction") != "delete":
+            deny("INVALID_AUTHORIZATION_MODE")
     if action == "managed-observe":
         return managed_observe(request)
     if action == "managed-start":

@@ -36,12 +36,17 @@ class CleanupFileApi {
     for (const [token, preview] of this.previews) if (Date.now() > preview.expiresAt) this.previews.delete(token);
     if (this.previews.size >= 4096) fail("CLEANUP_PREVIEW_CAPACITY_EXCEEDED");
     const { node, action = "move", targets } = params;
-    const observationMode = params.observationMode === "managed_tmux" ? node?.kind === "local" ? "filesystem" : "tmux" : undefined;
+    if (params.authorizationMode !== undefined && params.authorizationMode !== "confirmed_paths") fail("INVALID_AUTHORIZATION_MODE");
+    const pathOnly = params.authorizationMode === "confirmed_paths";
+    if (pathOnly && action !== "delete") fail("INVALID_ACTION");
+    const observationMode = params.observationMode === "managed_tmux" || pathOnly ? node?.kind === "local" ? "filesystem" : "tmux" : undefined;
     if (!node?.root || !["move", "delete", "restore"].includes(action) || !Array.isArray(targets) || !targets.length || targets.length > 500) fail("INVALID_REQUEST");
-    await this.activity(node);
+    if (!pathOnly) await this.activity(node);
     const rows = []; let identity;
     for (const original of targets) {
       const target = { ...original, ...(observationMode ? { activityEvidenceMode: "managed_tmux" } : {}) };
+      if (pathOnly) { target.authorizationMode = "confirmed_paths"; delete target.expectedOwner; delete target.expectedSha256; }
+      else if (target.authorizationMode !== undefined) fail("INVALID_AUTHORIZATION_MODE");
       if (!target || !["file", "directory"].includes(target.type)) fail("UNCERTAIN_TYPE");
       if (target.archiveBatch !== undefined && !/^job-[a-f0-9]{48}$/.test(target.archiveBatch)) fail("UNSAFE_ARCHIVE_BATCH");
       const archivePrefix = "clean_dir/" + (target.archiveBatch ? target.archiveBatch + "/" : "");
@@ -53,7 +58,7 @@ class CleanupFileApi {
       rows.push({ ...copy(target), ...result.target, destination: target.destination });
     }
     const row = { token: crypto.randomBytes(24).toString("hex"), operationId: "cleanup-" + crypto.randomBytes(16).toString("hex"), node: copy(node), rootIdentity: identity,
-      action, observationMode, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, managedObservation: 1, handleScan: observationMode ? "managed_tmux" : "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
+      action, observationMode, authorizationMode: pathOnly ? "confirmed_paths" : undefined, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, managedObservation: 1, confirmedPathDeletion: 1, handleScan: pathOnly ? "confirmed_paths" : observationMode ? "managed_tmux" : "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
     row.digest = hash({ node: row.node, rootIdentity: identity, action, targets: rows, safety: row.safety });
     this.previews.set(row.token, copy(row)); // Preview does not write a journal or a remote hash cache.
     return copy(row);
@@ -91,7 +96,7 @@ class CleanupFileApi {
       const proof = await this.observe(row, index);
       if (["completed", "executing"].includes(proof.state)) return proof;
       if (proof.state !== "pending") fail("CLEANUP_TARGET_CHANGED");
-      await this.activity(row.node);
+      if (row.authorizationMode !== "confirmed_paths") await this.activity(row.node);
       const request = { node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
         action: row.observationMode === "tmux" ? "managed-start" : row.action,
         cleanupAction: row.action, operationId: row.operationId, target: row.targets[index] };

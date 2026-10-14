@@ -288,7 +288,7 @@ function startLocalApiServer(context) {
       "files.cleanup.check": { readOnly: true, zeroWrites: true, receiptOnly: true, automaticExecution: false },
       "files.cleanup.verify": { readOnly: true, completedReceiptRequired: true },
       "files.cleanup.settle": { frozenApprovalRequired: true, receiptOnly: true, startsNewMoves: false },
-      "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
+      "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
       "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
       "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1 },
       "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576 },
