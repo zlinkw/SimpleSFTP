@@ -36,10 +36,12 @@ class CleanupFileApi {
     for (const [token, preview] of this.previews) if (Date.now() > preview.expiresAt) this.previews.delete(token);
     if (this.previews.size >= 4096) fail("CLEANUP_PREVIEW_CAPACITY_EXCEEDED");
     const { node, action = "move", targets } = params;
+    const observationMode = params.observationMode === "managed_tmux" ? node?.kind === "local" ? "filesystem" : "tmux" : undefined;
     if (!node?.root || !["move", "delete", "restore"].includes(action) || !Array.isArray(targets) || !targets.length || targets.length > 500) fail("INVALID_REQUEST");
     await this.activity(node);
     const rows = []; let identity;
-    for (const target of targets) {
+    for (const original of targets) {
+      const target = { ...original, ...(observationMode ? { activityEvidenceMode: "managed_tmux" } : {}) };
       if (!target || !["file", "directory"].includes(target.type)) fail("UNCERTAIN_TYPE");
       if (target.archiveBatch !== undefined && !/^job-[a-f0-9]{48}$/.test(target.archiveBatch)) fail("UNSAFE_ARCHIVE_BATCH");
       const archivePrefix = "clean_dir/" + (target.archiveBatch ? target.archiveBatch + "/" : "");
@@ -51,7 +53,7 @@ class CleanupFileApi {
       rows.push({ ...copy(target), ...result.target, destination: target.destination });
     }
     const row = { token: crypto.randomBytes(24).toString("hex"), operationId: "cleanup-" + crypto.randomBytes(16).toString("hex"), node: copy(node), rootIdentity: identity,
-      action, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, handleScan: "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
+      action, observationMode, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, managedObservation: 1, handleScan: observationMode ? "managed_tmux" : "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
     row.digest = hash({ node: row.node, rootIdentity: identity, action, targets: rows, safety: row.safety });
     this.previews.set(row.token, copy(row)); // Preview does not write a journal or a remote hash cache.
     return copy(row);
@@ -64,6 +66,7 @@ class CleanupFileApi {
   async check(params) {
     const row = await this.read(params.token), index = params.index;
     if (!Number.isInteger(index) || !row.targets[index]) fail("INVALID_TARGET");
+    if (row.observationMode) return this.observe(row, index);
     return this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity, target: row.targets[index],
       action: "check", deleted: row.action === "delete", receiptCompleted: row.states[index] === "completed" });
   }
@@ -81,6 +84,18 @@ class CleanupFileApi {
     const index = params.index;
     if (!Number.isInteger(index) || !row.targets[index]) fail("INVALID_TARGET");
     if (row.states[index] === "absent") fail("NOT_AN_EXECUTABLE_TARGET");
+    if (row.observationMode) {
+      const proof = await this.observe(row, index);
+      if (["completed", "executing"].includes(proof.state)) return proof;
+      if (proof.state !== "pending") fail("CLEANUP_TARGET_CHANGED");
+      await this.activity(row.node);
+      const request = { node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
+        action: row.observationMode === "tmux" ? "managed-start" : row.action,
+        cleanupAction: row.action, operationId: row.operationId, target: row.targets[index] };
+      // A lost response cannot leave a local busy flag that blocks later observations.
+      row.states[index] = "executing"; await this.save(row);
+      return this.checked(request);
+    }
     if (this.busy.has(row.token)) fail("OPERATION_BUSY");
     this.busy.add(row.token);
     try {
@@ -117,11 +132,29 @@ class CleanupFileApi {
       });
     } finally { this.busy.delete(row.token); }
   }
-  async status(params) { return this.read(params.token); }
+  async observe(row, index) {
+    return this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
+      action: "managed-observe", cleanupAction: row.action, localObservation: row.observationMode === "filesystem",
+      operationId: row.operationId, target: row.targets[index] });
+  }
+  async status(params) {
+    const row = await this.read(params.token);
+    if (row.observationMode) {
+      row.observations = [];
+      for (let index = 0; index < row.targets.length; index++) {
+        try {
+          const proof = await this.observe(row, index);
+          row.observations.push(proof); row.states[index] = proof.state;
+        } catch(error) { row.observations.push({ state: "unknown", queryError: error.message }); row.states[index] = "unknown"; }
+      }
+    }
+    return row;
+  }
   /** Settle an already-authorized receipt before coordinator preflight. Never starts a new move. */
   async settle(params) {
     const row = await this.read(params.token), index = params.index, target = row.targets[index];
     if (params.digest !== row.digest || !Number.isInteger(index) || !target || row.confirmations !== (row.action === "delete" ? 2 : 1)) fail("CONFIRM_REQUIRED");
+    if (row.observationMode) return this.observe(row, index);
     if (row.action === "delete") fail("DELETE_RECEIPT_UNCERTAIN");
     if (this.busy.has(row.token)) fail("OPERATION_BUSY");
     this.busy.add(row.token);
@@ -146,6 +179,11 @@ class CleanupFileApi {
   }
   async verify(params) {
     const row = await this.read(params.token), target = row.targets[params.index];
+    if (row.observationMode && target) {
+      const proof = await this.observe(row, params.index);
+      if (proof.state !== "completed") fail("CLEANUP_NOT_VERIFIED");
+      return proof;
+    }
     if (!target || row.states[params.index] !== "completed") fail("RECEIPT_UNVERIFIED");
     return this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity, target, action: "verify", deleted: row.action === "delete" });
   }

@@ -1,0 +1,28 @@
+const test=require('node:test'),assert=require('node:assert/strict'),path=require('node:path');
+const {spawnSync}=require('node:child_process');
+const {CleanupFileApi}=require('../cleanup-file-api');
+const linux=p=>'/mnt/'+p[0].toLowerCase()+p.slice(2).replace(/\\/g,'/');
+test('managed cleanup is observable while its execute response is lost, without a busy/receipt gate',async()=>{
+  let removed=false,mutations=0;
+  const api=new CleanupFileApi({storageRoot:path.join(require('node:os').tmpdir(),'se-managed-api-'+Date.now()),activity:async()=>{},lease:()=>assert.fail('managed query must not use old lease'),
+    transport:async request=>{
+      if(request.action==='inspect')return {ok:true,rootIdentity:{path:'/scope'},target:{fingerprint:'fp',contentFingerprint:'content',absolutePath:'/scope/job',inode:'i'}};
+      if(request.action==='managed-start'){mutations++;removed=true;return new Promise(()=>{});}
+      if(request.action==='managed-observe')return {ok:true,state:removed?'completed':'pending',rootIdentity:{path:'/scope'}};
+      assert.fail(request.action);
+    }});
+  const preview=await api.preview({node:{kind:'remote',root:'/scope'},action:'delete',observationMode:'managed_tmux',targets:[{relativePath:'job',type:'directory',destination:'clean_dir/job'}]});
+  for(const phase of [1,2])await api.confirm({token:preview.token,digest:preview.digest,phase,confirm:true,exactTargets:['/scope/job']});
+  void api.execute({token:preview.token,digest:preview.digest,index:0});
+  for(let i=0;i<20&&!removed;i++)await new Promise(resolve=>setTimeout(resolve,5));
+  assert.equal((await api.check({token:preview.token,index:0})).state,'completed');
+  assert.equal((await api.status({token:preview.token})).states[0],'completed');
+  assert.equal((await api.execute({token:preview.token,digest:preview.digest,index:0})).state,'completed');
+  assert.equal(mutations,1);
+});
+test('real isolated tmux removes and moves only confirmed fixture targets; fresh queries detect recreation',()=>{
+  const fixture=path.resolve(__dirname,'cleanupManaged.fixture.py'),engine=path.resolve(__dirname,'../cleanup-files.py');
+  const args=process.platform==='win32'?['--distribution',process.env.SIMPLE_TEST_WSL_DISTRO||'Ubuntu-Codex','--exec','python3',linux(fixture),linux(engine)]:[fixture,engine];
+  const proc=spawnSync(process.platform==='win32'?'wsl.exe':'python3',args,{encoding:'utf8',timeout:10000,windowsHide:true});
+  assert.equal(proc.status,0,proc.stderr||proc.stdout);assert.deepEqual(JSON.parse(proc.stdout),{ok:true,realTmux:true,receiptsRequired:false});
+});

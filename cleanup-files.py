@@ -4,11 +4,13 @@ No discovery by name, shell deletion, overwrite, or implicit cancellation.
 Authorization and all-node ordering belong to the cleanup coordinator.
 """
 import ctypes
+import base64
 import hashlib
 import json
 import os
 import re
 import socket
+import shlex
 import stat
 import subprocess
 import sys
@@ -245,6 +247,53 @@ def formal_cleanup_owner(root, target, owner):
     return hashlib.sha256(raw).hexdigest()
 
 
+def manifest_records(root, full, value):
+    records, hints = [], set()
+    if not os.path.isdir(full):
+        return records
+    # Exact filenames inside the selected target only; never scan unrelated work_dirs.
+    for row in value["inventory"]:
+        name = row["path"].rsplit("/", 1)[-1]
+        if name in ("config.yaml", "config_snapshot.yaml") and row["type"] == "file" and row["size"] <= 1024 * 1024:
+            file = path_guard(root, os.path.relpath(os.path.join(full, row["path"]), root).replace(os.sep, "/"), True)
+            with open(file, encoding="utf-8") as stream:
+                text = stream.read()
+            for found in re.finditer(r"(?m)^\s*(?:plan_file|planFile):\s*([^#\r\n]+)", text):
+                hint = found.group(1).strip().strip("\"'")
+                if hint:
+                    hints.add(hint)
+    for row in value["inventory"]:
+        name = row["path"].rsplit("/", 1)[-1]
+        if name not in ("artifact_manifest.json", "formal_job_owner.json", "run_wrapper_report.json", "checkpoint_manifest.json") or row["type"] != "file" or row["size"] > 1024 * 1024:
+            continue
+        file = path_guard(root, os.path.relpath(os.path.join(full, row["path"]), root).replace(os.sep, "/"), True)
+        try:
+            with open(file, encoding="utf-8-sig") as stream:
+                body = json.load(stream)
+            if not isinstance(body, dict):
+                continue
+            sources = [body.get("simpleExperiment", {}), body.get("identity", {}), body.get("job", {}), body]
+            binding = {}
+            aliases = {"planFile": ("planFile", "plan_file", "plan_path"), "runId": ("runId", "commandId", "run_id", "command_id"),
+                       "outputDir": ("outputDir", "output_dir", "job_dir"), "resultCsv": ("resultCsv", "collectionResultCsv", "result_csv", "results_csv"),
+                       "index": ("index", "experimentIndex"), "case": ("case",), "seed": ("seed",)}
+            for field, names in aliases.items():
+                for source in sources:
+                    if not isinstance(source, dict):
+                        continue
+                    if field in ("index", "case", "seed") and isinstance(source.get("job"), dict):
+                        source = {**source, **source["job"]}
+                    key = next((key for key in names if source.get(key) is not None), None)
+                    if key is not None:
+                        binding[field] = source[key]
+                        break
+            records.append({"relativePath": os.path.relpath(file, root).replace(os.sep, "/"), "sha256": row["sha256"],
+                            "binding": binding, "planHints": sorted(hints)})
+        except (ValueError, UnicodeError):
+            continue
+    return records
+
+
 def inspect(root, target, archived=False):
     rel = relative(target["relativePath"])
     full = path_guard(root, rel, archived)
@@ -315,11 +364,11 @@ def inspect(root, target, archived=False):
                         expected = owner["outputDir"].replace("\\", "/").rstrip("/")
                         if recorded not in (expected, full.replace(os.sep, "/")):
                             deny("OWNERSHIP_MISMATCH", name + ":" + key)
-    handle_warnings = open_handles(full)
+    handle_warnings = [] if target.get("activityEvidenceMode") == "managed_tmux" else open_handles(full)
     destination = path_guard(root, target["destination"], True, True)
     if os.path.lexists(destination):
         deny("DESTINATION_EXISTS")
-    return {**value, "references": references, "handleWarnings": handle_warnings, "absolutePath": full, "parent": os.path.dirname(full), "leaf": os.path.basename(full), "destination": destination}
+    return {**value, "references": references, "manifests": manifest_records(root, full, value), "handleWarnings": handle_warnings, "absolutePath": full, "parent": os.path.dirname(full), "leaf": os.path.basename(full), "destination": destination}
 
 
 def parent_cd(root, full):
@@ -429,12 +478,106 @@ def mutation_lock(root):
     return stream
 
 
+def managed_tmux(args):
+    result = subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=5)
+    if result.returncode:
+        error = result.stderr or ""
+        low = error.lower()
+        absent = "no server running" in low or "no sessions" in low or "error connecting" in low and any(value in low for value in ("no such file or directory", "connection refused"))
+        if args[0] == "list-panes" and absent:
+            return ""
+        deny("CLEANUP_TMUX_QUERY_FAILED", error[-1000:])
+    return result.stdout.rstrip("\r\n")
+
+
+def managed_key(request):
+    if not re.fullmatch(r"[a-zA-Z0-9._:-]{1,128}", str(request.get("operationId") or "")):
+        deny("CLEANUP_OPERATION_REQUIRED")
+    return digest({"operation": request["operationId"], "root": request["rootIdentity"],
+                   "path": request["target"]["relativePath"], "action": request["cleanupAction"], "fingerprint": request["target"]["fingerprint"]})
+
+
+def managed_observe(request):
+    root, identity = root_guard(request["root"])
+    if identity != request.get("rootIdentity"):
+        deny("ROOT_IDENTITY_CHANGED")
+    key, target = managed_key(request), request["target"]
+    source = path_guard(root, target["relativePath"], request["cleanupAction"] == "restore", True)
+    destination = path_guard(root, target["destination"], True, True)
+    executor = None
+    inventory = "" if request.get("localObservation") else managed_tmux(["list-panes", "-a", "-F", "#{window_id}\t#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{@sftp_cleanup}"])
+    for line in inventory.splitlines():
+        fields = line.split("\t")
+        if len(fields) == 5 and fields[4] == key:
+            executor = {"windowId": fields[0], "paneId": fields[1], "dead": fields[2] == "1",
+                        "exitCode": int(fields[3]) if re.fullmatch(r"-?\d+", fields[3]) else None}
+            if not executor["dead"]:
+                break
+    if executor and not executor["dead"]:
+        return {"ok": True, "state": "executing", "executor": executor, "rootIdentity": identity}
+    if not os.path.lexists(source):
+        if request["cleanupAction"] == "delete":
+            return {"ok": True, "state": "completed", "verifiedBy": "source_absence", "irreversible": True, "rootIdentity": identity, "executor": executor}
+        if not os.path.lexists(destination):
+            return {"ok": True, "state": "partial", "code": "SOURCE_AND_DESTINATION_MISSING", "rootIdentity": identity, "executor": executor}
+        value = contents(root, destination, target["type"])
+        if value["contentFingerprint"] != target["contentFingerprint"] or value["inode"] != target["inode"]:
+            return {"ok": True, "state": "changed", "code": "DESTINATION_CHANGED", "rootIdentity": identity, "executor": executor}
+        return {"ok": True, "state": "completed", "verifiedBy": "destination_identity", "rootIdentity": identity, "executor": executor}
+    value = inspect(root, target, request["cleanupAction"] == "restore")
+    state = "pending" if value["fingerprint"] == target["fingerprint"] else "changed"
+    return {"ok": True, "state": state, "rootIdentity": identity, "executor": executor}
+
+
+def managed_start(request):
+    proof = managed_observe(request)
+    if proof["state"] in ("executing", "completed"):
+        return proof
+    if proof["state"] != "pending":
+        deny("CLEANUP_TARGET_CHANGED")
+    root, _ = root_guard(request["root"])
+    key = managed_key(request)
+    # Immutable confirmed input and code are audit assets, never live state records.
+    directory = path_guard(root, "clean_dir/.operations/managed", True, True)
+    os.makedirs(directory, exist_ok=True)
+    path_guard(root, "clean_dir/.operations/managed", True)
+    code = request["runtimeSource"].encode("utf-8")
+    code_name = "clean_dir/.operations/managed/runtime-" + hashlib.sha256(code).hexdigest() + ".py"
+    command = {name: request[name] for name in ("root", "rootIdentity", "operationId", "target")}
+    command.update(action=request["cleanupAction"], managedInner=True)
+    input_name = "clean_dir/.operations/managed/" + key + ".json"
+    for relative_path, data in ((code_name, code), (input_name, json.dumps(command, ensure_ascii=False, sort_keys=True).encode("utf-8"))):
+        full = path_guard(root, relative_path, True, True)
+        if os.path.lexists(full):
+            with open(full, "rb") as handle:
+                if handle.read() != data:
+                    deny("CLEANUP_INPUT_CHANGED")
+        else:
+            with open(full, "xb") as handle:
+                handle.write(data)
+    session = "simple-clean-" + digest(root)[:16]
+    if subprocess.run(["tmux", "has-session", "-t", session], capture_output=True, timeout=3).returncode:
+        managed_tmux(["new-session", "-d", "-s", session])
+    launch = "exec " + shlex.join([sys.executable, "-B", "-X", "utf8", path_guard(root, code_name, True)]) + " < " + shlex.quote(path_guard(root, input_name, True))
+    # The parent holds the existing mutation lock until window binding is published;
+    # the child acquires that same lock before touching any approved target.
+    pane = managed_tmux(["new-window", "-d", "-t", session, "-n", "cleanup-" + key[:12], "-c", root,
+                         "-P", "-F", "#{pane_id}", "--", "bash", "-c", launch])
+    managed_tmux(["set-option", "-w", "-t", pane, "remain-on-exit", "on"])
+    managed_tmux(["set-option", "-w", "-t", pane, "@sftp_cleanup", key])
+    return {"ok": True, "state": "requested", "rootIdentity": request["rootIdentity"]}
+
+
 def main(request):
     root, identity = root_guard(request["root"])
     expected_owner = request.get("target", {}).get("expectedOwner")
     if expected_owner is not None and not isinstance(expected_owner, dict):
         deny("OWNERSHIP_UNVERIFIED")
     action = request["action"]
+    if action == "managed-observe":
+        return managed_observe(request)
+    if action == "managed-start":
+        return managed_start(request)
     if action not in ("check", "verify", "inventory", "inspect", "move", "delete", "restore", "settle"):
         deny("UNKNOWN_ACTION")
     if action == "inventory":
@@ -445,6 +588,7 @@ def main(request):
         if not os.path.lexists(full):
             return {"ok": True, "rootIdentity": identity, "target": {"missing": True, "type": target["type"], "absolutePath": full}}
         value = contents(root, full, target["type"])
+        value["manifests"] = manifest_records(root, full, value)
         if (target.get("expectedOwner") or {}).get("resultPathPolicy") == "declared":
             owner_hash = formal_cleanup_owner(root, target, target["expectedOwner"])
             value["formalOwnerSha256"] = owner_hash
@@ -530,14 +674,23 @@ def main(request):
 
 if __name__ == "__main__":
     lock = None
+    request = {}
     try:
         raw = sys.stdin.buffer.read(1048577).rstrip(b"\x00")
         if len(raw) > 1048576:
             deny("REQUEST_TOO_LARGE")
         request = json.loads(raw.decode("utf-8"))
-        if request.get("action") in ("move", "delete", "restore", "settle"):
+        if request.get("action") in ("move", "delete", "restore", "settle", "managed-start"):
             checked_root, _ = root_guard(request["root"])
-            lock = mutation_lock(checked_root)
+            deadline = time.monotonic() + (3 if request.get("managedInner") else 0)
+            while True:
+                try:
+                    lock = mutation_lock(checked_root)
+                    break
+                except GuardError as error:
+                    if error.code != "OPERATION_BUSY" or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.02)
         result = main(request)
     except GuardError as error:
         result = {"ok": False, "error": {"code": error.code, "message": str(error)}}
@@ -549,3 +702,5 @@ if __name__ == "__main__":
         if lock is not None:
             lock.close()
     sys.stdout.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    if request.get("managedInner") and not result.get("ok"):
+        sys.exit(1)

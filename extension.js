@@ -290,7 +290,7 @@ function startLocalApiServer(context) {
       "files.cleanup.settle": { frozenApprovalRequired: true, receiptOnly: true, startsNewMoves: false },
       "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
       "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
-      "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true },
+      "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1 },
       "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576 },
       "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
       "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, memoryWrapperResults: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024 },
@@ -4776,6 +4776,7 @@ async function cleanupFileTransport(request) {
   const node = request.node;
   let output;
   const script = fs.readFileSync(path.join(__dirname, "cleanup-files.py"), "utf8");
+  if (request.action === "managed-start") request.runtimeSource = script;
   if (node?.kind === "local") {
     if (!path.isAbsolute(node.root)) cleanupFail("UNSAFE_ROOT");
     output = await new Promise((resolve, reject) => {
@@ -4800,7 +4801,7 @@ async function cleanupFileTransport(request) {
     if (!known) cleanupFail("SERVER_IDENTITY_UNVERIFIED");
     const loader = cleanupRemoteLoader(script);
     output = await runRemoteBatchSsh(source, `python3 -B -c ${shellQuote(loader)}`, [JSON.stringify(request)], 60000,
-      { remoteMutation: !["check", "inspect", "inventory", "verify"].includes(request.action), stage: "PLAN 安全文件操作" });
+      { remoteMutation: !["check", "inspect", "inventory", "verify", "managed-observe"].includes(request.action), stage: "PLAN 安全文件操作" });
   }
   return JSON.parse(String(output));
 }
