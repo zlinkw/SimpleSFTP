@@ -579,6 +579,39 @@ def managed_active(root, target, full, value):
             deny("ACTIVE_TMUX_TASK", fields[1] + ":" + fields[0])
 
 
+def managed_delete_progress(root, target):
+    inventory = target.get("inventory") or []
+    source = path_guard(root, target["relativePath"], False, True)
+    expected = {row["path"]: row for row in inventory}
+    seen, mounts = set(), mount_points()
+    def scan(full, rel):
+        try:
+            info = os.lstat(full)
+        except FileNotFoundError:
+            return
+        row = expected.get(rel)
+        if not row:
+            return  # Progress never follows new children or expands the approved inventory.
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 1024:
+            deny("LINK_OR_REPARSE_POINT", full)
+        if str(info.st_dev) != row["device"] or str(info.st_ino) != row["inode"] or full in mounts:
+            deny("IDENTITY_CHANGED", full)
+        seen.add(rel)
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                with os.scandir(full) as children:
+                    for child in children:
+                        name = rel + "/" + child.name if rel else child.name
+                        if name in expected:
+                            scan(child.path, name)
+            except FileNotFoundError:
+                pass  # This executor removed the directory during the query.
+    scan(source, "")
+    removed = [row for row in inventory if row["path"] not in seen]
+    return {"removedEntries": len(removed), "totalEntries": len(inventory), "removedBytes": sum(row.get("size", 0) for row in removed),
+            "totalBytes": sum(row.get("size", 0) for row in inventory)}
+
+
 def managed_observe(request):
     root, identity = root_guard(request["root"])
     if identity != request.get("rootIdentity"):
@@ -596,7 +629,8 @@ def managed_observe(request):
             if not executor["dead"]:
                 break
     if executor and not executor["dead"]:
-        return {"ok": True, "state": "executing", "executor": executor, "rootIdentity": identity}
+        progress = managed_delete_progress(root, target) if request["cleanupAction"] == "delete" else None
+        return {"ok": True, "state": "executing", "executor": executor, "rootIdentity": identity, "progress": progress}
     if not os.path.lexists(source):
         if request["cleanupAction"] == "delete":
             return {"ok": True, "state": "completed", "verifiedBy": "source_absence", "irreversible": True, "rootIdentity": identity, "executor": executor}

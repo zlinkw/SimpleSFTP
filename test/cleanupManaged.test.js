@@ -2,6 +2,29 @@ const test=require('node:test'),assert=require('node:assert/strict'),path=requir
 const {spawnSync}=require('node:child_process');
 const {CleanupFileApi}=require('../cleanup-file-api');
 const linux=p=>'/mnt/'+p[0].toLowerCase()+p.slice(2).replace(/\\/g,'/');
+test('cleanup progress counts actual remaining frozen entries and bytes without reading weights',()=>{
+  const fixture=path.resolve(__dirname,'cleanupDeleteProgress.fixture.py'),engine=path.resolve(__dirname,'../cleanup-files.py');
+  const args=process.platform==='win32'?['--distribution',process.env.SIMPLE_TEST_WSL_DISTRO||'Ubuntu-Codex','--exec','python3',linux(fixture),linux(engine)]:[fixture,engine];
+  const proc=spawnSync(process.platform==='win32'?'wsl.exe':'python3',args,{encoding:'utf8',timeout:10000,windowsHide:true});
+  assert.equal(proc.status,0,proc.stderr||proc.stdout);assert.deepEqual(JSON.parse(proc.stdout),{ok:true,actualRemainingFiles:true});
+});
+test('a busy live mutation lock delays managed admission without becoming a terminal failure or duplicate execution',async()=>{
+  let attempts=0,removed=false;
+  const api=new CleanupFileApi({storageRoot:path.join(require('node:os').tmpdir(),'managed-busy-'+Date.now()),activity:async()=>{},
+    transport:async request=>{
+      if(request.action==='inspect')return {ok:true,rootIdentity:{path:'/scope'},target:{absolutePath:'/scope/job',fingerprint:'fp'}};
+      if(request.action==='managed-observe')return {ok:true,state:removed?'completed':'pending'};
+      if(request.action==='managed-start'){if(++attempts===1)return {ok:false,error:{code:'OPERATION_BUSY'}};removed=true;return {ok:true,state:'requested'};}
+      assert.fail(request.action);
+    }});
+  const p=await api.preview({node:{kind:'remote',root:'/scope'},action:'delete',authorizationMode:'confirmed_paths',targets:[{relativePath:'job',type:'directory',destination:'clean_dir/job'}]});
+  for(const phase of [1,2])await api.confirm({token:p.token,digest:p.digest,phase,confirm:true,exactTargets:['/scope/job']});
+  const request={token:p.token,digest:p.digest,index:0};
+  assert.equal((await api.execute(request)).state,'waiting');
+  assert.equal((await api.check(request)).state,'pending');
+  await api.execute(request);assert.equal((await api.check(request)).state,'completed');
+  await api.execute(request);assert.equal(attempts,2);
+});
 test('managed cleanup is observable while its execute response is lost, without a busy/receipt gate',async()=>{
   let removed=false,mutations=0;
   const api=new CleanupFileApi({storageRoot:path.join(require('node:os').tmpdir(),'se-managed-api-'+Date.now()),activity:async()=>{},lease:()=>assert.fail('managed query must not use old lease'),

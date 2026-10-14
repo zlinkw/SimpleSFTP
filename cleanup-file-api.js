@@ -117,7 +117,15 @@ class CleanupFileApi {
         const execution = this.checked(request); this.localExecutions.set(key, execution);
         try { return await execution; } finally { if (this.localExecutions.get(key) === execution) this.localExecutions.delete(key); }
       }
-      return this.checked(request);
+      try { return await this.checked(request); }
+      catch (error) {
+        // A live OS mutation lock refused admission before any window was
+        // created. The client may retry this same confirmed request, while
+        // lifecycle checks continue reading actual tmux/filesystem evidence.
+        if (row.observationMode === "tmux" && error.code === "OPERATION_BUSY")
+          return { ok: true, state: "waiting", reason: "CLEANUP_MUTATION_BUSY", notStarted: true };
+        throw error;
+      }
     }
     if (this.busy.has(row.token)) fail("OPERATION_BUSY");
     this.busy.add(row.token);
