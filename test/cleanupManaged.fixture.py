@@ -1,5 +1,5 @@
 """Destructive operations are confined to new disposable CPU fixture files."""
-import json, os, pathlib, subprocess, sys, tempfile, time
+import base64, json, os, pathlib, subprocess, sys, tempfile, time
 engine=pathlib.Path(sys.argv[1]);source=engine.read_text(encoding="utf-8")
 root=pathlib.Path(tempfile.mkdtemp(prefix="se-clean-observe-"))
 engine=root/"engine.py"
@@ -35,6 +35,15 @@ try:
         (root/name).mkdir(parents=True);(root/name/"weight.pth").write_bytes(b"fixture")
     (root/"outputs/remove/artifact_manifest.json").write_text(json.dumps({"simpleExperiment":{"runId":"fixture","planFile":"experiments/plans/fixture.yaml","outputDir":"outputs/remove","job":{"index":0,"case":"fixture","seed":42}}}),encoding="utf-8")
     deletion=frozen("outputs/remove","delete")
+    metadata=run({"root":str(root),"action":"inventory","manifestOnly":True,"target":{"relativePath":"outputs/remove","type":"directory"}})
+    assert metadata["target"]["manifests"][0]["binding"]["runId"]=="fixture"
+    # Live task windows block exact artifacts even with no state file or PID scan.
+    subprocess.run(["tmux","new-session","-d","-s","writer"],check=True,timeout=1)
+    task={"root":str(root),"outputDir":"outputs/remove","collectionResultCsv":"results/fixture.csv"}
+    subprocess.run(["tmux","set-option","-w","-t","writer","@se_job",base64.urlsafe_b64encode(json.dumps(task).encode()).decode()],check=True,timeout=1)
+    rejected=subprocess.run([sys.executable,"-B",str(engine)],input=json.dumps({**deletion,"action":"managed-start"}),capture_output=True,text=True,timeout=2)
+    assert json.loads(rejected.stdout)["error"]["code"]=="ACTIVE_TMUX_TASK",rejected.stdout
+    subprocess.run(["tmux","kill-window","-t","writer:0"],check=True,timeout=1)
     run({**deletion,"action":"managed-start"})  # The caller deliberately ignores this transport response.
     await_done(deletion)
     assert not (root/"outputs/remove").exists()

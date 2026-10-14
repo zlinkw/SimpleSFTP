@@ -17,7 +17,7 @@ function fail(code, message = code) { const error = new Error(message); error.co
 class CleanupFileApi {
   constructor({ storageRoot, transport, activity, lease }) {
     this.storageRoot = storageRoot; this.transport = transport; this.activity = activity; this.lease = lease;
-    this.previews = new Map(); this.busy = new Set();
+    this.previews = new Map(); this.busy = new Set(); this.localExecutions = new Map();
   }
   async checked(request) {
     const value = await this.transport(copy(request));
@@ -60,7 +60,8 @@ class CleanupFileApi {
   }
   async inspect(params) {
     if (!params.node?.root || !["file", "directory"].includes(params.target?.type)) fail("INVALID_REQUEST");
-    return this.checked({ node: params.node, root: params.node.root, action: "inventory", target: params.target, allowMissing: params.allowMissing === true });
+    return this.checked({ node: params.node, root: params.node.root, action: "inventory", target: params.target,
+      manifestOnly: params.manifestOnly === true, allowMissing: params.allowMissing === true });
   }
   /** Read-only observation of a frozen receipt. Never settles audit state or starts a file operation. */
   async check(params) {
@@ -85,6 +86,8 @@ class CleanupFileApi {
     if (!Number.isInteger(index) || !row.targets[index]) fail("INVALID_TARGET");
     if (row.states[index] === "absent") fail("NOT_AN_EXECUTABLE_TARGET");
     if (row.observationMode) {
+      const key = row.token + ":" + index;
+      if (row.observationMode === "filesystem" && this.localExecutions.has(key)) return { ok: true, state: "executing" };
       const proof = await this.observe(row, index);
       if (["completed", "executing"].includes(proof.state)) return proof;
       if (proof.state !== "pending") fail("CLEANUP_TARGET_CHANGED");
@@ -94,6 +97,11 @@ class CleanupFileApi {
         cleanupAction: row.action, operationId: row.operationId, target: row.targets[index] };
       // A lost response cannot leave a local busy flag that blocks later observations.
       row.states[index] = "executing"; await this.save(row);
+      if (row.observationMode === "filesystem") {
+        if (this.localExecutions.has(key)) return { ok: true, state: "executing" };
+        const execution = this.checked(request); this.localExecutions.set(key, execution);
+        try { return await execution; } finally { if (this.localExecutions.get(key) === execution) this.localExecutions.delete(key); }
+      }
       return this.checked(request);
     }
     if (this.busy.has(row.token)) fail("OPERATION_BUSY");
@@ -133,6 +141,8 @@ class CleanupFileApi {
     } finally { this.busy.delete(row.token); }
   }
   async observe(row, index) {
+    if (row.observationMode === "filesystem" && this.localExecutions.has(row.token + ":" + index))
+      return { ok: true, state: "executing", executor: { kind: "active_local_transfer" } };
     return this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
       action: "managed-observe", cleanupAction: row.action, localObservation: row.observationMode === "filesystem",
       operationId: row.operationId, target: row.targets[index] });

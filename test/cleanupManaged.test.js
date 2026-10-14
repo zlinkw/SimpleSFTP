@@ -26,3 +26,20 @@ test('real isolated tmux removes and moves only confirmed fixture targets; fresh
   const proc=spawnSync(process.platform==='win32'?'wsl.exe':'python3',args,{encoding:'utf8',timeout:10000,windowsHide:true});
   assert.equal(proc.status,0,proc.stderr||proc.stdout);assert.deepEqual(JSON.parse(proc.stdout),{ok:true,realTmux:true,receiptsRequired:false});
 });
+test('local cleanup queries the actual in-flight operation and cannot launch a concurrent duplicate',async()=>{
+  let removed=false,mutations=0,release;
+  const api=new CleanupFileApi({storageRoot:path.join(require('node:os').tmpdir(),'se-local-observe-'+Date.now()),activity:async()=>{},
+    transport:async request=>{
+      if(request.action==='inspect')return {ok:true,rootIdentity:{path:'/scope'},target:{fingerprint:'fp',contentFingerprint:'c',absolutePath:'/scope/output/job',inode:'i'}};
+      if(request.action==='managed-observe')return {ok:true,state:removed?'completed':'pending'};
+      if(request.action==='delete'){mutations++;return new Promise(resolve=>{release=()=>{removed=true;resolve({ok:true})}})}
+      assert.fail(request.action);
+    }});
+  const p=await api.preview({node:{kind:'local',root:'/scope'},action:'delete',observationMode:'managed_tmux',targets:[{relativePath:'output/job',type:'directory',destination:'clean_dir/output/job'}]});
+  for(const phase of [1,2])await api.confirm({token:p.token,digest:p.digest,phase,confirm:true,exactTargets:['/scope/output/job']});
+  const execution=api.execute({token:p.token,digest:p.digest,index:0});
+  for(let i=0;i<30&&!release;i++)await new Promise(resolve=>setTimeout(resolve,5));assert.ok(release);
+  assert.equal((await api.check({token:p.token,index:0})).state,'executing');
+  assert.equal((await api.execute({token:p.token,digest:p.digest,index:0})).state,'executing');assert.equal(mutations,1);
+  release();await execution;assert.equal((await api.check({token:p.token,index:0})).state,'completed');
+});

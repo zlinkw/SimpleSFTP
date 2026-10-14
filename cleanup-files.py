@@ -364,7 +364,11 @@ def inspect(root, target, archived=False):
                         expected = owner["outputDir"].replace("\\", "/").rstrip("/")
                         if recorded not in (expected, full.replace(os.sep, "/")):
                             deny("OWNERSHIP_MISMATCH", name + ":" + key)
-    handle_warnings = [] if target.get("activityEvidenceMode") == "managed_tmux" else open_handles(full)
+    if target.get("activityEvidenceMode") == "managed_tmux":
+        managed_active(root, target, full, value)
+        handle_warnings = []
+    else:
+        handle_warnings = open_handles(full)
     destination = path_guard(root, target["destination"], True, True)
     if os.path.lexists(destination):
         deny("DESTINATION_EXISTS")
@@ -497,6 +501,33 @@ def managed_key(request):
                    "path": request["target"]["relativePath"], "action": request["cleanupAction"], "fingerprint": request["target"]["fingerprint"]})
 
 
+def managed_active(root, target, full, value):
+    # Only real managed tmux windows are execution evidence. No historical PID/owner/claim scan.
+    if os.name == "nt":
+        return
+    fmt = "#{pane_id}\t#{window_id}\t#{pane_dead}\t#{@se_job}\t#{@simple_experiment_command}\t#{@simple_experiment_project}"
+    records = manifest_records(root, full, value)
+    run_ids = {row["binding"].get("runId") for row in records} - {None, ""}
+    sources = [full, path_guard(root, target["destination"], True, True)]
+    for line in managed_tmux(["list-panes", "-a", "-F", fmt]).splitlines():
+        fields = line.split("\t")
+        if len(fields) != 6 or fields[2] == "1":
+            continue
+        try:
+            job = json.loads(base64.urlsafe_b64decode(fields[3]).decode("utf-8")) if fields[3] else {}
+        except (ValueError, UnicodeError):
+            deny("CLEANUP_TASK_BINDING_UNVERIFIED", fields[1])
+        if job.get("root") == root and (not job.get("pane") or job["pane"] == fields[0]):
+            for name in ("outputDir", "collectionResultCsv"):
+                if not job.get(name):
+                    continue
+                active = path_guard(root, relative(job[name]), False, True)
+                if any(active == source or below(active, source) or below(source, active) for source in sources):
+                    deny("ACTIVE_TMUX_TASK", fields[1] + ":" + fields[0])
+        elif fields[4] in run_ids:
+            deny("ACTIVE_TMUX_TASK", fields[1] + ":" + fields[0])
+
+
 def managed_observe(request):
     root, identity = root_guard(request["root"])
     if identity != request.get("rootIdentity"):
@@ -565,6 +596,9 @@ def managed_start(request):
                          "-P", "-F", "#{pane_id}", "--", "bash", "-c", launch])
     managed_tmux(["set-option", "-w", "-t", pane, "remain-on-exit", "on"])
     managed_tmux(["set-option", "-w", "-t", pane, "@sftp_cleanup", key])
+    binding = {"root": root, "operationId": request["operationId"], "relativePath": request["target"]["relativePath"],
+               "destination": request["target"]["destination"]}
+    managed_tmux(["set-option", "-w", "-t", pane, "@sftp_cleanup_target", base64.urlsafe_b64encode(json.dumps(binding).encode("utf-8")).decode("ascii")])
     return {"ok": True, "state": "requested", "rootIdentity": request["rootIdentity"]}
 
 
@@ -587,6 +621,18 @@ def main(request):
             deny("UNSAFE_PARENT")
         if not os.path.lexists(full):
             return {"ok": True, "rootIdentity": identity, "target": {"missing": True, "type": target["type"], "absolutePath": full}}
+        if request.get("manifestOnly"):
+            if target["type"] != "directory" or not os.path.isdir(full):
+                deny("TYPE_CHANGED")
+            inventory = []
+            for name in ("artifact_manifest.json", "formal_job_owner.json", "run_wrapper_report.json", "checkpoint_manifest.json", "config.yaml", "config_snapshot.yaml"):
+                file = path_guard(root, target["relativePath"] + "/" + name, True, True)
+                if not os.path.isfile(file) or os.path.getsize(file) > 1024 * 1024:
+                    continue
+                row = contents(root, file, "file")["inventory"][0]
+                inventory.append({**row, "path": name})
+            return {"ok": True, "rootIdentity": identity, "target": {"type": "directory", "absolutePath": full,
+                "manifests": manifest_records(root, full, {"inventory": inventory})}}
         value = contents(root, full, target["type"])
         value["manifests"] = manifest_records(root, full, value)
         if (target.get("expectedOwner") or {}).get("resultPathPolicy") == "declared":
