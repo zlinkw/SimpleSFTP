@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.83
+
+- Managed cleanup uses the complete, explicit host/user/port/project root across inspection, review, execution and active status queries. A second saved profile or active server selection no longer rejects a verified SSH alias/IP spelling.
+- Retire Hub Agent deployment; keep Worker service ownership and exact tmux window management. Path double confirmation, canonical root/direct parent, fixed type and link protections remain.
+- Regression uses synthetic endpoints only; no production transfers, deletion or Agent deployment.
+
 ## 0.2.67
 
 - Canonicalize Windows drive and filename spelling aliases before freezing cleanup root/target identities. A lower-case VS Code workspace path no longer falsely reports ROOT_IDENTITY_CHANGED.
