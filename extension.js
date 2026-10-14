@@ -4790,15 +4790,9 @@ async function cleanupFileTransport(request) {
     });
   } else {
     const source = directSyncTarget({ host: node.host, username: node.user, port: node.port, remotePath: node.root }, "清理节点");
-    // Require a current configured identity. Disabled/history nodes remain available in the profile store.
-    const known = readSharedServers().servers.some(row => {
-      try {
-        const target = apiTransferSftp({ server: row });
-        return target.host === source.host && target.username === source.username && target.port === source.port
-          && String(target.remotePath).replace(/\/+$/, "") === source.remotePath;
-      } catch { return false; }
-    });
-    if (!known) cleanupFail("SERVER_IDENTITY_UNVERIFIED");
+    // The frozen, fully specified node is the authority for this exact operation.
+    // Never merge an active profile or require a second spelling of an SSH alias.
+    // SSH authentication and canonical root/parent checks still apply.
     const loader = cleanupRemoteLoader(script);
     output = await runRemoteBatchSsh(source, `python3 -B -c ${shellQuote(loader)}`, [JSON.stringify(request)], 60000,
       { remoteMutation: !["check", "inspect", "inventory", "verify", "managed-observe"].includes(request.action), stage: "PLAN 安全文件操作" });

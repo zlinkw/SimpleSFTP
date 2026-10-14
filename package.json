@@ -10,7 +10,7 @@
 	"license": "MIT",
 	"scripts": {
 		"test": "node scripts/test-serial.js",
-		"build": "node scripts/verify-runtime.js && node --test --test-force-exit --test-timeout 20000 test/formalJobCleanupOwner.test.js && node --test --test-force-exit --test-timeout 20000 test/pairedUpdateDrain.test.js && node --test --test-force-exit --test-timeout 20000 test/agentLifecycle.test.js && node --test --test-force-exit --test-timeout 20000 test/cleanupPreviewCapacity.test.js && node --test --test-force-exit --test-timeout 20000 test/cleanupHandle.test.js && node --test --test-force-exit --test-timeout 20000 test/cleanupManaged.test.js && node --test --test-force-exit --test-timeout 20000 test/confirmedPathDelete.test.js",
+		"build": "node scripts/verify-runtime.js && node --test --test-force-exit --test-timeout 20000 test/formalJobCleanupOwner.test.js && node --test --test-force-exit --test-timeout 20000 test/pairedUpdateDrain.test.js && node --test --test-force-exit --test-timeout 20000 test/agentLifecycle.test.js && node --test --test-force-exit --test-timeout 20000 test/cleanupPreviewCapacity.test.js && node --test --test-force-exit --test-timeout 20000 test/cleanupHandle.test.js && node --test --test-force-exit --test-timeout 20000 test/cleanupManaged.test.js && node --test --test-force-exit --test-timeout 20000 test/confirmedPathDelete.test.js && node --test --test-force-exit --test-timeout 20000 test/cleanupExplicitTarget.test.js",
 		"package": "npm run build && node scripts/package-vsix.js",
 		"install:latest": "pwsh.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/install-latest.ps1"
 	},

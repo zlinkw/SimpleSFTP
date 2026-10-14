@@ -80,7 +80,7 @@ def lifecycle_contract(params):
     state = lifecycle_canonical(os.path.join(install, "state", "projects", namespace), exists=False)
     mode = params.get("mode")
     worker = str(params.get("workerId") or "")
-    if mode not in ("worker_telemetry", "hub_control") or (mode == "worker_telemetry" and not worker):
+    if mode != "worker_telemetry" or not worker:
         raise AgentLifecycleError("AGENT_IDENTITY_REQUIRED")
     host = str(params.get("host") or "")
     if host not in ("localhost", "127.0.0.1", "::1"):
@@ -146,7 +146,7 @@ def lifecycle_tmux_config(params):
     if not prefix or not prefix[0].isalnum():
         prefix = "simple"
     worker = re.sub(r"[^a-z0-9._-]+", "-", str(params.get("workerId") or "worker").strip().lower()).strip("-") or "worker"
-    default = prefix + ("-hub-agent" if params.get("mode") == "hub_control" else "-worker-" + worker + "-agent")
+    default = prefix + "-worker-" + worker + "-agent"
     session = str(params.get("tmuxSession") or default)
     window = str(params.get("tmuxWindow") or "agent")
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}-agent", session) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}", window):
