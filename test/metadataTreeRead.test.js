@@ -39,3 +39,11 @@ test('empty tree and existence queries do not queue behind large inventory or fi
  try{const tree=await methods['sync.projectTree']({source,relativePath:'work_dirs'});assert.deepEqual(tree.entries,[]);const state=await methods['sync.projectTreeState']({source,relativePath:'work_dirs'});assert.equal(state.empty,true);}
  finally{release();await inventory;__test.setRemoteBatchTransport(null);__test.setProjectTreeTransport(null);}
 });
+
+test('cleanup progress is request-scoped and does not consult or persist transfer receipts',async()=>{
+ let observed=false;
+ __test.setTransferSettlementTestContext({instanceId:'cleanup-instance',globalState:{get:()=>assert.fail('cleanup cannot read old transfer records'),update:()=>assert.fail('cleanup cannot persist transfer records')},
+  cleanupApi:{preview:async()=>{const active=__test.listActiveTransfers();assert.ok(active.some(row=>row.operation==='files.cleanup.preview'&&row.operationId==='cleanup-progress'));observed=true;return {ok:true};}}});
+ try {const result=await __test.createLocalApiMethods()['files.cleanup.preview']({_operationId:'cleanup-progress',_requestKey:'a'.repeat(64)});assert.equal(result.ok,true);assert.equal(observed,true);assert.equal(__test.listActiveTransfers().length,0);}
+ finally {__test.setTransferSettlementTestContext({cleanupApi:null,globalState:{get:(_,fallback)=>fallback,update:async()=>{}}});}
+});

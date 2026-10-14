@@ -1,6 +1,7 @@
 const vscode = require("vscode");
 const { AsyncLocalStorage } = require("node:async_hooks");
 const { ProgressInactivity } = require("./progress-inactivity");
+const { startRemoteFileProgress } = require("./transfer-file-progress");
 const { LatestSnapshotWriter } = require("./latest-snapshot-writer");
 const { TransferCapacity } = require("./transfer-capacity");
 const transferCapacity = new TransferCapacity();
@@ -290,7 +291,7 @@ function startLocalApiServer(context) {
       "files.cleanup.check": { readOnly: true, zeroWrites: true, receiptOnly: true, automaticExecution: false },
       "files.cleanup.verify": { readOnly: true, completedReceiptRequired: true },
       "files.cleanup.settle": { frozenApprovalRequired: true, receiptOnly: true, startsNewMoves: false },
-      "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
+      "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
       "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
       "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1 },
       "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576 },
@@ -3439,7 +3440,7 @@ function nextTransferId(operation) {
   return `transfer-${Date.now()}-${transferSequence}-${String(operation || "").replace(/[^\w.-]+/g, "-")}`;
 }
 
-function createTransferController({ id, operation, localPath, remotePath, host }) {
+function createTransferController({ id, operation, localPath, remotePath, host, observeOnlyIdle = false }) {
   const listeners = new Set();
   const progressListeners = new Set();
   let cancelled = false;
@@ -3459,6 +3460,8 @@ function createTransferController({ id, operation, localPath, remotePath, host }
     lastProgressAt: new Date().toISOString(),
     startedAt: new Date().toISOString(),
     status: "running",
+    observeOnlyIdle,
+    stalled: false,
     totalBytes: 0,
     transferredBytes: 0,
     onCancel(listener) {
@@ -3496,13 +3499,23 @@ function createTransferController({ id, operation, localPath, remotePath, host }
       void maybeSettleTransferOperation(controller.operationId);
     },
   };
-  const idle = new ProgressInactivity(120000, () => controller.cancel(`文件步骤（${controller.phase}）120 秒无真实进展，已取消。请检查该阶段日志和目标状态后重试。`));
+  controller.markStalled = () => {
+    if (disposed || cancelled || controller.stalled) return;
+    controller.stalled = true;
+    const snapshot = { id, operationId: controller.operationId, phase: controller.phase, status: "running", stalled: true,
+      writtenBytes: controller.writtenBytes, writtenFiles: controller.writtenFiles, totalBytes: controller.totalBytes, totalFiles: controller.totalFiles };
+    localApiServer?.publish({ type: "transfer_progress", data: snapshot });
+    for (const listener of progressListeners) { try { listener(snapshot); } catch {} }
+    parentController?.markStalled?.();
+  };
+  const idle = new ProgressInactivity(120000, () => observeOnlyIdle ? controller.markStalled() : controller.cancel(`文件步骤（${controller.phase}）120 秒无真实进展，已取消。请检查该阶段日志和目标状态后重试。`), Date.now, observeOnlyIdle);
   let transferredBytes = 0;
   const wireScopes = new Map();
   let lastEventAt = 0;
   Object.defineProperty(controller, "transferredBytes", { enumerable: true, get: () => transferredBytes, set: (value) => { if (disposed || cancelled) return; transferredBytes = Math.max(transferredBytes, Number(value) || 0); controller.updateProgress({ processedBytes: transferredBytes, phase: "transferring" }); } });
   controller.updateProgress = (evidence) => {
     if (disposed || cancelled || !idle.update(evidence)) return false;
+    controller.stalled = false;
     const phaseChanged = Boolean(evidence.phase && evidence.phase !== controller.phase);
     if (evidence.metric === "wire") {
       const scope = String(evidence.scope || id), count = Math.max(0, Number(evidence.processedBytes) || 0);
@@ -3517,7 +3530,7 @@ function createTransferController({ id, operation, localPath, remotePath, host }
     if (evidence.processedFiles !== undefined) controller.processedFiles = evidence.processedFiles;
     for (const key of ["cacheHits", "cacheRehash"]) controller[key] = Number.isSafeInteger(evidence[key]) && evidence[key] >= 0 ? evidence[key] : undefined;
     controller.cacheStatus = ["ready", "unavailable", "read-failed", "write-failed"].includes(evidence.cacheStatus) ? evidence.cacheStatus : undefined;
-    for (const key of ["completedFiles", "totalFiles", "completedGroups", "totalGroups"]) {
+    for (const key of ["completedFiles", "totalFiles", "completedGroups", "totalGroups", "totalBytes", "writtenBytes", "writtenFiles"]) {
       if (Number.isSafeInteger(evidence[key]) && evidence[key] >= 0)
         controller[key] = Math.max(controller[key] || 0, evidence[key]);
     }
@@ -3531,6 +3544,7 @@ function createTransferController({ id, operation, localPath, remotePath, host }
         progressScope: controller.progressScope, processedFiles: controller.processedFiles,
         completedFiles: controller.completedFiles, totalFiles: controller.totalFiles,
         completedGroups: controller.completedGroups, totalGroups: controller.totalGroups,
+        writtenBytes: controller.writtenBytes, writtenFiles: controller.writtenFiles, stalled: controller.stalled,
         lastProgressAt: controller.lastProgressAt, status: controller.status };
       localApiServer?.publish({ type: "transfer_progress", data: snapshot });
       for (const listener of progressListeners) { try { listener(snapshot); } catch {} }
@@ -3546,7 +3560,7 @@ function createTransferController({ id, operation, localPath, remotePath, host }
 }
 
 function listActiveTransfers() {
-  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status, totalBytes, transferredBytes, operationId, phase, processedFiles, processedBytes, progressScope, lastProgressAt, comparedFiles, changedFiles, completedFiles, totalFiles, completedGroups, totalGroups, missingFiles, differentFiles, unchangedFiles, cacheHits, cacheRehash, cacheStatus }) => ({
+  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status, totalBytes, transferredBytes, operationId, phase, processedFiles, processedBytes, progressScope, lastProgressAt, comparedFiles, changedFiles, completedFiles, totalFiles, completedGroups, totalGroups, missingFiles, differentFiles, unchangedFiles, cacheHits, cacheRehash, cacheStatus, writtenBytes, writtenFiles, stalled }) => ({
     id,
     operation,
     localPath,
@@ -3555,6 +3569,7 @@ function listActiveTransfers() {
     startedAt,
     status,
     totalBytes,
+    writtenBytes, writtenFiles, stalled,
     transferredBytes,
     operationId, phase, processedFiles, lastProgressAt,
     processedBytes, progressScope, comparedFiles, changedFiles,
@@ -3884,14 +3899,15 @@ function uploadProgressCancellable(options = {}) {
 
 function runUploadWithProgress(options, title, operation) {
   const execute = async (progress, token) => {
-    const controller = createTransferController({ id: nextTransferId(title), operation: title, localPath: options.localPath || "", remotePath: options.sftp?.remotePath || "", host: options.sftp?.host || "" });
+    const controller = createTransferController({ id: nextTransferId(title), operation: title, localPath: options.localPath || "", remotePath: options.sftp?.remotePath || "", host: options.sftp?.host || "", observeOnlyIdle: true });
     controller.operationId = options._operationId || transferContext.getStore()?.operationId || controller.id;
+    const stalled = controller.onProgress?.(snapshot => { if (snapshot.stalled) progress?.report?.({ message: "暂未观察到新增写入，仍在查询实际文件；可手动取消" }); });
     const cancellation = token?.onCancellationRequested?.(() => controller.cancel("用户取消"));
     try {
       if (controller.status === "cancelled") throw new Error("传输已取消");
       const result = await transferContext.run(controller, () => operation(token, progress));
       if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认"); return result;
-    } finally { cancellation?.dispose(); controller.dispose(); }
+    } finally { cancellation?.dispose(); stalled?.dispose(); controller.dispose(); }
   };
   if (options.apiMode) return execute({ report() {} }, undefined);
   return vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title, cancellable: uploadProgressCancellable(options) }, execute);
@@ -4441,7 +4457,7 @@ function createLocalApiMethods() {
     },
   };
   for (const [name, method] of Object.entries(methods)) {
-    if (!/^(sync[.]|upload[.]|download[.]|remote[.])/.test(name)) continue;
+    if (!/^(sync[.]|upload[.]|download[.]|remote[.]|files[.]cleanup[.])/.test(name)) continue;
     methods[name] = async (params = {}) => {
       const controllerId = nextTransferId(name);
       const operationId = String(params._operationId || controllerId);
@@ -4450,9 +4466,11 @@ function createLocalApiMethods() {
         ? { method: name, params: retryIdentity(params) } : undefined;
       // Metadata is a cancellable read, never a durable modifying transaction.
       // Stale receipts cannot lock a fresh file-tree refresh.
-      const metadataRead = READ_ONLY_SETTLEMENT_METHODS.includes(name) || name === "sync.projectTreeState";
+      const cleanupRequest = name.startsWith("files.cleanup.");
+      const metadataRead = READ_ONLY_SETTLEMENT_METHODS.includes(name) || name === "sync.projectTreeState" || cleanupRequest;
       if (!metadataRead) await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, params._requestKey || transferRequestKey(name, params), recoveryContext);
-      const controller = createTransferController({ id: controllerId, operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "" });
+      const controller = createTransferController({ id: controllerId, operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "",
+        observeOnlyIdle: /^(upload[.]|download[.]|sync[.](?:serverToServer|fromRemote|download))/.test(name) });
       controller.operationId = operationId;
       try {
         if (cancelledTransferOperations.has(operationId)) throw new Error(cancelledTransferOperations.get(operationId));
@@ -4768,7 +4786,10 @@ function watchTransferProcess(child, onIdle, fileStep = true, filenames = [], re
   trackTransferResource(child, parent?.operationId, apiContext?.readOnly ? false : remoteMutation);
   let buffer = "", bytes = 0, wireBytes = 0;
   const allowed = new Set(filenames), completed = new Set();
-  const idle = new ProgressInactivity(fileStep ? 120000 : 30000, () => { child.kill(); onIdle(new Error(fileStep ? "文件步骤 120 秒无真实进展，已停止。" : "控制请求 30 秒无有效响应，执行结果待确认。")); });
+  const idle = new ProgressInactivity(fileStep ? 120000 : 30000, () => {
+    if (parent?.observeOnlyIdle) { parent.markStalled(); return; }
+    child.kill(); onIdle(new Error(fileStep ? "文件步骤 120 秒无真实进展，已停止。" : "控制请求 30 秒无有效响应，执行结果待确认。"));
+  }, Date.now, Boolean(parent?.observeOnlyIdle));
   const cancellation = parent?.onCancel((reason) => { child.kill(); idle.dispose(); onIdle(new Error(reason)); });
   const cancelledRead = () => { child.kill(); idle.dispose(); onIdle(apiContext.signal.reason); };
   if (apiContext?.readOnly) {
@@ -5222,12 +5243,22 @@ function runLocalTarUpload(options) {
     plan.files.map(file => file.relativePath), remoteResourceServer(options.sftp),
     () => withTransferCapacity({ server: options.sftp }, () => runLocalTarUploadCore({ ...options, uploadPlan: plan })));
 }
-function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, timeoutMs, token, transferId, progress }) {
+async function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, timeoutMs, token, transferId, progress }) {
   const remoteCommand = createRemoteExtractCommand(sftp.remotePath);
   const plan = uploadPlan || createWorkspaceUploadPlan(localPath, sftp);
   const manifestContent = `${plan.files.map((file) => tarEntryPath(file.relativePath)).join("\n")}\n`;
   const chunkedChecksum = hashUploadPlanChunks(plan.files);
   const startedAt = Date.now();
+  const parent = transferContext.getStore();
+  const observer = startRemoteFileProgress({ source: sftp, files: plan.files, launch: spawn, sshArgs: getSshArgs, quote: shellQuote,
+    onProgress: value => {
+      parent?.updateProgress({ phase: "transferring", scope: "remote-files", processedBytes: value.writtenBytes, processedFiles: value.writtenFiles, ...value });
+      progress?.report?.({ message: `远端已写入 ${value.writtenBytes}/${value.totalBytes} 字节，${value.writtenFiles}/${value.totalFiles} 个文件；内容待核验` });
+    }, onError: () => progress?.report?.({ message: "远端文件进度暂时无法查询，传输完成后仍会校验内容" }) });
+  trackTransferResource(observer.child, parent?.operationId, false);
+  const observerCancellation = parent?.onCancel(() => observer.stop());
+  await observer.ready;
+  if (parent?.status === "cancelled") { observer.stop(); observerCancellation?.dispose(); throw new Error("用户已取消本次上传"); }
   const upload = new Promise((resolve, reject) => {
     const controller = createTransferController({
       id: transferId || nextTransferId(operation),
@@ -5235,6 +5266,7 @@ function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, timeout
       localPath,
       remotePath: String(sftp && sftp.remotePath || ""),
       host: String(sftp && sftp.host || ""),
+      observeOnlyIdle: true,
     });
     controller.totalBytes = plan.byteCount;
     let reportedPercent = 0;
@@ -5349,6 +5381,7 @@ function runLocalTarUploadCore({ localPath, sftp, uploadPlan, operation, timeout
     });
 
   return upload.finally(() => {
+    observer.stop(); observerCancellation?.dispose();
   });
 }
 
@@ -5525,6 +5558,7 @@ function openMappedDownloadStream({ sftp, plan, localPath, timeoutMs, token, tra
     localPath: String(localPath || ""),
     remotePath: String(sftp.remotePath || ""),
     host: String(sftp.host || ""),
+    observeOnlyIdle: true,
   });
   controller.totalBytes = plan.byteCount || 0;
   const launch = spawnImpl || spawn;
@@ -6085,6 +6119,7 @@ function runRemoteTarExtractCore({ localPath, sftp, downloadScope, timeoutMs, to
     const controller = createTransferController({
       id: transferId || nextTransferId("远端到本地同步"),
       operation: "远端到本地同步",
+      observeOnlyIdle: true,
       localPath,
       remotePath: String(sftp && sftp.remotePath || ""),
       host: String(sftp && sftp.host || ""),
@@ -6668,6 +6703,7 @@ module.exports = {
     createTransferController,
     createLocalApiMethods,
     setTransferSettlementTestContext(options = {}) {
+      if (Object.hasOwn(options, "cleanupApi")) cleanupFileApi = options.cleanupApi;
       transferRecoveryTestHooks = options.recoveryHooks || null;
       transferRecoveries.clear();
       extensionContext = { globalState: options.globalState };

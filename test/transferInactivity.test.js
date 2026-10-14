@@ -3,16 +3,26 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const { ProgressInactivity } = require('../progress-inactivity');
-function fixture() {
+function fixture(options={}) {
   const source=fs.readFileSync(require.resolve('../extension.js'),'utf8');
   const start=source.indexOf('function createTransferController('), end=source.indexOf('function transferTimeoutMs(',start);
   const events=[];
-  const context={ProgressInactivity,Date,Set,Object,Number,Math,queueMicrotask,
+  const context={ProgressInactivity:options.ProgressInactivity||ProgressInactivity,Date,Set,Object,Number,Math,queueMicrotask,maybeSettleTransferOperation:async()=>{},
     transferContext:{getStore:()=>undefined},activeTransfers:new Map(),localApiServer:{publish:e=>events.push(e)}};
   vm.createContext(context);
   vm.runInContext(source.slice(start,end)+'; this.create=createTransferController; this.list=listActiveTransfers;',context);
   return {...context,events};
 }
+test('real transfer stalls remain cancellable and recover from later actual file progress',()=>{
+ let clock=0,watch;
+ class Clocked extends ProgressInactivity{constructor(ms,onIdle,_now,notifyOnly){super(120,onIdle,()=>clock,notifyOnly);watch=this;}}
+ const f=fixture({ProgressInactivity:Clocked}),c=f.create({id:'actual',operation:'upload',observeOnlyIdle:true});
+ c.updateProgress({phase:'transferring',processedBytes:2,writtenBytes:2,writtenFiles:0,totalBytes:10,totalFiles:2});
+ clock=121;assert.equal(watch.check(),true);assert.equal(c.status,'running');assert.equal(c.stalled,true);
+ clock=130;c.updateProgress({phase:'transferring',processedBytes:10,processedFiles:2,writtenBytes:10,writtenFiles:2,totalBytes:10,totalFiles:2});
+ assert.equal(c.stalled,false);assert.equal(f.list()[0].writtenBytes,10);assert.equal(f.list()[0].writtenFiles,2);
+ assert.equal(c.cancel('user cancelled'),true);assert.equal(c.status,'cancelled');c.dispose();
+});
 test('transfer list and events expose true counters and phases; cancellation reaches listeners',()=>{
   const f=fixture();const c=f.create({id:'t',operation:'upload'});let cancels=0;
   c.onCancel(()=>cancels++);

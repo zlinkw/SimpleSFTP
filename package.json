@@ -2,7 +2,7 @@
 	"name": "simple-sftp",
 	"displayName": "SimpleSFTP",
 	"description": "为远端项目创建本地 SFTP 同步工作区，并提供批量文件上传下载与进度反馈。",
-	"version": "0.2.85",
+	"version": "0.2.86",
 	"publisher": "simple-local",
 	"extensionKind": [
 		"ui"
@@ -10,7 +10,7 @@
 	"license": "MIT",
 	"scripts": {
 		"test": "node scripts/test-serial.js",
-		"build": "node scripts/verify-runtime.js && node --test --test-force-exit --test-timeout 20000 test/formalJobCleanupOwner.test.js && node --test --test-force-exit --test-timeout 20000 test/pairedUpdateDrain.test.js && node --test --test-force-exit --test-timeout 20000 test/agentLifecycle.test.js && node --test --test-force-exit --test-timeout 20000 test/cleanupPreviewCapacity.test.js && node --test --test-force-exit --test-timeout 20000 test/cleanupHandle.test.js && node --test --test-force-exit --test-timeout 20000 test/cleanupManaged.test.js && node --test --test-force-exit --test-timeout 20000 test/confirmedPathDelete.test.js && node --test --test-force-exit --test-timeout 20000 test/cleanupExplicitTarget.test.js && node --test --test-force-exit --test-timeout 20000 test/metadataTreeRead.test.js && node --test --test-force-exit --test-timeout 20000 test/transferRecovery.test.js",
+		"build": "node scripts/verify-runtime.js && node --test --test-force-exit --test-timeout 20000 test/formalJobCleanupOwner.test.js && node --test --test-force-exit --test-timeout 20000 test/pairedUpdateDrain.test.js && node --test --test-force-exit --test-timeout 20000 test/agentLifecycle.test.js && node --test --test-force-exit --test-timeout 20000 test/cleanupPreviewCapacity.test.js && node --test --test-force-exit --test-timeout 20000 test/cleanupHandle.test.js && node --test --test-force-exit --test-timeout 20000 test/cleanupManaged.test.js && node --test --test-force-exit --test-timeout 20000 test/confirmedPathDelete.test.js && node --test --test-force-exit --test-timeout 20000 test/cleanupExplicitTarget.test.js && node --test --test-force-exit --test-timeout 20000 test/metadataTreeRead.test.js && node --test --test-force-exit --test-timeout 20000 test/transferRecovery.test.js && node --test --test-force-exit --test-timeout 20000 test/remoteFileProgress.test.js && node --test --test-force-exit --test-timeout 20000 test/transferInactivity.test.js",
 		"package": "npm run build && node scripts/package-vsix.js",
 		"install:latest": "pwsh.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/install-latest.ps1"
 	},
@@ -39,7 +39,8 @@
 		"readme.md",
 		"LICENSE.txt",
 		"agent-lifecycle.js",
-		"agent-lifecycle.py"
+		"agent-lifecycle.py",
+		"transfer-file-progress.js"
 	],
 	"engines": {
 		"vscode": "^1.80.0"
@@ -193,7 +194,7 @@
 					"default": 600,
 					"minimum": 0,
 					"maximum": 86400,
-					"description": "兼容旧配置；不再限制业务总时长。文件步骤连续 120 秒无真实进展才结束等待。"
+					"description": "兼容旧配置；不限制传输总时长。按实际文件字节和数量展示进度，暂无变化时提示等待，用户可取消。"
 				},
 				"simpleSftp.uploadCancellable": {
 					"type": "boolean",

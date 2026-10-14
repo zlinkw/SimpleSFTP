@@ -101,13 +101,20 @@ def path_guard(root, rel, allow_clean=False, missing=False):
     return physical
 
 
-def contents(root, full, expected_type):
+def contents(root, full, expected_type, metadata_only=False):
     st = os.lstat(full)
     actual = "directory" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "unknown"
     if actual != expected_type:
         deny("TYPE_CHANGED")
     rows = []
     mounts = mount_points()
+    progress = {"at": 0, "bytes": 0}
+    def report(force=False):
+        now = time.monotonic()
+        if force or now - progress["at"] >= 1:
+            sys.stderr.write("SIMPLE_PROGRESS " + json.dumps({"phase": "verifying" if metadata_only else "hashing", "processedFiles": len(rows), "processedBytes": progress["bytes"]}) + "\n")
+            sys.stderr.flush()
+            progress["at"] = now
     def visit(value, name):
         info = os.lstat(value)
         if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 1024:
@@ -115,7 +122,9 @@ def contents(root, full, expected_type):
         if info.st_dev != st.st_dev or (value != full and (os.path.ismount(value) or value in mounts)):
             deny("MOUNT_ESCAPE", value)
         if stat.S_ISDIR(info.st_mode):
-            rows.append({"path": name, "type": "directory", "device": str(info.st_dev), "inode": str(info.st_ino)})
+            rows.append({"path": name, "type": "directory", "device": str(info.st_dev), "inode": str(info.st_ino),
+                         **({"mtime": str(info.st_mtime_ns), "ctime": str(info.st_ctime_ns)} if metadata_only else {})})
+            report()
             for leaf in sorted(os.listdir(value)):
                 relative(leaf)
                 if leaf.lower() in (".git", "clean_dir"):
@@ -124,21 +133,29 @@ def contents(root, full, expected_type):
         elif stat.S_ISREG(info.st_mode):
             if info.st_nlink != 1:
                 deny("SHARED_HARDLINK", value)
-            h = hashlib.sha256()
-            with open(value, "rb") as stream:
-                for block in iter(lambda: stream.read(1024 * 1024), b""):
-                    h.update(block)
+            h = None
+            if not metadata_only:
+                h = hashlib.sha256()
+                with open(value, "rb") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        h.update(block)
+                        progress["bytes"] += len(block)
+                        report()
             after = os.lstat(value)
             if (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
                 deny("CONTENT_CHANGED")
-            rows.append({"path": name, "type": "file", "size": info.st_size, "sha256": h.hexdigest(), "mtime": str(info.st_mtime_ns), "device": str(info.st_dev), "inode": str(info.st_ino)})
+            rows.append({"path": name, "type": "file", "size": info.st_size, "mtime": str(info.st_mtime_ns), "device": str(info.st_dev), "inode": str(info.st_ino),
+                         **({"ctime": str(info.st_ctime_ns)} if metadata_only else {"sha256": h.hexdigest()})})
+            report()
         else:
             deny("UNCERTAIN_TYPE", value)
         if len(rows) > 50000:
             deny("INVENTORY_LIMIT")
     visit(full, "")
+    report(True)
     content = [{k: v for k, v in row.items() if k not in ("mtime", "device", "inode")} for row in rows]
-    return {"type": actual, "size": sum(row.get("size", 0) for row in rows), "fingerprint": digest(rows), "contentFingerprint": digest(content), "inventory": rows, "device": str(st.st_dev), "inode": str(st.st_ino)}
+    return {"type": actual, "size": sum(row.get("size", 0) for row in rows), "fingerprint": digest(rows), "contentFingerprint": digest(content), "inventory": rows, "device": str(st.st_dev), "inode": str(st.st_ino),
+            **({"fingerprintMode": "metadata"} if metadata_only else {})}
 
 
 def open_handles(full):
@@ -306,7 +323,7 @@ def inspect(root, target, archived=False):
         deny("PROTECTED_PATH")
     if not path_only:
         tracked_dirty(root, rel)
-    value = contents(root, full, target["type"])
+    value = contents(root, full, target["type"], metadata_only=path_only)
     if target.get("expectedSha256") and (target["type"] != "file" or value["inventory"][0].get("sha256") != target["expectedSha256"]):
         deny("OWNERSHIP_HASH_MISMATCH")
     owner = target.get("expectedOwner")
@@ -378,7 +395,7 @@ def inspect(root, target, archived=False):
     destination = path_guard(root, target["destination"], True, True)
     if not path_only and os.path.lexists(destination):
         deny("DESTINATION_EXISTS")
-    return {**value, "references": references, "manifests": manifest_records(root, full, value), "handleWarnings": handle_warnings, "absolutePath": full, "parent": os.path.dirname(full), "leaf": os.path.basename(full), "destination": destination}
+    return {**value, "references": references, "manifests": [] if path_only else manifest_records(root, full, value), "handleWarnings": handle_warnings, "absolutePath": full, "parent": os.path.dirname(full), "leaf": os.path.basename(full), "destination": destination}
 
 
 def parent_cd(root, full):
@@ -412,23 +429,23 @@ def no_replace(source, destination):
             deny("MOVE_FAILED", str(ctypes.get_errno()))
 
 
-def delete_file(root, full, expected):
+def delete_file(root, full, expected, metadata_only=False):
     if expected.get("type") != "file":
         deny("UNCERTAIN_TYPE")
     path_guard(root, os.path.relpath(full, root).replace(os.sep, "/"))
-    actual = contents(root, full, "file")["inventory"][0]
-    if any(actual.get(key) != expected.get(key) for key in ("device", "inode", "size", "mtime", "sha256")):
+    actual = contents(root, full, "file", metadata_only=metadata_only)["inventory"][0]
+    if any(actual.get(key) != expected.get(key) for key in ("device", "inode", "size", "mtime", "ctime" if metadata_only else "sha256")):
         deny("CONTENT_CHANGED")
     child = parent_cd(root, full)
     info = os.lstat(child)
     if not stat.S_ISREG(info.st_mode) or str(info.st_ino) != expected["inode"] or str(info.st_dev) != expected["device"]:
         deny("TYPE_CHANGED")
-    if info.st_size != expected["size"] or str(info.st_mtime_ns) != expected["mtime"]:
+    if info.st_size != expected["size"] or str(info.st_mtime_ns) != expected["mtime"] or metadata_only and str(info.st_ctime_ns) != expected["ctime"]:
         deny("CONTENT_CHANGED")
     os.unlink(child)
 
 
-def delete_directory(root, full, inventory, base=""):
+def delete_directory(root, full, inventory, base="", metadata_only=False):
     # Execute the immutable inventory. New children and runtime type changes never expand it.
     expected = next((row for row in inventory if row["path"] == base), None)
     if not expected or expected["type"] != "directory":
@@ -445,9 +462,9 @@ def delete_directory(root, full, inventory, base=""):
         if str(st.st_ino) != row["inode"] or str(st.st_dev) != row["device"]:
             deny("IDENTITY_CHANGED")
         if row["type"] == "file" and stat.S_ISREG(st.st_mode):
-            delete_file(root, value, row)
+            delete_file(root, value, row, metadata_only=metadata_only)
         elif row["type"] == "directory" and stat.S_ISDIR(st.st_mode):
-            delete_directory(root, value, inventory, row["path"])
+            delete_directory(root, value, inventory, row["path"], metadata_only=metadata_only)
         else:
             deny("TYPE_CHANGED")
     child = parent_cd(root, full)
@@ -687,7 +704,7 @@ def main(request):
         destination = path_guard(root, target["destination"], True, True)
         if os.path.lexists(source):
             if action == "check":
-                value = inspect(root, target) if (target.get("expectedOwner") or {}).get("resultPathPolicy") == "declared" else contents(root, source, target["type"])
+                value = inspect(root, target) if target.get("authorizationMode") == "confirmed_paths" or (target.get("expectedOwner") or {}).get("resultPathPolicy") == "declared" else contents(root, source, target["type"])
                 if value["fingerprint"] != target["fingerprint"]:
                     deny("SOURCE_RECREATED_OR_CHANGED")
                 if os.path.lexists(destination):
@@ -730,16 +747,17 @@ def main(request):
     if action == "restore" and (not target["relativePath"].startswith(archive_prefix) or target["destination"] != target["relativePath"][len(archive_prefix):]):
         deny("UNSAFE_DESTINATION")
     record = {"operationId": request["operationId"], "action": action, "source": value["absolutePath"], "destination": value["destination"], "type": target["type"], "fingerprint": value["fingerprint"], "contentFingerprint": value["contentFingerprint"], "inventory": value["inventory"], "time": time.time()}
-    audit(root, {**record, "phase": "intent"})
+    if target.get("authorizationMode") != "confirmed_paths":
+        audit(root, {**record, "phase": "intent"})
     # Repeat after durable intent; no stale inspection authorizes mutation.
     checked = inspect(root, target, archived)
     if checked["fingerprint"] != value["fingerprint"]:
         deny("CONTENT_CHANGED")
     if action == "delete":
         if target["type"] == "file":
-            delete_file(root, value["absolutePath"], value["inventory"][0])
+            delete_file(root, value["absolutePath"], value["inventory"][0], metadata_only=target.get("authorizationMode") == "confirmed_paths")
         elif target["type"] == "directory":
-            delete_directory(root, value["absolutePath"], value["inventory"])
+            delete_directory(root, value["absolutePath"], value["inventory"], metadata_only=target.get("authorizationMode") == "confirmed_paths")
         else:
             deny("UNCERTAIN_TYPE")
     else:
@@ -753,7 +771,8 @@ def main(request):
             deny("MOVE_VERIFICATION_FAILED")
     if os.path.lexists(value["absolutePath"]):
         deny("SOURCE_STILL_EXISTS")
-    audit(root, {**record, "phase": "completed"})
+    if target.get("authorizationMode") != "confirmed_paths":
+        audit(root, {**record, "phase": "completed"})
     return {"ok": True, "rootIdentity": identity, "receipt": {**record, "phase": "completed"}}
 
 
