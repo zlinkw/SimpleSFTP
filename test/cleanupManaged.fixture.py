@@ -41,12 +41,18 @@ try:
     subprocess.run(["tmux","new-session","-d","-s","writer"],check=True,timeout=1)
     task={"root":str(root),"outputDir":"outputs/remove","collectionResultCsv":"results/fixture.csv"}
     subprocess.run(["tmux","set-option","-w","-t","writer","@se_job",base64.urlsafe_b64encode(json.dumps(task).encode()).decode()],check=True,timeout=1)
+    live={"root":str(root),"relativePath":"outputs/remove","destination":"clean_dir/outputs/remove"}
+    subprocess.run(["tmux","set-option","-w","-t","writer","@sftp_cleanup_target",base64.urlsafe_b64encode(json.dumps(live).encode()).decode()],check=True,timeout=1)
+    presence=run({"root":str(root),"action":"inventory","presenceOnly":True,"observeExecutors":True,"allowMissing":True,"target":{"relativePath":"outputs/remove","type":"directory"}})
+    assert presence["target"]["missing"] is False and presence["executorsChecked"] and len(presence["executors"])==1
     rejected=subprocess.run([sys.executable,"-B",str(engine)],input=json.dumps({**deletion,"action":"managed-start"}),capture_output=True,text=True,timeout=2)
     assert json.loads(rejected.stdout)["error"]["code"]=="ACTIVE_TMUX_TASK",rejected.stdout
     subprocess.run(["tmux","kill-window","-t","writer:0"],check=True,timeout=1)
     run({**deletion,"action":"managed-start"})  # The caller deliberately ignores this transport response.
     await_done(deletion)
     assert not (root/"outputs/remove").exists()
+    absent=run({"root":str(root),"action":"inventory","presenceOnly":True,"observeExecutors":True,"allowMissing":True,"target":{"relativePath":"outputs/remove","type":"directory"}})
+    assert absent["target"]["missing"] and absent["executorsChecked"] and not absent["executors"]
     assert observe(deletion)["state"]=="completed"
     (root/"outputs/remove").mkdir();(root/"outputs/remove"/"new.txt").write_text("new job",encoding="utf-8")
     assert observe(deletion)["state"]=="changed"

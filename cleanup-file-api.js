@@ -65,8 +65,18 @@ class CleanupFileApi {
   }
   async inspect(params) {
     if (!params.node?.root || !["file", "directory"].includes(params.target?.type)) fail("INVALID_REQUEST");
-    return this.checked({ node: params.node, root: params.node.root, action: "inventory", target: params.target,
-      manifestOnly: params.manifestOnly === true, allowMissing: params.allowMissing === true });
+    const result = await this.checked({ node: params.node, root: params.node.root, action: "inventory", target: params.target,
+      manifestOnly: params.manifestOnly === true, presenceOnly: params.presenceOnly === true,
+      allowMissing: params.allowMissing === true, observeExecutors: params.observeExecutors === true });
+    if (params.observeExecutors === true && params.node.kind === "local") {
+      result.executorsChecked = true; result.executors = [];
+      for (const [key] of this.localExecutions) {
+        const [token, index] = key.split(":"), row = this.previews.get(token), target = row?.targets[Number(index)];
+        if (row && hash(row.rootIdentity) === hash(result.rootIdentity) && target?.relativePath === params.target.relativePath)
+          result.executors.push({ kind: "active_local_transfer" });
+      }
+    }
+    return result;
   }
   /** Read-only observation of a frozen receipt. Never settles audit state or starts a file operation. */
   async check(params) {

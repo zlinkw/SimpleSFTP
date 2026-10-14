@@ -31,6 +31,7 @@ test('local cleanup queries the actual in-flight operation and cannot launch a c
   const api=new CleanupFileApi({storageRoot:path.join(require('node:os').tmpdir(),'se-local-observe-'+Date.now()),activity:async()=>{},
     transport:async request=>{
       if(request.action==='inspect')return {ok:true,rootIdentity:{path:'/scope'},target:{fingerprint:'fp',contentFingerprint:'c',absolutePath:'/scope/output/job',inode:'i'}};
+      if(request.action==='inventory')return {ok:true,rootIdentity:{path:'/scope'},target:{missing:removed,type:'directory',absolutePath:'/scope/output/job'}};
       if(request.action==='managed-observe')return {ok:true,state:removed?'completed':'pending'};
       if(request.action==='delete'){mutations++;return new Promise(resolve=>{release=()=>{removed=true;resolve({ok:true})}})}
       assert.fail(request.action);
@@ -40,6 +41,8 @@ test('local cleanup queries the actual in-flight operation and cannot launch a c
   const execution=api.execute({token:p.token,digest:p.digest,index:0});
   for(let i=0;i<30&&!release;i++)await new Promise(resolve=>setTimeout(resolve,5));assert.ok(release);
   assert.equal((await api.check({token:p.token,index:0})).state,'executing');
+  const presence=await api.inspect({node:{kind:'local',root:'/scope'},target:{relativePath:'output/job',type:'directory'},presenceOnly:true,allowMissing:true,observeExecutors:true});
+  assert.equal(presence.executorsChecked,true);assert.equal(presence.executors.length,1);
   assert.equal((await api.execute({token:p.token,digest:p.digest,index:0})).state,'executing');assert.equal(mutations,1);
   release();await execution;assert.equal((await api.check({token:p.token,index:0})).state,'completed');
 });

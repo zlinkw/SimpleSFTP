@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.85
+
+- Read current path existence and immutable type without hashing file contents or reading old cleanup receipts. Query matching live tmux cleanup windows directly when requested; local executors use actual in-flight transfers.
+- Preserve root, link and type validation. Absence, active execution and failed queries remain separate. Paired with SimpleExperiment 0.5.311; tests use temporary fixtures and isolated tmux only.
+
 ## 0.2.84
 
 - File-tree and metadata reads no longer create durable transfer transactions or wait for historical uncertain read receipts. Keep existing writer and download settlement protections.

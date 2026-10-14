@@ -507,6 +507,30 @@ def managed_key(request):
                    "path": request["target"]["relativePath"], "action": request["cleanupAction"], "fingerprint": request["target"]["fingerprint"]})
 
 
+def current_cleanup_executors(root, full):
+    if os.name == "nt":
+        return []
+    result = []
+    for line in managed_tmux(["list-panes", "-a", "-F", "#{window_id}\t#{pane_id}\t#{pane_dead}\t#{@sftp_cleanup_target}"]).splitlines():
+        fields = line.split("\t")
+        if len(fields) != 4 or fields[2] == "1" or not fields[3]:
+            continue
+        try:
+            binding = json.loads(base64.urlsafe_b64decode(fields[3]).decode("utf-8"))
+        except (ValueError, UnicodeError):
+            deny("CLEANUP_WINDOW_BINDING_UNVERIFIED", fields[0])
+        if binding.get("root") != root:
+            continue
+        for name in ("relativePath", "destination"):
+            if not binding.get(name):
+                continue
+            active = path_guard(root, relative(binding[name]), True, True)
+            if full == active or below(full, active) or below(active, full):
+                result.append({"windowId": fields[0], "paneId": fields[1]})
+                break
+    return result
+
+
 def managed_active(root, target, full, value):
     # Only real managed tmux windows are execution evidence. No historical PID/owner/claim scan.
     if os.name == "nt":
@@ -628,8 +652,14 @@ def main(request):
         full = path_guard(root, target["relativePath"], missing=request.get("allowMissing") is True)
         if not below(root, os.path.dirname(full)):
             deny("UNSAFE_PARENT")
+        live = {"executorsChecked": True, "executors": current_cleanup_executors(root, full)} if request.get("observeExecutors") else {}
         if not os.path.lexists(full):
-            return {"ok": True, "rootIdentity": identity, "target": {"missing": True, "type": target["type"], "absolutePath": full}}
+            return {"ok": True, "rootIdentity": identity, **live, "target": {"missing": True, "type": target["type"], "absolutePath": full}}
+        if request.get("presenceOnly"):
+            actual = os.lstat(full)
+            if not (target["type"] == "directory" and stat.S_ISDIR(actual.st_mode) or target["type"] == "file" and stat.S_ISREG(actual.st_mode)):
+                deny("TYPE_CHANGED")
+            return {"ok": True, "rootIdentity": identity, **live, "target": {"missing": False, "type": target["type"], "absolutePath": full}}
         if request.get("manifestOnly"):
             if target["type"] != "directory" or not os.path.isdir(full):
                 deny("TYPE_CHANGED")
@@ -640,7 +670,7 @@ def main(request):
                     continue
                 row = contents(root, file, "file")["inventory"][0]
                 inventory.append({**row, "path": name})
-            return {"ok": True, "rootIdentity": identity, "target": {"type": "directory", "absolutePath": full,
+            return {"ok": True, "rootIdentity": identity, **live, "target": {"type": "directory", "absolutePath": full,
                 "manifests": manifest_records(root, full, {"inventory": inventory})}}
         value = contents(root, full, target["type"])
         value["manifests"] = manifest_records(root, full, value)
@@ -648,7 +678,7 @@ def main(request):
             owner_hash = formal_cleanup_owner(root, target, target["expectedOwner"])
             value["formalOwnerSha256"] = owner_hash
             value["fingerprint"] = digest({"target": value["fingerprint"], "formalOwnerSha256": owner_hash})
-        return {"ok": True, "rootIdentity": identity, "target": {**value, "absolutePath": full}}
+        return {"ok": True, "rootIdentity": identity, **live, "target": {**value, "absolutePath": full}}
     if action in ("check", "settle", "verify"):
         if request.get("rootIdentity") and request["rootIdentity"] != identity:
             deny("ROOT_IDENTITY_CHANGED")
