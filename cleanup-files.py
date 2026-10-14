@@ -154,9 +154,10 @@ def open_handles(full):
                 deny("OPEN_HANDLE_OR_PERMISSION", value)
             api.CloseHandle.argtypes = [ctypes.c_void_p]
             api.CloseHandle(handle)
-        return
+        return []
     if not os.path.isdir("/proc"):
         deny("HANDLE_CHECK_UNAVAILABLE")
+    warnings = []
     for pid in os.listdir("/proc"):
         if not pid.isdigit() or int(pid) == os.getpid():
             continue
@@ -175,7 +176,12 @@ def open_handles(full):
         except (FileNotFoundError, ProcessLookupError):
             pass
         except PermissionError:
-            deny("HANDLE_CHECK_UNAVAILABLE", "pid=" + pid)
+            # /proc ptrace restrictions (e.g. a non-dumpable daemon with our
+            # uid) say nothing about this target. Report limited visibility;
+            # do not turn one unreadable process into a machine-wide file lock.
+            # Continue scanning so a visible target handle still rejects it.
+            warnings.append({"code": "PROC_VISIBILITY_LIMIT", "pid": pid})
+    return warnings
 
 
 def tracked_dirty(root, rel):
@@ -309,11 +315,11 @@ def inspect(root, target, archived=False):
                         expected = owner["outputDir"].replace("\\", "/").rstrip("/")
                         if recorded not in (expected, full.replace(os.sep, "/")):
                             deny("OWNERSHIP_MISMATCH", name + ":" + key)
-    open_handles(full)
+    handle_warnings = open_handles(full)
     destination = path_guard(root, target["destination"], True, True)
     if os.path.lexists(destination):
         deny("DESTINATION_EXISTS")
-    return {**value, "references": references, "absolutePath": full, "parent": os.path.dirname(full), "leaf": os.path.basename(full), "destination": destination}
+    return {**value, "references": references, "handleWarnings": handle_warnings, "absolutePath": full, "parent": os.path.dirname(full), "leaf": os.path.basename(full), "destination": destination}
 
 
 def parent_cd(root, full):
