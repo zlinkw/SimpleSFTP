@@ -101,7 +101,7 @@ def path_guard(root, rel, allow_clean=False, missing=False):
     return physical
 
 
-def contents(root, full, expected_type, metadata_only=False):
+def contents(root, full, expected_type, metadata_only=False, expected_inventory=()):
     st = os.lstat(full)
     actual = "directory" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "unknown"
     if actual != expected_type:
@@ -109,6 +109,9 @@ def contents(root, full, expected_type, metadata_only=False):
     rows = []
     mounts = mount_points()
     progress = {"at": 0, "bytes": 0}
+    # Unlinking a confirmed name changes the shared inode's ctime, including
+    # aliases in another target of this frozen batch. It does not change bytes.
+    shared_inodes = {(row.get("device"), row.get("inode")) for row in expected_inventory if row.get("hardlink") is True} if metadata_only else set()
     def report(force=False):
         now = time.monotonic()
         if force or now - progress["at"] >= 1:
@@ -131,7 +134,8 @@ def contents(root, full, expected_type, metadata_only=False):
                     deny("PROTECTED_DESCENDANT", value)
                 visit(os.path.join(value, leaf), name + "/" + leaf if name else leaf)
         elif stat.S_ISREG(info.st_mode):
-            if info.st_nlink != 1:
+            shared = info.st_nlink > 1 or (str(info.st_dev), str(info.st_ino)) in shared_inodes
+            if info.st_nlink != 1 and not metadata_only:
                 deny("SHARED_HARDLINK", value)
             h = None
             if not metadata_only:
@@ -145,7 +149,7 @@ def contents(root, full, expected_type, metadata_only=False):
             if (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
                 deny("CONTENT_CHANGED")
             rows.append({"path": name, "type": "file", "size": info.st_size, "mtime": str(info.st_mtime_ns), "device": str(info.st_dev), "inode": str(info.st_ino),
-                         **({"ctime": str(info.st_ctime_ns)} if metadata_only else {"sha256": h.hexdigest()})})
+                         **({"hardlink": True} if metadata_only and shared else {"ctime": str(info.st_ctime_ns)} if metadata_only else {"sha256": h.hexdigest()})})
             report()
         else:
             deny("UNCERTAIN_TYPE", value)
@@ -323,7 +327,7 @@ def inspect(root, target, archived=False):
         deny("PROTECTED_PATH")
     if not path_only:
         tracked_dirty(root, rel)
-    value = contents(root, full, target["type"], metadata_only=path_only)
+    value = contents(root, full, target["type"], metadata_only=path_only, expected_inventory=target.get("inventory") or ())
     if target.get("expectedSha256") and (target["type"] != "file" or value["inventory"][0].get("sha256") != target["expectedSha256"]):
         deny("OWNERSHIP_HASH_MISMATCH")
     owner = target.get("expectedOwner")
@@ -433,14 +437,14 @@ def delete_file(root, full, expected, metadata_only=False):
     if expected.get("type") != "file":
         deny("UNCERTAIN_TYPE")
     path_guard(root, os.path.relpath(full, root).replace(os.sep, "/"))
-    actual = contents(root, full, "file", metadata_only=metadata_only)["inventory"][0]
+    actual = contents(root, full, "file", metadata_only=metadata_only, expected_inventory=[expected])["inventory"][0]
     if any(actual.get(key) != expected.get(key) for key in ("device", "inode", "size", "mtime", "ctime" if metadata_only else "sha256")):
         deny("CONTENT_CHANGED")
     child = parent_cd(root, full)
     info = os.lstat(child)
     if not stat.S_ISREG(info.st_mode) or str(info.st_ino) != expected["inode"] or str(info.st_dev) != expected["device"]:
         deny("TYPE_CHANGED")
-    if info.st_size != expected["size"] or str(info.st_mtime_ns) != expected["mtime"] or metadata_only and str(info.st_ctime_ns) != expected["ctime"]:
+    if info.st_size != expected["size"] or str(info.st_mtime_ns) != expected["mtime"] or metadata_only and not expected.get("hardlink") and str(info.st_ctime_ns) != expected["ctime"]:
         deny("CONTENT_CHANGED")
     os.unlink(child)
 
