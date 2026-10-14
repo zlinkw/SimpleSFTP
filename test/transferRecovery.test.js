@@ -209,8 +209,7 @@ test("inventory API queues four new Plans behind each Worker background scan wit
     assert.equal(calls.length, 10);
     const state = await __test.listTransferOperationState();
     assert.equal(state.operations.length, 0);
-    assert.equal(state.settledOperations.length, 10);
-    assert.ok(state.settledOperations.every(row => !row.cancelRequestedAt));
+    assert.equal(state.settledOperations.length, 0, "new metadata reads do not persist transfer receipts");
   } finally { __test.setRemoteBatchTransport(null); }
 });
 

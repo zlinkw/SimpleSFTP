@@ -185,7 +185,7 @@ class LocalApiServer {
         return;
       }
       const controller = new AbortController();
-      const readOnly = /\.(list|get|status|schema)$/.test(payload.method) || ["files.cleanup.check", "files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.verify"].includes(payload.method) || /^(project\.(inventory|fileStats|tree)|sync\.(?:projectInventory|projectFileStats|projectTree|planLogPaths|listPlanLogs)|transfers\.reconcile)$/.test(payload.method);
+      const readOnly = /\.(list|get|status|schema)$/.test(payload.method) || ["files.cleanup.check", "files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.verify"].includes(payload.method) || /^(project\.(inventory|fileStats|tree)|sync\.(?:projectInventory|projectFileStats|projectTree|projectTreeState|planLogPaths|listPlanLogs)|transfers\.reconcile)$/.test(payload.method);
       const cancelRead = () => { if (readOnly) controller.abort(new Error("API_READ_CANCELLED")); };
       request.on("aborted", cancelRead); response.on("close", cancelRead);
       if (request.aborted || response.destroyed) cancelRead();
@@ -424,7 +424,7 @@ class LocalApiServer {
       name: this.name,
       version: this.version,
       instanceId: this.instanceId(),
-      features: { transferSettlementReceipts: true,
+      features: { transferSettlementReceipts: true, metadataReadsTransient: true, projectTreeExistenceQuery: true,
         ...(typeof this.methods["transfers.reconcile"] === "function" ? { transferSettlementReconciliation: true,
           transferReconciliationMethods: ["sync.serverToServerFpsync", ...READ_ONLY_SETTLEMENT_METHODS] } : {}),
         ...(this.methodOptions["sync.projectInventory"]?.scopeTransport === "stdin" ? { projectInventoryStdinScopes: true } : {}) },

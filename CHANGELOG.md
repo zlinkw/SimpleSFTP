@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.84
+
+- File-tree and metadata reads no longer create durable transfer transactions or wait for historical uncertain read receipts. Keep existing writer and download settlement protections.
+- Tree/stat probes use a bounded independent capacity pool, so empty directories do not wait behind large transfers or hashing. Provide sync.projectTreeState for a minimal existence/empty-directory check after a failed full read; never turn query or permission failures into absence.
+- Enumerate genuine directory progress on stderr; stdout stays JSON. Report existing empty directories separately from missing paths. Include tmp/result while excluding other machine temporary state.
+- Regressions use temporary directories, isolated tmux and synthetic endpoints only; no production cleanup, transfer or Agent deployment.
+
 ## 0.2.83
 
 - Managed cleanup uses the complete, explicit host/user/port/project root across inspection, review, execution and active status queries. A second saved profile or active server selection no longer rejects a verified SSH alias/IP spelling.

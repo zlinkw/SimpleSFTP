@@ -4,6 +4,8 @@ const { ProgressInactivity } = require("./progress-inactivity");
 const { LatestSnapshotWriter } = require("./latest-snapshot-writer");
 const { TransferCapacity } = require("./transfer-capacity");
 const transferCapacity = new TransferCapacity();
+const metadataTreeCapacity = new TransferCapacity();
+let projectTreeTransport;
 let extensionDeactivating = false;
 const { chooseSampleFiles, chooseCompression, CompressionHistory, SAMPLE_TIMEOUT_MS } = require("./compression-policy");
 const compressionSampleScript = require("node:fs").readFileSync(require("node:path").join(__dirname, "compression-sample.py"), "utf8");
@@ -1096,7 +1098,7 @@ function projectInventoryScript() {
     "blocked={'.git','.vscode','.codex','.agents','.coding-tools','.local-gpt','.runtime','clean_dir','zlk_cluster','.venv','venv','env','node_modules','__pycache__','.cache','.pytest_cache','.mypy_cache','.ruff_cache','.tox'}",
     "def allowed(rel,isdir=False):",
     " parts=rel.replace(os.sep,'/').lower().split('/')",
-    " if parts[0]=='tmp' or any(p in blocked for p in parts): return False",
+    " if (parts[0]=='tmp' and len(parts)>1 and parts[1]!='result') or any(p in blocked for p in parts): return False",
     " if any(p.startswith('.simple-sftp-stage-') or '.simple-sftp-partial-' in p for p in parts): return False",
     " if len(parts)>2 and parts[:2]==['experiments','results'] and parts[-1].endswith('.csv.lock'): return False",
     " if parts[0]=='work_dirs' and parts[-1]=='.tb_mean.lock': return False",
@@ -1210,7 +1212,7 @@ function projectInventoryScript() {
 function projectTreePathAllowed(relative) {
   const parts = String(relative || "").toLowerCase().split("/");
   if (parts.some(part => part.startsWith(".simple-sftp-stage-") || part.includes(".simple-sftp-partial-"))) return false;
-  if (parts[0] === "tmp" || parts.some((part) => [".git", ".vscode", ".codex", ".agents", ".coding-tools", ".local-gpt", ".runtime", "clean_dir", "zlk_cluster", ".venv", "venv", "env", "node_modules", "__pycache__", ".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"].includes(part))) return false;
+  if (parts[0] === "tmp" && parts.length > 1 && parts[1] !== "result" || parts.some((part) => [".git", ".vscode", ".codex", ".agents", ".coding-tools", ".local-gpt", ".runtime", "clean_dir", "zlk_cluster", ".venv", "venv", "env", "node_modules", "__pycache__", ".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"].includes(part))) return false;
   if (parts[0] === "experiments" && parts[1] === "results" && parts.at(-1).endsWith(".csv.lock")) return false;
   if (parts[0] === "work_dirs" && parts.at(-1) === ".tb_mean.lock") return false;
   if (parts.at(-1).startsWith(".env")) return false;
@@ -1227,29 +1229,66 @@ async function projectTree(options = {}) {
   const source = directSyncTarget(options.source, "来源");
   const relativePath = String(options.relativePath || ".") === "." ? "." : directSyncRelativePath(options.relativePath);
   if (relativePath !== "." && !projectTreePathAllowed(relativePath)) throw new Error("远端目录属于机器状态，不可纳入同步范围。");
-  const script = [
-    "import json,os,sys",
+  const output = await (projectTreeTransport || runSsh)(source, `python3 -c ${shellQuote(projectTreeScript())} ${shellQuote(source.remotePath)} ${shellQuote(relativePath)}`, transferTimeoutMs(source, options));
+  const result = JSON.parse(output);
+  if (!Array.isArray(result.entries) || typeof result.exists !== "boolean") throw new Error("远端目录清单无效。");
+  return { ok: true, relativePath, exists: result.exists, entries: result.entries.filter((entry) => projectTreePathAllowed(entry.path)).sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name)) };
+}
+
+function projectTreeScript() {
+  return [
+    "import json,os,stat,sys",
     "root=os.path.realpath(sys.argv[1]); rel=sys.argv[2]",
     "parts=[] if rel=='.' else rel.split('/')",
     "if any(p in ('','.','..') for p in parts): raise ValueError('unsafe tree path')",
     "if any(os.path.islink(os.path.join(root,*parts[:i])) for i in range(1,len(parts)+1)): raise ValueError('symlink tree path')",
     "target=os.path.join(root,*parts)",
     "if os.path.commonpath((root,os.path.realpath(target)))!=root: raise ValueError('tree directory outside project')",
-    "if not os.path.exists(target): print('[]'); sys.exit(0)",
-    "if not os.path.isdir(target): print('[]'); sys.exit(0)",
-    "entries=[]",
+    "if not os.path.isdir(root): raise ValueError('TREE_ROOT_UNAVAILABLE')",
+    "try: info=os.stat(target,follow_symlinks=False)",
+    "except FileNotFoundError: print(json.dumps({'entries':[],'exists':False})); sys.exit(0)",
+    "if not stat.S_ISDIR(info.st_mode): raise ValueError('TREE_TARGET_NOT_DIRECTORY')",
+    "entries=[]; processed=0",
     "for item in os.scandir(target):",
+    " processed+=1",
+    " if processed>50000: raise ValueError('TREE_ENTRY_LIMIT')",
+    " if processed%32==0: print('SIMPLE_PROGRESS '+json.dumps({'phase':'verifying','processedFiles':processed}),file=sys.stderr,flush=True)",
     " if item.is_symlink(): continue",
-    " if not item.is_dir(follow_symlinks=False) and not item.is_file(follow_symlinks=False): continue",
+    " try:",
+    "  directory=item.is_dir(follow_symlinks=False)",
+    "  if not directory and not item.is_file(follow_symlinks=False): continue",
+    "  info=item.stat(follow_symlinks=False)",
+    " except FileNotFoundError: continue",
     " name=item.name; child=name if rel=='.' else rel+'/'+name",
-    " stat=item.stat(follow_symlinks=False)",
-    " entries.append({'name':name,'path':child,'directory':item.is_dir(follow_symlinks=False),'size':stat.st_size if item.is_file(follow_symlinks=False) else None,'modifiedAtMs':stat.st_mtime_ns//1000000})",
-    "print(json.dumps(entries,ensure_ascii=False,separators=(',',':')))",
+    " entries.append({'name':name,'path':child,'directory':directory,'size':None if directory else info.st_size,'modifiedAtMs':info.st_mtime_ns//1000000})",
+    "print(json.dumps({'entries':entries,'exists':True},ensure_ascii=False,separators=(',',':')))",
   ].join("\n");
-  const output = await runSsh(source, `python3 -c ${shellQuote(script)} ${shellQuote(source.remotePath)} ${shellQuote(relativePath)}`, transferTimeoutMs(source, options));
-  const entries = JSON.parse(output);
-  if (!Array.isArray(entries)) throw new Error("远端目录清单无效。");
-  return { ok: true, relativePath, entries: entries.filter((entry) => projectTreePathAllowed(entry.path)).sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name)) };
+}
+
+function projectTreeStateScript() {
+  return [
+    "import json,os,stat,sys",
+    "root=os.path.realpath(sys.argv[1]); rel=sys.argv[2]; parts=[] if rel=='.' else rel.split('/')",
+    "if any(p in ('','.','..') for p in parts): raise ValueError('unsafe tree path')",
+    "if any(os.path.islink(os.path.join(root,*parts[:i])) for i in range(1,len(parts)+1)): raise ValueError('symlink tree path')",
+    "target=os.path.join(root,*parts)",
+    "if os.path.commonpath((root,os.path.realpath(target)))!=root: raise ValueError('tree directory outside project')",
+    "if not os.path.isdir(root): raise ValueError('TREE_ROOT_UNAVAILABLE')",
+    "try: info=os.stat(target,follow_symlinks=False)",
+    "except FileNotFoundError: print(json.dumps({'exists':False})); sys.exit(0)",
+    "if not stat.S_ISDIR(info.st_mode): raise ValueError('TREE_TARGET_NOT_DIRECTORY')",
+    "with os.scandir(target) as entries: empty=next(entries,None) is None",
+    "print(json.dumps({'exists':True,'empty':empty}))",
+  ].join("\n");
+}
+async function projectTreeState(options = {}) {
+  const source = directSyncTarget(options.source, "来源");
+  const relativePath = String(options.relativePath || ".") === "." ? "." : directSyncRelativePath(options.relativePath);
+  if (relativePath !== "." && !projectTreePathAllowed(relativePath)) throw new Error("目录属于机器状态。");
+  const output = await (projectTreeTransport || runSsh)(source, `python3 -c ${shellQuote(projectTreeStateScript())} ${shellQuote(source.remotePath)} ${shellQuote(relativePath)}`, transferTimeoutMs(source, options));
+  const result = JSON.parse(output);
+  if (typeof result.exists !== "boolean" || result.exists && typeof result.empty !== "boolean") throw new Error("目录状态无效。");
+  return { ok: true, relativePath, ...result };
 }
 
 function remoteBatchStage(command) {
@@ -4254,6 +4293,7 @@ function createLocalApiMethods() {
     "sync.projectInventory": async (params = {}) => projectInventory(params),
     "sync.projectFileStats": async (params = {}) => projectFileStats(params),
     "sync.projectTree": async (params = {}) => projectTree(params),
+    "sync.projectTreeState": async (params = {}) => projectTreeState(params),
     "sync.deletePath": async (params = {}) => deleteProjectPath(params),
     "sync.serverToServerBatch": async (params = {}) => syncServerToServerBatch({ ...params, apiMode: true }),
     "sync.serverToServerFpsync": async (params = {}) => syncServerToServerFpsync({ ...params, apiMode: true }),
@@ -4408,17 +4448,21 @@ function createLocalApiMethods() {
       const remoteMutation = /^(upload[.]|handoff[.]|sync[.](?:serverToServer|deletePath)|remote[.])/.test(name);
       const recoveryContext = name === "sync.serverToServerFpsync" || READ_ONLY_SETTLEMENT_METHODS.includes(name)
         ? { method: name, params: retryIdentity(params) } : undefined;
-      await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, params._requestKey || transferRequestKey(name, params), recoveryContext);
+      // Metadata is a cancellable read, never a durable modifying transaction.
+      // Stale receipts cannot lock a fresh file-tree refresh.
+      const metadataRead = READ_ONLY_SETTLEMENT_METHODS.includes(name) || name === "sync.projectTreeState";
+      if (!metadataRead) await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, params._requestKey || transferRequestKey(name, params), recoveryContext);
       const controller = createTransferController({ id: controllerId, operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "" });
       controller.operationId = operationId;
       try {
         if (cancelledTransferOperations.has(operationId)) throw new Error(cancelledTransferOperations.get(operationId));
-        const result = await transferContext.run(controller, () => withTransferCapacity(params, () => method(params)));
+        const pool = ["sync.projectTree", "sync.projectTreeState", "sync.projectFileStats"].includes(name) ? metadataTreeCapacity : transferCapacity;
+        const result = await transferContext.run(controller, () => withTransferCapacity(params, () => method(params), pool));
         if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认");
         return result;
       } finally {
         controller.dispose();
-        await finishTransferOperation(operationId);
+        if (!metadataRead) await finishTransferOperation(operationId);
       }
     };
   }
@@ -6540,7 +6584,7 @@ function waitLocalTransferResources(operationId) {
   })));
 }
 
-async function withTransferCapacity(options, work) {
+async function withTransferCapacity(options, work, pool = transferCapacity) {
   const parent = transferContext.getStore();
   const abort = new AbortController();
   const cancel = reason => abort.abort(new Error(reason || "传输已取消"));
@@ -6554,7 +6598,7 @@ async function withTransferCapacity(options, work) {
   const keys = [options.source, options.destination, options.server, options.sftp, options.target, options].filter(item => item?.host).map(item => String(item.host).toLowerCase() + ":" + normalizeSshPort(item.port, 22));
   parent?.pause();
   try {
-    return await transferCapacity.run(keys, abort.signal, async () => {
+    return await pool.run(keys, abort.signal, async () => {
       parent?.resume();
       try { return await work(); }
       finally { if (parent?.operationId) await waitLocalTransferResources(parent.operationId); }
@@ -6608,6 +6652,9 @@ module.exports = {
     fpsyncProgressTitle,
     planLogPathsFromState,
     projectInventoryScript,
+    projectTreeScript,
+    projectTreeStateScript,
+    setProjectTreeTransport: value => { projectTreeTransport = value; },
     projectTreePathAllowed,
     normalizeDownloadScope,
     normalizeDownloadScopePath,
