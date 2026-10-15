@@ -16,7 +16,7 @@ def frozen(name,action):
     if name == "outputs/remove":
         assert any(row["binding"].get("planFile")=="experiments/plans/fixture.yaml" for row in inspected["target"].get("manifests",[]))
     return {"root":str(root),"rootIdentity":inspected["rootIdentity"],"target":{**target,**inspected["target"],"destination":target["destination"]},
-            "operationId":"fixture-"+name.replace("/","-"),"cleanupAction":action,"runtimeSource":source}
+            "operationId":"fixture-"+name.replace("/","-"),"cleanupAction":action,"runtimeSource":source,"tmuxSessionPrefix":"research"}
 def observe(request):
     return run({**request,"action":"managed-observe"})
 def await_done(request):
@@ -50,6 +50,8 @@ try:
     subprocess.run(["tmux","kill-window","-t","writer:0"],check=True,timeout=1)
     run({**deletion,"action":"managed-start"})  # The caller deliberately ignores this transport response.
     await_done(deletion)
+    names=subprocess.run(["tmux","list-sessions","-F","#{session_name}"],capture_output=True,text=True,timeout=1,check=True).stdout.splitlines()
+    assert names and all(name.startswith("research-clean-") for name in names),names
     assert not (root/"outputs/remove").exists()
     absent=run({"root":str(root),"action":"inventory","presenceOnly":True,"observeExecutors":True,"allowMissing":True,"target":{"relativePath":"outputs/remove","type":"directory"}})
     assert absent["target"]["missing"] and absent["executorsChecked"] and not absent["executors"]

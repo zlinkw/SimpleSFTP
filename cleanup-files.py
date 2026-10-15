@@ -646,6 +646,9 @@ def managed_observe(request):
 
 
 def managed_start(request):
+    prefix = str(request.get("tmuxSessionPrefix") or "simple").strip()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,31}", prefix):
+        deny("INVALID_TMUX_SESSION_PREFIX")
     proof = managed_observe(request)
     if proof["state"] in ("executing", "completed"):
         return proof
@@ -671,7 +674,7 @@ def managed_start(request):
         else:
             with open(full, "xb") as handle:
                 handle.write(data)
-    session = "simple-clean-" + digest(root)[:16]
+    session = prefix + "-clean-" + digest(root)[:16]
     if subprocess.run(["tmux", "has-session", "-t", session], capture_output=True, timeout=3).returncode:
         managed_tmux(["new-session", "-d", "-s", session])
     launch = "exec " + shlex.join([sys.executable, "-B", "-X", "utf8", path_guard(root, code_name, True)]) + " < " + shlex.quote(path_guard(root, input_name, True))

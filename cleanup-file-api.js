@@ -33,6 +33,8 @@ class CleanupFileApi {
   }
   async save(row) { await atomicWriteText(path.join(this.storageRoot, row.token + ".json"), JSON.stringify(row)); this.previews.set(row.token, copy(row)); }
   async preview(params) {
+    const tmuxSessionPrefix = String(params.tmuxSessionPrefix || "simple").trim();
+    if (!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(tmuxSessionPrefix)) fail("INVALID_TMUX_SESSION_PREFIX");
     for (const [token, preview] of this.previews) if (Date.now() > preview.expiresAt) this.previews.delete(token);
     if (this.previews.size >= 4096) fail("CLEANUP_PREVIEW_CAPACITY_EXCEEDED");
     const { node, action = "move", targets } = params;
@@ -59,7 +61,8 @@ class CleanupFileApi {
     }
     const row = { token: crypto.randomBytes(24).toString("hex"), operationId: "cleanup-" + crypto.randomBytes(16).toString("hex"), node: copy(node), rootIdentity: identity,
       action, observationMode, authorizationMode: pathOnly ? "confirmed_paths" : undefined, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, managedObservation: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, handleScan: pathOnly ? "confirmed_paths" : observationMode ? "managed_tmux" : "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
-    row.digest = hash({ node: row.node, rootIdentity: identity, action, targets: rows, safety: row.safety });
+    row.tmuxSessionPrefix = tmuxSessionPrefix;
+    row.digest = hash({ node: row.node, rootIdentity: identity, action, targets: rows, safety: row.safety, tmuxSessionPrefix });
     this.previews.set(row.token, copy(row)); // Preview does not write a journal or a remote hash cache.
     return copy(row);
   }
@@ -109,7 +112,8 @@ class CleanupFileApi {
       if (row.authorizationMode !== "confirmed_paths") await this.activity(row.node);
       const request = { node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
         action: row.observationMode === "tmux" ? "managed-start" : row.action,
-        cleanupAction: row.action, operationId: row.operationId, target: row.targets[index] };
+        cleanupAction: row.action, operationId: row.operationId, target: row.targets[index],
+        tmuxSessionPrefix: row.tmuxSessionPrefix || params.tmuxSessionPrefix || "simple" };
       // A lost response cannot leave a local busy flag that blocks later observations.
       row.states[index] = "executing"; await this.save(row);
       if (row.observationMode === "filesystem") {
