@@ -36,6 +36,36 @@ function clientRequestKey(method, params) {
   return createHash("sha256").update(JSON.stringify({ method, ...retryIdentity(params) })).digest("hex");
 }
 
+// Conservative Windows argv reader. Only a complete ssh -N invocation with no
+// remote command is exempt; command-line text never leaves this local function.
+function sshForwardOnly(command) {
+  if (typeof command !== "string" || command.length > 32768 || /\\"/.test(command)) return false;
+  const args = []; let word = "", quoted = false, started = false;
+  for (const char of command) {
+    if (char === '"') { quoted = !quoted; started = true; }
+    else if (/\s/.test(char) && !quoted) { if (started) { args.push(word); word = ""; started = false; } }
+    else { word += char; started = true; }
+  }
+  if (quoted) return false;
+  if (started) args.push(word);
+  if (!/(?:^|[\\/])ssh(?:[.]exe)?$/i.test(args.shift() || "")) return false;
+  let noSession = false;
+  const safeOptions = /^(?:ServerAliveInterval|ServerAliveCountMax|TCPKeepAlive|ExitOnForwardFailure|BatchMode|ConnectTimeout|ConnectionAttempts|StrictHostKeyChecking|UserKnownHostsFile|LogLevel|IdentitiesOnly|GatewayPorts|PasswordAuthentication|KbdInteractiveAuthentication|NumberOfPasswordPrompts)$/i;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (!arg.startsWith("-")) return noSession && i === args.length - 1 && Boolean(arg);
+    if (/^-[46CfgnNqTtv]+$/.test(arg)) { noSession ||= arg.includes("N"); continue; }
+    if (/^-[LRDpli]/.test(arg)) { if (arg.length === 2 && !args[++i]) return false; continue; }
+    if (arg === "-o" || arg.startsWith("-o")) {
+      const value = arg.length > 2 ? arg.slice(2) : args[++i];
+      if (!value || !safeOptions.test(value.split(/[=\s]/)[0])) return false;
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
 function assertLocalProcessesIdle(rows, oldPid, allowCurrentOwner, currentPid = process.pid, oldStartedAt) {
   if (!Array.isArray(rows) || rows.length > 8192 || rows.some(row => !Number.isSafeInteger(row?.ProcessId) || row.ProcessId < 0
     || !Number.isSafeInteger(row.ParentProcessId) || row.ParentProcessId < 0 || typeof row.Name !== "string" || !row.Name || row.Name.length > 260))
@@ -59,6 +89,10 @@ function assertLocalProcessesIdle(rows, oldPid, allowCurrentOwner, currentPid = 
     throw new Error("LOCAL_TRANSFER_OR_OWNER_STILL_ACTIVE");
   let unrelatedTransports = 0;
   for (const transport of rows.filter(row => /^(ssh|scp|sftp|plink|rsync|tar|gzip|pigz|zstd)\.exe$/i.test(row.Name))) {
+    // A port-forward-only client cannot be this protocol's remote command.
+    // Its exited shell ancestor is irrelevant, but ordinary/unknown SSH still
+    // needs complete ancestry and all writer exit checks remain in place.
+    if (/^ssh[.]exe$/i.test(transport.Name) && transport.forwardOnly === true) { unrelatedTransports++; continue; }
     let cursor = transport, birthChainVerified = true;
     const seen = new Set();
     while (true) {
@@ -99,10 +133,15 @@ async function localTransferExitProof(instanceId, allowCurrentOwner = false) {
   const oldStartedAt = match ? Date.parse(match[2]) : NaN;
   if (process.platform !== "win32" || !match || !Number.isFinite(oldStartedAt)) throw new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE");
   const oldPid = Number(match[1]);
-  const command = `$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $items=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CreationDate); if($items.Count -gt 8192){throw 'LOCAL_PROCESS_PROOF_UNAVAILABLE'}; ConvertTo-Json -Compress -InputObject @($items)`;
+  const command = `$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $items=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CreationDate,@{Name='SshCommandLine';Expression={if($_.Name -ieq 'ssh.exe'){$_.CommandLine}else{$null}}}); if($items.Count -gt 8192){throw 'LOCAL_PROCESS_PROOF_UNAVAILABLE'}; ConvertTo-Json -Compress -InputObject @($items)`;
   const output = await new Promise((resolve, reject) => execFile("pwsh.exe", ["-NoProfile", "-NonInteractive", "-Command", command],
     { windowsHide: true, timeout: 6000, maxBuffer: 1048576, encoding: "utf8" }, (error, stdout) => error ? reject(new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE")) : resolve(stdout)));
   const rows = JSON.parse(String(output));
+  if (!Array.isArray(rows)) throw new Error("LOCAL_PROCESS_PROOF_UNAVAILABLE");
+  for (const row of rows) {
+    row.forwardOnly = /^ssh[.]exe$/i.test(row.Name) && sshForwardOnly(row.SshCommandLine);
+    delete row.SshCommandLine;
+  }
   return assertLocalProcessesIdle(rows, oldPid, allowCurrentOwner, process.pid, oldStartedAt);
 }
 
@@ -115,4 +154,4 @@ function settlementProbeCommand(root, quote) {
   return `python3 -B -c ${quote(loader)} ${quote(encoded)} ${quote(root)} ${quote(receiverHash)} ${quote("staged-tar-v1")}`;
 }
 
-module.exports = { READ_ONLY_SETTLEMENT_METHODS, clientRequestKey, retryIdentity, assertLocalProcessesIdle, localTransferExitProof, settlementProbeCommand };
+module.exports = { READ_ONLY_SETTLEMENT_METHODS, clientRequestKey, retryIdentity, assertLocalProcessesIdle, localTransferExitProof, settlementProbeCommand, sshForwardOnly };

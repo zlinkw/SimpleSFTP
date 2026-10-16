@@ -84,5 +84,22 @@ test("the local census includes process ancestry and creation time with bounded 
   assert.ok(f.calls[0].config.maxBuffer <= 1048576);
   const command = f.calls[0].args.at(-1);
   assert.match(command, /ParentProcessId/); assert.match(command, /CreationDate/);
-  assert.doesNotMatch(command, /CommandLine|ExecutablePath|-Filter/);
+  assert.match(command, /if\(\$_[.]Name -ieq 'ssh[.]exe'\)/);
+  assert.doesNotMatch(command, /ExecutablePath|-Filter/);
+});
+
+test('an orphaned forwarding-only ssh client does not block unrelated transfer exit, but ordinary ssh remains guarded', async () => {
+  const orphan = { ProcessId: 15132, ParentProcessId: 42524, Name: 'ssh.exe', CreationDate: '2026-10-16T04:44:51Z',
+    SshCommandLine: '"C:\\Windows\\System32\\OpenSSH\\ssh.exe" -N -L 127.0.0.1:2222:localhost:22 -p 22 example@host' };
+  const parent = { ProcessId: 42524, ParentProcessId: 37292, Name: 'pwsh.exe', CreationDate: '2026-10-16T04:44:44Z' };
+  assert.equal((await fixture([currentOwner,orphan,parent]).localTransferExitProof(`35692:${startedAt}`)).localTransportCount,0);
+  await assert.rejects(fixture([currentOwner,{...orphan,SshCommandLine:'ssh.exe host tar -N'},parent]).localTransferExitProof(`35692:${startedAt}`),/ANCESTRY_UNAVAILABLE/);
+  await assert.rejects(fixture([currentOwner,orphan,parent,{...otherRead,ParentProcessId:35692}]).localTransferExitProof(`35692:${startedAt}`),/OWNER_STILL_ACTIVE/);
+});
+
+test('no-session classification rejects remote arguments, unknown options and quoted -N in remote text',()=>{
+  const {sshForwardOnly}=require('../transfer-settlement');
+  for(const command of ['ssh.exe -N host','ssh.exe -NT -L2222:localhost:22 -o ExitOnForwardFailure=yes host',
+    'ssh.exe -N -T -o GatewayPorts=no -o ConnectionAttempts=1 -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o NumberOfPasswordPrompts=0 -L 2222:localhost:22 host'])assert.equal(sshForwardOnly(command),true,command);
+  for(const command of ['ssh.exe host echo -N','ssh.exe -N host tar','ssh.exe -o ProxyCommand=anything -N host','ssh.exe -N -F config host','ssh.exe -N "unterminated','ssh.exe -o RemoteCommand=-N host','scp.exe -N host'])assert.equal(sshForwardOnly(command),false,command);
 });
