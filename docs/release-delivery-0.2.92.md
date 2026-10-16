@@ -18,4 +18,10 @@
 
 SHA256：`ca05a0669600f6a0d3475bb67ca7bbc89a4c10edc989c2ae7ba1fdc97cddf00f`。同名 `.vsix.sha256` 精确绑定该文件名。
 
-源码推送、稳定 Release 资产核验、真实更新解析与安装分别记录；没有以打包代替发行或现场验收。需与 SimpleExperiment 0.5.362 配套重载；本次不自动补交 PLAN、启动/停止/重跑科研任务、改科研环境或更新远端 Agent。现场问题须在重载后只读验收，不能提前宣布解决。
+实现提交 `7a8d361f0d6577f146efab4bf1be638af7e1bee4` 已普通 fast-forward 推送 origin/master，并 fetch 核对一致。[稳定 Latest v0.2.92](https://github.com/zlinkw/SimpleSFTP/releases/tag/v0.2.92) 的 tag 与 target_commitish 绑定该提交，draft=false、prerelease=false；VSIX 169720 字节、精确 SHA256 清单 90 字节。GitHub 资产 digest、清单及实际下载 SHA256 一致，没有覆盖历史资产。
+
+实际已安装旧版 Experiment 0.5.361 的 ReleaseClient 从真实公开 Latest 识别 0.2.92 Windows 更新，实际下载并核实 universal 身份、版本及字节与确定包一致；同时核验配套 Experiment 0.5.362。验证目录 `C:/Users/ZLK/AppData/Local/Temp/simpleex-0362-release-verify-MjlXCD` 保留。
+
+显式且仅执行一次 `npm run install:latest`，无 force 或降级。VS Code 安装列表确认 simple-local.simple-sftp@0.2.92；全部 21 个已安装 JS/Python 运行文件逐字节一致，CLI 入口已核对。配套 Experiment 0.5.362 同样完成稳定发行及一次安装。
+
+安装前最后核对的 Host 仍运行 SFTP 0.2.91；安装后未操作面板、API 或服务器，等待用户 Reload Window。未以打包、安装或本机回归代替现场验收。本次不自动补交 PLAN、启动/停止/重跑科研任务、改科研环境或更新远端 Agent；不能提前宣布现场问题解决。本节为文档补记，不修改 tag 或已发行字节。
