@@ -156,9 +156,9 @@ test("disposal preserves a newer discovery and consumes its own fixed writing sl
 
 test("disconnected readers cancel while writes remain owned by durable operations", async () => {
   const { EventEmitter } = require("node:events");
-  for (const [method, readOnly] of [["project.inventory", true], ["sync.projectInventory", true], ["sync.projectFileStats", true],
+  for (const [method, readOnly, params = {}] of [["project.inventory", true], ["sync.projectInventory", true], ["sync.projectFileStats", true],
       ["sync.projectTree", true], ["sync.planLogPaths", true], ["transfers.reconcile", true], ["upload.start", false],
-      ["sync.serverToServerFpsync", false]]) {
+      ["sync.serverToServerFpsync", false], ["sync.downloadMappedPaths", true, {memoryOnly:true}], ["sync.downloadMappedPaths", false]]) {
     let entered, release, captured;
     const ready = new Promise(resolve => { entered = resolve; });
     const server = new LocalApiServer({ methods: { [method]: async (_params, _server, context) => {
@@ -167,11 +167,23 @@ test("disconnected readers cancel while writes remain owned by durable operation
     const request = new EventEmitter(), response = new EventEmitter();
     response.writeHead = () => {}; response.end = () => {};
     const pending = server.handleRpc(request, response);
-    request.emit("data", Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: {} }))); request.emit("end");
+    request.emit("data", Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }))); request.emit("end");
     await ready; response.emit("close");
     assert.equal(captured.aborted, readOnly); release({ ok: true }); await pending;
     assert.equal(server.activeRpc, 0); await server.dispose();
   }
+});
+
+test('CLI file RPC has no socket inactivity cutoff while small controls remain bounded',async()=>{
+ const vm=require('node:vm'),{EventEmitter}=require('node:events'),source=fs.readFileSync(path.join(__dirname,'../bin/simple-sftp-api.js'),'utf8');
+ const seen=[],context={URL,Buffer,JSON,Promise,Error,http:{request(options,receive){
+  seen.push(options);const req=new EventEmitter();req.end=()=>{const res=new EventEmitter();receive(res);res.emit('data',Buffer.from('{"result":{"ok":true}}'));res.emit('end');};return req;
+ }}};
+ vm.createContext(context);vm.runInContext(source.slice(source.indexOf('function request('),source.indexOf('function option('))+';this.call=request;',context);
+ for(const method of ['sync.projectInventory','sync.projectTreeState','files.cleanup.execute','sync.downloadMappedPaths','upload.files','project.create','handoff.markReady','downloadScope.configure']){
+  await context.call({baseUrl:'http://127.0.0.1:1',token:'fixture'},JSON.stringify({method}));assert.equal(seen.at(-1).timeout,0,method);
+ }
+ await context.call({baseUrl:'http://127.0.0.1:1',token:'fixture'},JSON.stringify({method:'status'}));assert.equal(seen.at(-1).timeout,15000);
 });
 
 test("local API requires bearer auth for every endpoint", async () => {
@@ -356,7 +368,9 @@ test("SimpleSFTP uploads have connect timeout, progress inactivity, cancellation
   assert.match(extensionSource, /defaultConnectTimeoutSeconds = 15/);
   assert.match(extensionSource, /"-o", `ConnectTimeout=\$\{connectTimeout\}`/);
   assert.match(extensionSource, /ProgressInactivity/);
-  assert.equal(require("../package.json").contributes.configuration.properties["simpleSftp.uploadTimeoutSeconds"].description.includes("不再限制业务总时长"), true);
+  const description = require("../package.json").contributes.configuration.properties["simpleSftp.uploadTimeoutSeconds"].description;
+  assert.match(description, /不限制传输总时长/);
+  assert.match(description, /实际文件.*用户可取消/);
   assert.match(extensionSource, /cancellable: uploadProgressCancellable/);
   assert.match(extensionSource, /transfer\.cancel\(/);
   assert.match(extensionSource, /"transfers\.list": async/);

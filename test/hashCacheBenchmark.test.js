@@ -23,6 +23,33 @@ const python = process.platform === "win32" ? "python" : "python3";
 const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-hash-cache-"));
 let lastStderr = "";
 
+test("inventory publishes actual enumeration counts before hashing, including an empty directory", () => {
+  const root = path.join(fixtureRoot, "scan-progress");
+  const names = writeTree(root, 3);
+  fs.mkdirSync(path.join(root, "empty"));
+  const result = runPython(__test.projectInventoryScript(), [root, ".", "1", "null"], { SIMPLE_SFTP_HASH_CACHE_DIR: path.join(fixtureRoot,"cache-scan") });
+  const reports = lastStderr.split('\n').filter(line => line.startsWith('SIMPLE_PROGRESS ')).map(line => JSON.parse(line.slice(16)));
+  assert.equal(reports[0].phase, 'preparing');
+  const scan = reports.filter(row => row.phase === 'preparing');
+  assert.ok(scan.at(-1).processedFiles >= names.length + 2);
+  assert.equal(scan.at(-1).processedBytes, undefined, 'directory enumeration is not a hash or network byte count');
+  assert.equal(reports.at(-1).phase, 'hashing');
+  assert.equal(Object.keys(result.files).length,names.length);
+});
+
+test('inventory directory and target metadata failures never masquerade as an empty file set',()=>{
+ const root=path.join(fixtureRoot,'scan-error');writeTree(root,1);fs.mkdirSync(path.join(root,'hidden'));
+ const injections=[
+  ["def denied_walk(*args,**kwargs):", " kwargs.get('onerror',lambda error: None)(PermissionError('fixture enumeration denied'))", " return iter([])", "os.walk=denied_walk"],
+  ["real_stat=os.stat", "def denied_stat(file,*args,**kwargs):", " if str(file).endswith('hidden'): raise PermissionError('fixture stat denied')", " return real_stat(file,*args,**kwargs)", "os.stat=denied_stat"]
+ ];
+ for(let i=0;i<injections.length;i++){
+  const script='import os,json\n'+injections[i].join('\n')+'\ntry:\n'+__test.projectInventoryScript().split('\n').map(line=>' '+line).join('\n')+'\nexcept Exception as error:\n print(json.dumps({"error":str(error)}))\n';
+  const result=runPython(script,[root,i?'hidden':'.','1','null'],{SIMPLE_SFTP_HASH_CACHE_DIR:path.join(fixtureRoot,'cache-scan-error-'+i)});
+  assert.match(result.error,/fixture (enumeration|stat) denied/);assert.equal(result.files,undefined);
+ }
+});
+
 test("interrupted inventory retains completed hash batches instead of starting cold again", () => {
   const root = path.join(fixtureRoot, "interrupted");
   const names = writeTree(root, 100);

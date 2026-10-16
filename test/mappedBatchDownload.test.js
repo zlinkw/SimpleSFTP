@@ -533,7 +533,7 @@ test("success waits for SSH exit after the tar trailer", async () => {
   assert.equal(result.fileCount, 1);
 });
 
-test("API cancel during the real SSH stream kills that one child", async () => {
+test("API cancel during the real SSH stream kills that one child", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-live-cancel-"));
   keep(root);
   const { PassThrough } = require("node:stream");
@@ -541,6 +541,8 @@ test("API cancel during the real SSH stream kills that one child", async () => {
   let killed = 0;
   let sshCalls = 0;
   let sshProc;
+  // Always settle the injected child if an assertion fails before normal exit.
+  t.after(() => sshProc?.emitClose?.());
   const token = {
     isCancellationRequested: false,
     onCancellationRequested(listener) {

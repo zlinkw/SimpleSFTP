@@ -23,6 +23,36 @@ test('real transfer stalls remain cancellable and recover from later actual file
  assert.equal(c.stalled,false);assert.equal(f.list()[0].writtenBytes,10);assert.equal(f.list()[0].writtenFiles,2);
  assert.equal(c.cancel('user cancelled'),true);assert.equal(c.status,'cancelled');c.dispose();
 });
+test('inventory, directory reads and cleanup controllers do not auto-cancel silent filesystem work',()=>{
+ for(const operation of ['sync.projectInventory','sync.projectTree','sync.projectTreeState','sync.projectFileStats','files.cleanup.preview','files.cleanup.execute','remote.listDirs']){
+  let clock=0,watch;
+  class Clocked extends ProgressInactivity{constructor(ms,onIdle,_now,notifyOnly){super(120,onIdle,()=>clock,notifyOnly);watch=this;}}
+  const f=fixture({ProgressInactivity:Clocked}),c=f.create({id:operation,operation});
+  try{
+   clock=121;assert.equal(watch.check(),true);assert.equal(c.status,'running');assert.equal(c.stalled,true);assert.equal(c.processedFiles,0);
+   clock=150;c.updateProgress({phase:'preparing',processedFiles:2});assert.equal(c.stalled,false);assert.equal(c.processedFiles,2);
+   assert.equal(c.cancel('explicit user cancellation'),true);assert.equal(c.status,'cancelled');
+  }finally{c.dispose();}
+ }
+});
+
+test('file SSH watcher preserves a silent child while control requests retain bounded waits',()=>{
+ const {EventEmitter}=require('node:events');
+ const source=fs.readFileSync(require.resolve('../extension.js'),'utf8');
+ const start=source.indexOf('function watchTransferProcess('),end=source.indexOf('async function cleanupFileTransport(',start);
+ for(const fileStep of [true,false]){
+  let clock=0,watch,kills=0,failures=0,stalls=0;
+  class Clocked extends ProgressInactivity{constructor(ms,onIdle,_now,notifyOnly){super(120,onIdle,()=>clock,notifyOnly);watch=this;}}
+  const parent={status:'running',observeOnlyIdle:false,onCancel:()=>({dispose(){}}),markStalled:()=>stalls++,updateProgress(){}};
+  const context={ProgressInactivity:Clocked,Date,Set,String,Boolean,Number,JSON,Error,
+   transferContext:{getStore:()=>parent},currentApiRequestContext:()=>undefined,trackTransferResource(){}};
+  vm.createContext(context);vm.runInContext(source.slice(start,end)+';this.watch=watchTransferProcess;',context);
+  const child=new EventEmitter();child.pid=42;child.stderr=new EventEmitter();child.kill=()=>kills++;
+  const monitor=context.watch(child,()=>failures++,fileStep);
+  clock=121;watch.check();assert.equal(kills,fileStep?0:1);assert.equal(failures,fileStep?0:1);assert.equal(stalls,fileStep?1:0);
+  monitor.dispose();child.emit('close',0);
+ }
+});
 test('transfer list and events expose true counters and phases; cancellation reaches listeners',()=>{
   const f=fixture();const c=f.create({id:'t',operation:'upload'});let cancels=0;
   c.onCancel(()=>cancels++);

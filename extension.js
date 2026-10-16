@@ -294,7 +294,7 @@ function startLocalApiServer(context) {
       "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
       "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
       "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1, tmuxSessionPrefix: 1 },
-      "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576 },
+      "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576, idlePolicy: "observe-filesystem" },
       "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
       "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, memoryWrapperResults: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024 },
     },
@@ -844,7 +844,7 @@ function removeLocalStagingDirectory(tempDir, options = {}) {
     : ["-c", 'cd -- "$1" || exit 75; test "$(pwd -P)" = "$2" || exit 75; rm -rf -- "./$3"', "sh", parent, safetyRoot, leaf];
   return new Promise((resolve, reject) => {
     const child = execFile(command, args, { cwd: parent, windowsHide: true, timeout: 0 }, (error) => error ? reject(error) : resolve());
-    const monitor = watchTransferProcess(child, reject, false);
+    const monitor = watchTransferProcess(child, reject, true);
     child.stdout?.on("data", monitor.receive);
   });
 }
@@ -1096,6 +1096,12 @@ function projectInventoryScript() {
     "  progress['bytes']+=byte_count; progress['files']+=file_count; now=time.monotonic()",
     "  if force or now-progress['at']>=0.25:",
     "   sys.stderr.write('SIMPLE_PROGRESS '+json.dumps({'phase':'hashing','processedBytes':progress['bytes'],'processedFiles':progress['files'],'cacheHits':reused,'cacheRehash':hashed,'cacheStatus':cache_status})+chr(10)); sys.stderr.flush(); progress['at']=now",
+    "scan_count=0; scan_at=0",
+    "def report_scan(count=0,force=False):",
+    " global scan_count,scan_at",
+    " scan_count+=count; now=time.monotonic()",
+    " if force or now-scan_at>=0.25:",
+    "  sys.stderr.write('SIMPLE_PROGRESS '+json.dumps({'phase':'preparing','processedFiles':scan_count})+chr(10)); sys.stderr.flush(); scan_at=now",
     "blocked={'.git','.vscode','.codex','.agents','.coding-tools','.local-gpt','.runtime','clean_dir','zlk_cluster','.venv','venv','env','node_modules','__pycache__','.cache','.pytest_cache','.mypy_cache','.ruff_cache','.tox'}",
     "def allowed(rel,isdir=False):",
     " parts=rel.replace(os.sep,'/').lower().split('/')",
@@ -1120,7 +1126,10 @@ function projectInventoryScript() {
     "if any(os.path.islink(os.path.join(root,*parts[:i])) for i in range(1,len(parts)+1)): raise ValueError('symlink inventory path')",
     "target=os.path.join(root,*parts)",
     "if os.path.commonpath((root,os.path.realpath(target)))!=root: raise ValueError('inventory path outside project')",
-    "if not os.path.isdir(target) and not os.path.isfile(target): print(json.dumps({'files':{}})); sys.exit(0)",
+    "if not os.path.isdir(root): raise ValueError('INVENTORY_ROOT_UNAVAILABLE')",
+    "try: target_info=os.stat(target,follow_symlinks=False)",
+    "except FileNotFoundError: print(json.dumps({'files':{}})); sys.exit(0)",
+    "if not (statmod.S_ISDIR(target_info.st_mode) or statmod.S_ISREG(target_info.st_mode)): raise ValueError('INVENTORY_TARGET_TYPE')",
     "cache={}; db=None; cache_status='ready'; cache_at=time.monotonic(); update_bytes=0; cache_root=hashlib.sha256(root.encode('utf-8')).hexdigest()",
     "try:",
     " cache_dir=os.environ.get('SIMPLE_SFTP_HASH_CACHE_DIR') or os.path.join(os.path.expanduser('~'),'.cache','simple-sftp')",
@@ -1130,13 +1139,17 @@ function projectInventoryScript() {
     "except (OSError,sqlite3.Error):",
     " if db is not None: db.close()",
     " db=None; cache={}; cache_status='unavailable'",
-    "walk=((os.path.dirname(target),[],[os.path.basename(target)]),) if os.path.isfile(target) else os.walk(target,followlinks=False) if recursive else ((target,[],[name for name in os.listdir(target) if not os.path.isdir(os.path.join(target,name))]),)",
+    "def fail_walk(error): raise error",
+    "walk=((os.path.dirname(target),[],[os.path.basename(target)]),) if statmod.S_ISREG(target_info.st_mode) else os.walk(target,followlinks=False,onerror=fail_walk) if recursive else ((target,[],[name for name in os.listdir(target) if not os.path.isdir(os.path.join(target,name))]),)",
     "names=[]",
     "for current,dirs,files in walk:",
-    " if recursive: dirs[:]=[d for d in dirs if not os.path.islink(os.path.join(current,d)) and allowed(os.path.relpath(os.path.join(current,d),root),True) and in_scope(os.path.relpath(os.path.join(current,d),root).replace(os.sep,'/'),True)]",
+    " report_scan(1)",
+    " if recursive: dirs[:]=[d for d in dirs if allowed(os.path.relpath(os.path.join(current,d),root),True) and in_scope(os.path.relpath(os.path.join(current,d),root).replace(os.sep,'/'),True) and not os.path.islink(os.path.join(current,d))]",
     " for name in files:",
     "  full=os.path.join(current,name); rel=os.path.relpath(full,root).replace(os.sep,'/')",
     "  if allowed(rel) and in_scope(rel): names.append((rel,full))",
+    "  report_scan(1)",
+    "report_scan(force=True)",
     "if db is not None:",
     " try:",
     "  for offset in range(0,len(names),512):",
@@ -3206,7 +3219,7 @@ function listRemoteFiles(sftp, remotePath) {
         return { name: String(name || "").trim(), sizeBytes: Number(sizeText) || 0 };
       }).filter((item) => item.name));
     });
-    const monitor = watchTransferProcess(child, reject, false);
+    const monitor = watchTransferProcess(child, reject, true);
     child.stdout?.on("data", monitor.receive);
   });
 }
@@ -3221,7 +3234,7 @@ function listRemoteDirs(sftp, remotePath) {
       }
       resolve(stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
     });
-    const monitor = watchTransferProcess(child, reject, false);
+    const monitor = watchTransferProcess(child, reject, true);
     child.stdout?.on("data", monitor.receive);
   });
 }
@@ -3440,7 +3453,7 @@ function nextTransferId(operation) {
   return `transfer-${Date.now()}-${transferSequence}-${String(operation || "").replace(/[^\w.-]+/g, "-")}`;
 }
 
-function createTransferController({ id, operation, localPath, remotePath, host, observeOnlyIdle = false }) {
+function createTransferController({ id, operation, localPath, remotePath, host, observeOnlyIdle = true }) {
   const listeners = new Set();
   const progressListeners = new Set();
   let cancelled = false;
@@ -4467,11 +4480,21 @@ function createLocalApiMethods() {
       // Metadata is a cancellable read, never a durable modifying transaction.
       // Stale receipts cannot lock a fresh file-tree refresh.
       const cleanupRequest = name.startsWith("files.cleanup.");
-      const metadataRead = READ_ONLY_SETTLEMENT_METHODS.includes(name) || name === "sync.projectTreeState" || cleanupRequest;
+      // downloadMappedPaths reads the server but writes local destinations.
+      // It needs writer settlement/cancellation receipts, unlike pure metadata.
+      const metadataRead = (READ_ONLY_SETTLEMENT_METHODS.includes(name) && (name !== "sync.downloadMappedPaths" || params.memoryOnly === true))
+        || ["sync.projectTreeState", "sync.planLogPaths", "remote.listDirs"].includes(name) || cleanupRequest;
       if (!metadataRead) await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, params._requestKey || transferRequestKey(name, params), recoveryContext);
       const controller = createTransferController({ id: controllerId, operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "",
-        observeOnlyIdle: /^(upload[.]|download[.]|sync[.](?:serverToServer|fromRemote|download))/.test(name) });
+        // No file operation is failed or killed because a filesystem call is slow.
+        // Errors and explicit cancellation still settle through the original path.
+        observeOnlyIdle: true });
       controller.operationId = operationId;
+      const requestContext = currentApiRequestContext();
+      const readSignal = requestContext?.readOnly ? requestContext.signal : undefined;
+      const cancelRead = () => controller.cancel("API_READ_CANCELLED");
+      readSignal?.addEventListener("abort", cancelRead, { once: true });
+      if (readSignal?.aborted) cancelRead();
       try {
         if (cancelledTransferOperations.has(operationId)) throw new Error(cancelledTransferOperations.get(operationId));
         const pool = ["sync.projectTree", "sync.projectTreeState", "sync.projectFileStats"].includes(name) ? metadataTreeCapacity : transferCapacity;
@@ -4479,6 +4502,7 @@ function createLocalApiMethods() {
         if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认");
         return result;
       } finally {
+        readSignal?.removeEventListener("abort", cancelRead);
         controller.dispose();
         if (!metadataRead) await finishTransferOperation(operationId);
       }
@@ -4786,12 +4810,13 @@ function watchTransferProcess(child, onIdle, fileStep = true, filenames = [], re
   trackTransferResource(child, parent?.operationId, apiContext?.readOnly ? false : remoteMutation);
   let buffer = "", bytes = 0, wireBytes = 0;
   const allowed = new Set(filenames), completed = new Set();
+  const observeOnlyIdle = fileStep || Boolean(parent?.observeOnlyIdle);
   const idle = new ProgressInactivity(fileStep ? 120000 : 30000, () => {
-    if (parent?.observeOnlyIdle) { parent.markStalled(); return; }
+    if (observeOnlyIdle) { parent?.markStalled(); return; }
     child.kill(); onIdle(new Error(fileStep ? "文件步骤 120 秒无真实进展，已停止。" : "控制请求 30 秒无有效响应，执行结果待确认。"));
-  }, Date.now, Boolean(parent?.observeOnlyIdle));
+  }, Date.now, observeOnlyIdle);
   const cancellation = parent?.onCancel((reason) => { child.kill(); idle.dispose(); onIdle(new Error(reason)); });
-  const cancelledRead = () => { child.kill(); idle.dispose(); onIdle(apiContext.signal.reason); };
+  const cancelledRead = () => { if (parent?.status === "cancelled") return; child.kill(); idle.dispose(); onIdle(apiContext.signal.reason); };
   if (apiContext?.readOnly) {
     apiContext.signal.addEventListener("abort", cancelledRead, { once: true });
     if (apiContext.signal.aborted) cancelledRead();
@@ -4847,10 +4872,10 @@ async function cleanupFileTransport(request) {
     output = await new Promise((resolve, reject) => {
       const child = spawn(process.platform === "win32" ? "python" : "python3", ["-B", "-X", "utf8", path.join(__dirname, "cleanup-files.py")], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
       let text = "";
-      const timer = setTimeout(() => { child.kill(); reject(new Error("LOCAL_CLEANUP_TIMEOUT")); }, 60000);
+      const monitor = watchTransferProcess(child, reject, true, [], request.action !== "inspect" && request.action !== "check");
       child.stdout.on("data", chunk => { text += chunk.toString("utf8"); if (text.length > 16 * 1024 * 1024) { child.kill(); reject(new Error("INVENTORY_LIMIT")); } });
-      child.on("error", error => { clearTimeout(timer); reject(error); });
-      child.on("close", code => { clearTimeout(timer); code === 0 ? resolve(text) : reject(new Error("LOCAL_CLEANUP_FAILED")); });
+      child.on("error", error => { monitor.dispose(); reject(error); });
+      child.on("close", code => { monitor.dispose(); code === 0 ? resolve(text) : reject(new Error("LOCAL_CLEANUP_FAILED")); });
       child.stdin.on("error", () => {}); child.stdin.end(JSON.stringify(request));
     });
   } else {
@@ -4880,7 +4905,7 @@ function runSsh(sftp, command, timeout) {
       }
       resolve(stdout);
     });
-    const monitor = watchTransferProcess(child, reject, Boolean(transferContext.getStore()), [], undefined, { stdoutBytesArePayload: false });
+    const monitor = watchTransferProcess(child, reject, true, [], undefined, { stdoutBytesArePayload: false });
     child.stdout?.on("data", monitor.receive);
   });
 }

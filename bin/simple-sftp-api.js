@@ -130,6 +130,9 @@ function readDiscovery() {
 function request(discovery, payload) {
   const url = new URL("/api/v1/rpc", discovery.baseUrl);
   const body = Buffer.from(payload, "utf8");
+  const method = JSON.parse(payload).method;
+  const fileOperation = /^(sync[.]|upload[.]|download[.]|remote[.]|files[.]cleanup[.])/.test(method)
+    || ["project.create", "handoff.markReady", "downloadScope.configure"].includes(method);
   return new Promise((resolve, reject) => {
     const req = http.request(
       {
@@ -142,7 +145,8 @@ function request(discovery, payload) {
           "Content-Length": body.length,
           Authorization: `Bearer ${discovery.token}`,
         },
-        timeout: 15_000,
+        // Business completion comes from actual file work, not a silent socket.
+        timeout: fileOperation ? 0 : 15_000,
       },
       (res) => {
         const chunks = [];
