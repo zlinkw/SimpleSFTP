@@ -330,6 +330,28 @@ test("stdin scopes load only requested cached rows and preserve missing/empty sc
   assert.equal(empty.cacheRows, 0);
 });
 
+test('exact inventory roots never enumerate unrelated ancestors, while directory scopes stay complete', () => {
+  const root = path.join(fixtureRoot, 'direct-scopes');
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'results'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src', 'one.py'), 'one', 'utf8');
+  fs.writeFileSync(path.join(root, 'src', 'two.py'), 'two', 'utf8');
+  fs.writeFileSync(path.join(root, 'results', 'keep.csv'), 'keep', 'utf8');
+  const prefix = ["import os", "original_scandir=os.scandir", "def guarded_scan(target):",
+    " if os.path.realpath(target)==os.path.realpath(os.sys.argv[1]): raise PermissionError('unrelated project root enumerated')",
+    " return original_scandir(target)", "os.scandir=guarded_scan"].join('\n');
+  const script = prefix + '\n' + __test.projectInventoryScript();
+  const env = { SIMPLE_SFTP_HASH_CACHE_DIR: path.join(fixtureRoot, 'cache-direct-scopes') };
+  const files = runPython(script, [root, '.', '1', '@stdin'], env, Buffer.from('src/one.py\0src/two.py\0src/missing.py\0'));
+  assert.deepEqual(Object.keys(files.files).sort(), ['src/one.py', 'src/two.py']);
+  assert.equal(files.unverifiedFiles && Object.keys(files.unverifiedFiles).length, 0);
+  assert.equal(files.files['src/one.py'].sha256, crypto.createHash('sha256').update('one').digest('hex'));
+  const directories = runPython(script, [root, '.', '1', '@stdin'], env, Buffer.from('src\0src/one.py\0results\0'));
+  assert.deepEqual(Object.keys(directories.files).sort(), ['results/keep.csv', 'src/one.py', 'src/two.py']);
+  const empty = runPython(script, [root, '.', '1', '@stdin'], env, Buffer.alloc(0));
+  assert.deepEqual(empty.files, {});
+});
+
 test("final lstat ctime-only change rejects a cached batch digest", () => {
   const root = path.join(fixtureRoot, "ctime-final");
   const cacheDir = path.join(fixtureRoot, "cache-ctime-final");

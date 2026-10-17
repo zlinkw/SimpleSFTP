@@ -6,6 +6,9 @@ const { LatestSnapshotWriter } = require("./latest-snapshot-writer");
 const { TransferCapacity } = require("./transfer-capacity");
 const transferCapacity = new TransferCapacity();
 const metadataTreeCapacity = new TransferCapacity();
+// Short, exact code checks cannot queue behind a recursive artifact inventory.
+// Each lane remains bounded to two servers globally and one read per server.
+const codeInventoryCapacity = new TransferCapacity();
 let projectTreeTransport;
 let extensionDeactivating = false;
 const { chooseSampleFiles, chooseCompression, CompressionHistory, SAMPLE_TIMEOUT_MS } = require("./compression-policy");
@@ -294,7 +297,7 @@ function startLocalApiServer(context) {
       "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
       "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
       "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1, tmuxSessionPrefix: 1 },
-      "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576, idlePolicy: "observe-filesystem" },
+      "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576, idlePolicy: "observe-filesystem", scopedTraversal: "direct-roots-v1", codeInventoryLane: 1, capacityTiming: 1 },
       "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
       "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, memoryWrapperResults: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024 },
     },
@@ -1140,7 +1143,30 @@ function projectInventoryScript() {
     " if db is not None: db.close()",
     " db=None; cache={}; cache_status='unavailable'",
     "def fail_walk(error): raise error",
-    "walk=((os.path.dirname(target),[],[os.path.basename(target)]),) if statmod.S_ISREG(target_info.st_mode) else os.walk(target,followlinks=False,onerror=fail_walk) if recursive else ((target,[],[name for name in os.listdir(target) if not os.path.isdir(os.path.join(target,name))]),)",
+    "def scoped_walk():",
+    " if scopes is None or '.' in scope_set or not recursive: roots=[relroot] if scopes is None or scope_set else []",
+    " else:",
+    "  roots=[]; retained=set()",
+    "  for scope in sorted(scope_set,key=lambda value:(len(value.split('/')),value)):",
+    "   candidate=scope if relroot=='.' or scope.startswith(relroot+'/') else relroot if scope==relroot or relroot.startswith(scope+'/') else None",
+    "   if candidate is None or any('/'.join(candidate.split('/')[:i]) in retained for i in range(1,len(candidate.split('/'))+1)): continue",
+    "   retained.add(candidate); roots.append(candidate)",
+    " for relative in roots:",
+    "  pieces=[] if relative=='.' else relative.split('/')",
+    "  if relative!='.' and not allowed(relative,True): continue",
+    "  cursor=root",
+    "  for piece in pieces:",
+    "   cursor=os.path.join(cursor,piece)",
+    "   if os.path.islink(cursor): raise ValueError('symlink inventory scope: '+relative)",
+    "  if os.path.commonpath((root,os.path.realpath(cursor)))!=root: raise ValueError('inventory scope outside project')",
+    "  try: info=os.stat(cursor,follow_symlinks=False)",
+    "  except FileNotFoundError: continue",
+    "  if statmod.S_ISREG(info.st_mode): yield (os.path.dirname(cursor),[],[os.path.basename(cursor)])",
+    "  elif statmod.S_ISDIR(info.st_mode):",
+    "   if recursive: yield from os.walk(cursor,followlinks=False,onerror=fail_walk)",
+    "   else: yield (cursor,[],[name for name in os.listdir(cursor) if not os.path.isdir(os.path.join(cursor,name))])",
+    "  else: raise ValueError('INVENTORY_SCOPE_TYPE: '+relative)",
+    "walk=scoped_walk()",
     "names=[]",
     "for current,dirs,files in walk:",
     " report_scan(1)",
@@ -3473,6 +3499,18 @@ function createTransferController({ id, operation, localPath, remotePath, host, 
     lastProgressAt: new Date().toISOString(),
     startedAt: new Date().toISOString(),
     status: "running",
+    setCapacityState(state) {
+      const at = new Date().toISOString();
+      controller.capacityState = state;
+      if (state === "queued") controller.capacityQueuedAt = at;
+      else {
+        controller.capacityGrantedAt = at;
+        controller.capacityWaitMs = Date.parse(at) - Date.parse(controller.capacityQueuedAt || at);
+      }
+      localApiServer?.publish({ type: "transfer_progress", data: { id, operationId: controller.operationId,
+        phase: controller.phase, status: controller.status, capacityState: state,
+        capacityQueuedAt: controller.capacityQueuedAt, capacityGrantedAt: controller.capacityGrantedAt, capacityWaitMs: controller.capacityWaitMs } });
+    },
     observeOnlyIdle,
     stalled: false,
     totalBytes: 0,
@@ -3573,7 +3611,7 @@ function createTransferController({ id, operation, localPath, remotePath, host, 
 }
 
 function listActiveTransfers() {
-  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status, totalBytes, transferredBytes, operationId, phase, processedFiles, processedBytes, progressScope, lastProgressAt, comparedFiles, changedFiles, completedFiles, totalFiles, completedGroups, totalGroups, missingFiles, differentFiles, unchangedFiles, cacheHits, cacheRehash, cacheStatus, writtenBytes, writtenFiles, stalled }) => ({
+  return [...activeTransfers.values()].map(({ id, operation, localPath, remotePath, host, startedAt, status, totalBytes, transferredBytes, operationId, phase, processedFiles, processedBytes, progressScope, lastProgressAt, comparedFiles, changedFiles, completedFiles, totalFiles, completedGroups, totalGroups, missingFiles, differentFiles, unchangedFiles, cacheHits, cacheRehash, cacheStatus, writtenBytes, writtenFiles, stalled, capacityState, capacityQueuedAt, capacityGrantedAt, capacityWaitMs, processStartedAt, firstProgressAt }) => ({
     id,
     operation,
     localPath,
@@ -3583,6 +3621,7 @@ function listActiveTransfers() {
     status,
     totalBytes,
     writtenBytes, writtenFiles, stalled,
+    capacityState, capacityQueuedAt, capacityGrantedAt, capacityWaitMs, processStartedAt, firstProgressAt,
     transferredBytes,
     operationId, phase, processedFiles, lastProgressAt,
     processedBytes, progressScope, comparedFiles, changedFiles,
@@ -4497,9 +4536,18 @@ function createLocalApiMethods() {
       if (readSignal?.aborted) cancelRead();
       try {
         if (cancelledTransferOperations.has(operationId)) throw new Error(cancelledTransferOperations.get(operationId));
-        const pool = ["sync.projectTree", "sync.projectTreeState", "sync.projectFileStats"].includes(name) ? metadataTreeCapacity : transferCapacity;
+        const codeInventory = name === "sync.projectInventory" && params.inventoryPurpose === "code-sync"
+          && Array.isArray(params.scopePaths) && params.scopePaths.length > 0 && !params.scopePaths.includes(".");
+        const pool = codeInventory ? codeInventoryCapacity
+          : ["sync.projectTree", "sync.projectTreeState", "sync.projectFileStats"].includes(name) ? metadataTreeCapacity : transferCapacity;
         const result = await transferContext.run(controller, () => withTransferCapacity(params, () => method(params), pool));
         if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认");
+        if (name === "sync.projectInventory") return { ...result, queryTiming: {
+          capacityQueuedAt: controller.capacityQueuedAt, capacityGrantedAt: controller.capacityGrantedAt,
+          capacityWaitMs: controller.capacityWaitMs, processStartedAt: controller.processStartedAt,
+          firstProgressAt: controller.firstProgressAt, completedAt: new Date().toISOString(),
+          lane: codeInventory ? "code-sync" : "bulk",
+        } };
         return result;
       } finally {
         readSignal?.removeEventListener("abort", cancelRead);
@@ -4806,6 +4854,7 @@ function getRemoteMarkerPath(remotePath, markerName) {
 
 function watchTransferProcess(child, onIdle, fileStep = true, filenames = [], remoteMutation, options = {}) {
   const parent = transferContext.getStore();
+  if (parent) parent.processStartedAt ||= new Date().toISOString();
   const apiContext = currentApiRequestContext();
   trackTransferResource(child, parent?.operationId, apiContext?.readOnly ? false : remoteMutation);
   let buffer = "", bytes = 0, wireBytes = 0;
@@ -4823,6 +4872,7 @@ function watchTransferProcess(child, onIdle, fileStep = true, filenames = [], re
   }
   if (parent?.status === "cancelled") { child.kill(); idle.dispose(); throw new Error("传输已取消"); }
   const update = (evidence) => {
+    if (parent) parent.firstProgressAt ||= new Date().toISOString();
     evidence = { ...evidence, scope: String(evidence.metric === "wire" && options.wireScope || child.pid || child) };
     idle.update(evidence);
     parent?.updateProgress(evidence);
@@ -6657,8 +6707,10 @@ async function withTransferCapacity(options, work, pool = transferCapacity) {
   if (readSignal?.aborted) cancelRead();
   const keys = [options.source, options.destination, options.server, options.sftp, options.target, options].filter(item => item?.host).map(item => String(item.host).toLowerCase() + ":" + normalizeSshPort(item.port, 22));
   parent?.pause();
+  parent?.setCapacityState?.("queued");
   try {
     return await pool.run(keys, abort.signal, async () => {
+      parent?.setCapacityState?.("running");
       parent?.resume();
       try { return await work(); }
       finally { if (parent?.operationId) await waitLocalTransferResources(parent.operationId); }

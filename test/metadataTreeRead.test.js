@@ -47,3 +47,49 @@ test('cleanup progress is request-scoped and does not consult or persist transfe
  try {const result=await __test.createLocalApiMethods()['files.cleanup.preview']({_operationId:'cleanup-progress',_requestKey:'a'.repeat(64)});assert.equal(result.ok,true);assert.equal(observed,true);assert.equal(__test.listActiveTransfers().length,0);}
  finally {__test.setTransferSettlementTestContext({cleanupApi:null,globalState:{get:(_,fallback)=>fallback,update:async()=>{}}});}
 });
+
+test('bounded code inventory lane bypasses a bulk read on the same server and reports capacity timing',async()=>{
+ const source={host:'slow-inventory.invalid',username:'u',remotePath:'/fixture'};
+ let release,codeStarted=false;
+ __test.setTransferSettlementTestContext({instanceId:'lanes',globalState:{get:(_,fallback)=>fallback,update:async()=>{}}});
+ __test.setRemoteBatchTransport(async(_source,_command,paths)=>{
+  if(paths.includes('src/train.py')){codeStarted=true;return JSON.stringify({files:{}});}
+  return new Promise(resolve=>release=()=>resolve(JSON.stringify({files:{}})));
+ });
+ const methods=__test.createLocalApiMethods();
+ const bulk=methods['sync.projectInventory']({source,scopePaths:['work_dirs'],_operationId:'bulk-lane'});
+ await new Promise(setImmediate);
+ const code=methods['sync.projectInventory']({source,scopePaths:['src/train.py'],inventoryPurpose:'code-sync',_operationId:'code-lane'});
+ try {
+  await new Promise(setImmediate);
+  assert.equal(codeStarted,true,'code lookup must not wait for unrelated bulk inventory');
+  const codeResult=await code;
+  assert.equal(codeResult.queryTiming.lane,'code-sync');
+  assert.ok(codeResult.queryTiming.completedAt);
+  const active=__test.listActiveTransfers().find(t=>t.operationId==='bulk-lane');
+  assert.equal(active.capacityState,'running');
+  assert.ok(active.capacityQueuedAt);assert.ok(active.capacityGrantedAt);
+  assert.ok(active.capacityWaitMs>=0);
+ } finally {release();await Promise.all([bulk,code]);__test.setRemoteBatchTransport(null);}
+});
+
+test('code inventory lane still serializes the same server and releases its next ticket after a failure',async()=>{
+ const source={host:'bounded-code.invalid',username:'u',remotePath:'/fixture'};
+ let failFirst,starts=0;
+ __test.setTransferSettlementTestContext({instanceId:'bounded',globalState:{get:(_,fallback)=>fallback,update:async()=>{}}});
+ __test.setRemoteBatchTransport(async()=>{
+  if(++starts===1)return new Promise((_resolve,reject)=>failFirst=()=>reject(Error('real read failure')));
+  return JSON.stringify({files:{}});
+ });
+ const methods=__test.createLocalApiMethods();
+ const first=methods['sync.projectInventory']({source,scopePaths:['src/a.py'],inventoryPurpose:'code-sync',_operationId:'code-first'});
+ const failed=assert.rejects(first,/real read failure/);
+ await new Promise(setImmediate);
+ const next=methods['sync.projectInventory']({source,scopePaths:['src/b.py'],inventoryPurpose:'code-sync',_operationId:'code-next'});
+ try {
+  await new Promise(setImmediate);assert.equal(starts,1);
+  const waiting=__test.listActiveTransfers().find(t=>t.operationId==='code-next');
+  assert.equal(waiting.capacityState,'queued');assert.equal(waiting.capacityGrantedAt,undefined);
+ } finally {failFirst();await failed;await next;__test.setRemoteBatchTransport(null);}
+ assert.equal(starts,2);assert.equal(__test.listActiveTransfers().length,0);
+});
