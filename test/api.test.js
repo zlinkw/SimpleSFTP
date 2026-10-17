@@ -174,6 +174,51 @@ test("disconnected readers cancel while writes remain owned by durable operation
   }
 });
 
+test('busy file RPCs leave directory browsing and operation controls available', async () => {
+  const { EventEmitter } = require('node:events');
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  let starts = 0;
+  const api = new LocalApiServer({ methods: {
+    'sync.projectInventory': async () => { starts++; await gate; return {}; },
+    'sync.projectTree': async () => ({ entries: [] }),
+    'transfers.list': async () => ({ transfers: [] }),
+    'files.cleanup.preview': async () => ({ reviewed: true }),
+    'upload.files': async () => { assert.fail('disconnected queued write started'); },
+  } });
+  function rpc(method) {
+    const req = new EventEmitter(), res = new EventEmitter();
+    let body, status;
+    res.writeHead = code => { status = code; }; res.end = text => { body = JSON.parse(text); };
+    const done = api.handleRpc(req, res);
+    req.emit('data', Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: starts, method }))); req.emit('end');
+    return { done, res, result: () => ({ body, status }) };
+  }
+  const pending = Array.from({ length: 8 }, () => rpc('sync.projectInventory'));
+  try {
+    await new Promise(setImmediate); assert.equal(starts, 8);
+    const tree = rpc('sync.projectTree'), control = rpc('transfers.list'), review = rpc('files.cleanup.preview');
+    await Promise.all([tree.done, control.done, review.done]);
+    assert.deepEqual(tree.result().body.result, { entries: [] });
+    assert.deepEqual(control.result().body.result, { transfers: [] });
+    assert.deepEqual(review.result().body.result, { reviewed: true });
+    const cancelled = rpc('sync.projectInventory');
+    await new Promise(setImmediate); assert.equal(starts, 8, 'ninth file query is queued');
+    cancelled.res.emit('close'); await cancelled.done;
+    assert.equal(starts, 8, 'a disconnected queued query must not start');
+    const write = rpc('upload.files'); await new Promise(setImmediate);
+    write.res.emit('close'); await write.done;
+    assert.equal(write.result().body.error.data.notStarted, true);
+    const overflow = Array.from({length:65}, () => rpc('sync.projectInventory'));
+    try {
+      await overflow.at(-1).done;
+      assert.equal(overflow.at(-1).result().body.error.message, 'API_CAPACITY_EXCEEDED');
+      assert.equal(overflow.at(-1).result().body.error.data.notStarted, true);
+      assert.equal(api.health().rpcLanes.files.queued,64);
+    } finally { for (const item of overflow) item.res.emit('close'); await Promise.all(overflow.map(p=>p.done)); }
+  } finally { release(); await Promise.all(pending.map(p => p.done)); await api.dispose(); }
+  assert.equal(api.activeRpc, 0);
+});
+
 test('CLI file RPC has no socket inactivity cutoff while small controls remain bounded',async()=>{
  const vm=require('node:vm'),{EventEmitter}=require('node:events'),source=fs.readFileSync(path.join(__dirname,'../bin/simple-sftp-api.js'),'utf8');
  const seen=[],context={URL,Buffer,JSON,Promise,Error,http:{request(options,receive){

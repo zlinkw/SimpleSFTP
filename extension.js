@@ -6,6 +6,7 @@ const { LatestSnapshotWriter } = require("./latest-snapshot-writer");
 const { TransferCapacity } = require("./transfer-capacity");
 const transferCapacity = new TransferCapacity();
 const metadataTreeCapacity = new TransferCapacity();
+const cleanupReadCapacity = new TransferCapacity();
 // Short, exact code checks cannot queue behind a recursive artifact inventory.
 // Each lane remains bounded to two servers globally and one read per server.
 const codeInventoryCapacity = new TransferCapacity();
@@ -4542,7 +4543,8 @@ function createLocalApiMethods() {
         const codeInventory = name === "sync.projectInventory" && params.inventoryPurpose === "code-sync"
           && Array.isArray(params.scopePaths) && params.scopePaths.length > 0 && !params.scopePaths.includes(".");
         const memoryRead = name === "sync.downloadMappedPaths" && params.memoryOnly === true && params.metricsOnly === true;
-        const pool = memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
+        const cleanupRead = ["files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.check", "files.cleanup.verify", "files.cleanup.status"].includes(name);
+        const pool = cleanupRead ? cleanupReadCapacity : memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
           : ["sync.projectTree", "sync.projectTreeState", "sync.projectFileStats"].includes(name) ? metadataTreeCapacity : transferCapacity;
         const result = await transferContext.run(controller, () => withTransferCapacity(params, () => method(params), pool));
         if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认");

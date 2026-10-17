@@ -48,6 +48,21 @@ test('cleanup progress is request-scoped and does not consult or persist transfe
  finally {__test.setTransferSettlementTestContext({cleanupApi:null,globalState:{get:(_,fallback)=>fallback,update:async()=>{}}});}
 });
 
+test('cleanup review remains available while bulk file inventory occupies its server',async()=>{
+ const source={host:'review-lane.invalid',username:'u',remotePath:'/fixture'};
+ let release,reviewed=false;
+ __test.setTransferSettlementTestContext({instanceId:'review-lane',globalState:{get:(_,fallback)=>fallback,update:async()=>{}},
+  cleanupApi:{preview:async()=>{reviewed=true;return {ok:true};}}});
+ __test.setRemoteBatchTransport(async()=>new Promise(resolve=>release=()=>resolve(JSON.stringify({files:{}}))));
+ const methods=__test.createLocalApiMethods(),bulk=methods['sync.projectInventory']({source,scopePaths:['work_dirs']});
+ await new Promise(setImmediate);
+ const preview=methods['files.cleanup.preview']({source});
+ try {
+  await new Promise(setImmediate);assert.equal(reviewed,true,'review must not wait for bulk hashing');
+  assert.equal((await preview).ok,true);
+ } finally {release();await Promise.allSettled([bulk,preview]);__test.setRemoteBatchTransport(null);__test.setTransferSettlementTestContext({cleanupApi:null,globalState:{get:(_,fallback)=>fallback,update:async()=>{}}});}
+});
+
 test('bounded code inventory lane bypasses a bulk read on the same server and reports capacity timing',async()=>{
  const source={host:'slow-inventory.invalid',username:'u',remotePath:'/fixture'};
  let release,codeStarted=false;
