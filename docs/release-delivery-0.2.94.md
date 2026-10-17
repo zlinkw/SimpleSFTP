@@ -11,3 +11,7 @@ capabilities 增加 memoryReadLane=1、capacityTiming=1；内存下载回应增�
 完整串行回归、确定包、源码推送、稳定发行与一次安装回执完成后补记。没有在科研服务器重放、删除或重跑任务，也不自动部署 Agent/Scheduler。新版安装后须重载才能做现场验收。
 
 最终 `npm test` 串行 42 文件、273 项通过；递增 0.2.94 后 `npm run package` 退出 0，全部 build 门禁和 23 文件运行闭包通过。没有 20 秒挂起后重试。确定包 `simple-sftp-0.2.94.vsix`：170860 字节、26 个 ZIP 条目、21 个 JS/Python 运行文件；SHA256 `1452a52b9da84a89f760154b162d299cc79ff2496a945d67840450a75988aa92`。身份、版本、universal 平台、源锁文件、运行字节和实际 discovery 秘密排除均通过。同名清单精确绑定文件名。包已冻结，后续文档回执不改包、不覆盖历史资产。
+
+实现提交 `8d273049f3686be487a13d5dcdc4606c9e10172f` 已普通推送 origin/master、fetch 确认一致。[稳定 Latest v0.2.94](https://github.com/zlinkw/SimpleSFTP/releases/tag/v0.2.94) 的 tag 和 target_commitish 绑定该提交，draft=false、prerelease=false。精确 VSIX 170860 字节和同名 SHA256 清单 90 字节均已发布；真实 Latest、资产 digest、实际下载字节和本机确定包一致。配套 [Experiment v0.5.364](https://github.com/zlinkw/SimpleExperiment/releases/tag/v0.5.364) 同步完成稳定发行，绑定实现提交 `ebe6922cb843dc5c0ba4721e5d97d2033d442877`。
+
+实际已安装旧版 Experiment 0.5.363 的 ReleaseClient 检出两项 Windows 配套更新并从真实入口下载核实，验证目录 `C:/Users/ZLK/AppData/Local/Temp/simpleex-0364-release-MqEC0q` 保留。显式且仅一次 install:latest 成功；VS Code 已安装 0.2.94，入口核对通过，安装后 21 个 JS/Python 文件与已发布包逐字节一致。没有 force、降级、重复安装或重放文件操作。安装后停止 API/面板/服务器操作，等待用户重载；远端服务未部署，科研任务和产物未改，现场耗时尚待验收。本节为文档回执，不改变 tag 和包。
