@@ -200,7 +200,7 @@ class LocalApiServer {
       try {
         const lane = /^files\.cleanup\.(preview|inspect|check|verify)$/.test(payload.method) ? 'review'
           : /^(sync\.project(?:Tree|TreeState|FileStats)|remote\.listDirs)$/.test(payload.method) ? 'browse'
-          : /^(sync\.|upload\.|download\.|files\.cleanup\.(?:preview|inspect|execute|verify))/.test(payload.method) ? 'files' : 'control';
+          : /^(sync\.|upload\.|download\.|agents\.|project\.|handoff\.|downloadScope\.|transfers\.reconcile$|files\.cleanup\.(?:preview|inspect|execute|verify))/.test(payload.method) ? 'files' : 'control';
         result = await this.rpcLanes[lane].run([Symbol(payload.method)], controller.signal, () => {
           queued = false;
           return apiRequestContext.run({ readOnly, signal: controller.signal }, () => {

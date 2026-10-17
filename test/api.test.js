@@ -177,13 +177,14 @@ test("disconnected readers cancel while writes remain owned by durable operation
 test('busy file RPCs leave directory browsing and operation controls available', async () => {
   const { EventEmitter } = require('node:events');
   let release; const gate = new Promise(resolve => { release = resolve; });
-  let starts = 0;
+  let starts = 0, serviceStarts = 0;
   const api = new LocalApiServer({ methods: {
     'sync.projectInventory': async () => { starts++; await gate; return {}; },
     'sync.projectTree': async () => ({ entries: [] }),
     'transfers.list': async () => ({ transfers: [] }),
     'files.cleanup.preview': async () => ({ reviewed: true }),
     'upload.files': async () => { assert.fail('disconnected queued write started'); },
+    'agents.lifecycle': async () => { serviceStarts++; await gate; return {}; },
   } });
   function rpc(method) {
     const req = new EventEmitter(), res = new EventEmitter();
@@ -208,6 +209,12 @@ test('busy file RPCs leave directory browsing and operation controls available',
     const write = rpc('upload.files'); await new Promise(setImmediate);
     write.res.emit('close'); await write.done;
     assert.equal(write.result().body.error.data.notStarted, true);
+    const services = Array.from({length:4},()=>rpc('agents.lifecycle'));
+    try {
+      await new Promise(setImmediate);assert.equal(serviceStarts,0);
+      const available = rpc('transfers.list');await available.done;
+      assert.deepEqual(available.result().body.result,{transfers:[]});
+    } finally {for(const item of services)item.res.emit('close');await Promise.all(services.map(p=>p.done));}
     const overflow = Array.from({length:65}, () => rpc('sync.projectInventory'));
     try {
       await overflow.at(-1).done;
