@@ -93,3 +93,23 @@ test('code inventory lane still serializes the same server and releases its next
  } finally {failFirst();await failed;await next;__test.setRemoteBatchTransport(null);}
  assert.equal(starts,2);assert.equal(__test.listActiveTransfers().length,0);
 });
+
+test('bounded memory result reads bypass bulk inventory on the same host and release failed tickets',async()=>{
+ const source={host:'memory-lane.invalid',username:'u',remotePath:'/fixture'},root=fs.mkdtempSync(path.join(os.tmpdir(),'sftp-memory-lane-'));
+ let release,started=0,notify;const began=new Promise(resolve=>notify=resolve);
+ __test.setTransferSettlementTestContext({instanceId:'memory-lane',globalState:{get:(_,fallback)=>fallback,update:async()=>{}}});
+ __test.setRemoteBatchTransport(async()=>new Promise(resolve=>release=()=>resolve(JSON.stringify({files:{}}))));
+ __test.setMappedDownloadTransport(async()=>{started++;notify();throw Error('memory source changed');});
+ const methods=__test.createLocalApiMethods(),bulk=methods['sync.projectInventory']({source,scopePaths:['work_dirs'],_operationId:'bulk-memory'});
+ await new Promise(setImmediate);
+ const params={server:source,localPath:root,memoryOnly:true,metricsOnly:true,wrapperResults:true,compression:'none',confirm:true,pathConfirmed:true,
+  entries:[{remotePath:'work_dirs/a/metrics.csv',localRelativePath:'unused/a.csv',bytes:1,sha256:'a'.repeat(64)}]};
+ const first=assert.rejects(methods['sync.downloadMappedPaths']({...params,_operationId:'memory-first'}),/memory source changed/);
+ try{
+  await Promise.race([began,new Promise(resolve=>setTimeout(resolve,300))]);
+  assert.equal(started,1,'a 4 MiB bounded memory read must not wait for the bulk inventory');
+  await first;
+  await assert.rejects(methods['sync.downloadMappedPaths']({...params,_operationId:'memory-next'}),/memory source changed/);
+  assert.equal(started,2);assert.deepEqual(fs.readdirSync(root),[]);
+ }finally{release();await Promise.allSettled([bulk,first]);__test.setRemoteBatchTransport(null);__test.setMappedDownloadTransport(null);}
+});

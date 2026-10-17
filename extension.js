@@ -9,6 +9,9 @@ const metadataTreeCapacity = new TransferCapacity();
 // Short, exact code checks cannot queue behind a recursive artifact inventory.
 // Each lane remains bounded to two servers globally and one read per server.
 const codeInventoryCapacity = new TransferCapacity();
+// Memory-only metrics are capped at 4 MiB by the existing normalizer/extractor.
+// They cannot hold up, or queue behind, bulk hashes and disk-writing transfers.
+const memoryResultCapacity = new TransferCapacity();
 let projectTreeTransport;
 let extensionDeactivating = false;
 const { chooseSampleFiles, chooseCompression, CompressionHistory, SAMPLE_TIMEOUT_MS } = require("./compression-policy");
@@ -299,7 +302,7 @@ function startLocalApiServer(context) {
       "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1, tmuxSessionPrefix: 1 },
       "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576, idlePolicy: "observe-filesystem", scopedTraversal: "direct-roots-v1", codeInventoryLane: 1, capacityTiming: 1 },
       "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
-      "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, memoryWrapperResults: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024 },
+      "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, memoryWrapperResults: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024, memoryReadLane: 1, capacityTiming: 1 },
     },
   });
   localApiServer = server;
@@ -4538,15 +4541,16 @@ function createLocalApiMethods() {
         if (cancelledTransferOperations.has(operationId)) throw new Error(cancelledTransferOperations.get(operationId));
         const codeInventory = name === "sync.projectInventory" && params.inventoryPurpose === "code-sync"
           && Array.isArray(params.scopePaths) && params.scopePaths.length > 0 && !params.scopePaths.includes(".");
-        const pool = codeInventory ? codeInventoryCapacity
+        const memoryRead = name === "sync.downloadMappedPaths" && params.memoryOnly === true && params.metricsOnly === true;
+        const pool = memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
           : ["sync.projectTree", "sync.projectTreeState", "sync.projectFileStats"].includes(name) ? metadataTreeCapacity : transferCapacity;
         const result = await transferContext.run(controller, () => withTransferCapacity(params, () => method(params), pool));
         if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认");
-        if (name === "sync.projectInventory") return { ...result, queryTiming: {
+        if (name === "sync.projectInventory" || memoryRead) return { ...result, queryTiming: {
           capacityQueuedAt: controller.capacityQueuedAt, capacityGrantedAt: controller.capacityGrantedAt,
           capacityWaitMs: controller.capacityWaitMs, processStartedAt: controller.processStartedAt,
           firstProgressAt: controller.firstProgressAt, completedAt: new Date().toISOString(),
-          lane: codeInventory ? "code-sync" : "bulk",
+          lane: memoryRead ? "memory-results" : codeInventory ? "code-sync" : "bulk",
         } };
         return result;
       } finally {
@@ -5476,7 +5480,8 @@ async function downloadMappedPaths(options = {}) {
 }
 
 async function downloadMappedPathsCore(options = {}) {
-  return withTransferCapacity(options, () => downloadMappedPathsInternal(options));
+  const memoryRead = options.memoryOnly === true && options.metricsOnly === true;
+  return withTransferCapacity(options, () => downloadMappedPathsInternal(options), memoryRead ? memoryResultCapacity : transferCapacity);
 }
 
 async function downloadMappedPathsInternal(options = {}) {
