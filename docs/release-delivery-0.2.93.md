@@ -9,3 +9,9 @@ inventoryPurpose=code-sync 的有界范围读取使用独立容量，避免排�
 最终 `npm run package` 退出 0，包含 metadataTreeRead 7 项和全部既有串行 build 门禁，23 文件运行闭包通过。该新增用例加上此前 42 文件/271 项覆盖了最终逻辑；没有并行测试或超过 20 秒后的重试。确定包 `simple-sftp-0.2.93.vsix` 为 170663 字节、26 个 ZIP 条目、21 个 JS/Python 运行文件，逐字节匹配当前文件；publisher/name/version、universal 平台、源锁版本和实际 discovery 秘密排除通过。
 
 SHA256：`742e44343fe1572a5da6856d3b5cbc9886fc89c42660495de2bdb9ac72eb9797`。同名清单精确绑定包名。包在交付回执补记前生成；不重新打包或替换资产。
+
+实现提交 `e75af6b0de826e2e8752c302b8a00b23545b1150` 已普通推送 origin/master、fetch 核对一致。[稳定 Latest v0.2.93](https://github.com/zlinkw/SimpleSFTP/releases/tag/v0.2.93) 的 tag/target_commitish 绑定该提交，draft=false、prerelease=false。VSIX 170663 字节，同名 SHA256 清单 90 字节；真实 Latest、资产 digest、实际下载内容与本机确定包一致。配套 [Experiment v0.5.363](https://github.com/zlinkw/SimpleExperiment/releases/tag/v0.5.363) 同样完成发行。
+
+实际旧版 Experiment 0.5.362 ReleaseClient 识别并下载 Windows 更新包，身份、版本、universal 平台及精确清单验证通过。验证目录 `C:/Users/ZLK/AppData/Local/Temp/simpleex-0363-release-verify-zs0Gwf` 保留。
+
+显式且仅一次 `npm run install:latest` 成功；VS Code 列表为 simple-local.simple-sftp@0.2.93，已安装 21 个 JS/Python 运行文件与包逐字节一致。两个 CLI 入口和 simpleex --help 核对通过。安装后停止插件 API、面板及服务器操作，等待用户重载；未重提、重跑或删除科研任务产物，也未升级远端服务。现场新代码的耗时验收尚未执行，不能提前宣称 H20 已加速。本节仅为文档回执，不改变发行包。
