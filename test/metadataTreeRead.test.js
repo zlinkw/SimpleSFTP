@@ -1,6 +1,22 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),os=require('node:os'),Module=require('node:module'),{spawnSync}=require('node:child_process');
 const original=Module._load;Module._load=function(name,...args){return name==='vscode'?{TreeItem:class{},ProgressLocation:{Notification:1},workspace:{workspaceFolders:[],getConfiguration:()=>({get:(_,fallback)=>fallback})},window:{withProgress:(_,work)=>work({report(){}})}}:original.call(this,name,...args);};
 const {__test}=require('../extension.js');Module._load=original;
+test('recursive metadata inventory counts nested file facts without opening contents or creating a hash cache',()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'sftp-metadata-')),script=path.join(root,'probe.py');
+ fs.mkdirSync(path.join(root,'data','nested'),{recursive:true});fs.writeFileSync(path.join(root,'data','nested','big.bin'),'content','utf8');
+ fs.writeFileSync(script,"import builtins,os\ndef denied(*a,**k): raise AssertionError('content/cache access forbidden')\nbuiltins.open=denied\nos.open=denied\nos.makedirs=denied\n"+__test.projectInventoryScript(true),'utf8');
+ const output=spawnSync(process.platform==='win32'?'python':'python3',['-B','-X','utf8',script,root,'data','1','null'],{encoding:'utf8',timeout:10000,windowsHide:true});assert.equal(output.status,0,output.stderr);
+ const result=JSON.parse(output.stdout);assert.equal(result.comparisonBasis,'metadata');assert.deepEqual(Object.keys(result.files),['data/nested/big.bin']);assert.equal(result.files['data/nested/big.bin'].size,7);assert.equal(result.files['data/nested/big.bin'].sha256,undefined);assert.deepEqual(result.unverifiedFiles,{});
+});
+test('recursive metadata queue bypasses bulk inventory and leaves immediate browsing available',async()=>{
+ const source={host:'metadata-summary.invalid',username:'u',remotePath:'/fixture'};let release;
+ __test.setTransferSettlementTestContext({instanceId:'metadata',globalState:{get:(_,v)=>v,update:async()=>{}}});
+ __test.setRemoteBatchTransport(async(_s,command)=>command.includes('METADATA_ENTRY_LIMIT')?JSON.stringify({files:{}}):new Promise(resolve=>release=()=>resolve(JSON.stringify({files:{}}))));
+ __test.setProjectTreeTransport(async()=>JSON.stringify({exists:true,entries:[]}));
+ const methods=__test.createLocalApiMethods(),bulk=methods['sync.projectInventory']({source,scopePaths:['work_dirs']});await new Promise(setImmediate);
+ try{const summary=await methods['sync.projectInventory']({source,scopePaths:['data'],metadataOnly:true});assert.equal(summary.comparisonBasis,'metadata');assert.equal(summary.queryTiming.lane,'metadata-inventory');assert.deepEqual((await methods['sync.projectTree']({source})).entries,[]);}
+ finally{release();await bulk;__test.setRemoteBatchTransport(null);__test.setProjectTreeTransport(null);}
+});
 function probe(script,relative,setup=()=>{},prefix=''){
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'sftp-tree-')),file=path.join(root,'probe.py');setup(root);
  fs.writeFileSync(file,"import json,sys\ntry:\n"+(prefix+script).split('\n').map(line=>' '+line).join('\n')+"\nexcept Exception as exc:\n print(json.dumps({'error':str(exc)}))\n",'utf8');

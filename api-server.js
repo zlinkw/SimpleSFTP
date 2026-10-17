@@ -77,7 +77,7 @@ class LocalApiServer {
     // HTTP admission must not starve browsing or stop/status requests behind
     // long file operations. Actual SSH work retains its per-server limits.
     this.rpcLanes = { files: new TransferCapacity({ concurrency: 8 }),
-      browse: new TransferCapacity({ concurrency: 4 }), review: new TransferCapacity({ concurrency: 2 }),
+      browse: new TransferCapacity({ concurrency: 4 }), review: new TransferCapacity({ concurrency: 2 }), summary: new TransferCapacity({ concurrency: 4 }),
       control: new TransferCapacity({ concurrency: 4 }) };
     this.discoveryLease = options.discoveryLease || new HostOperationLeaseManager();
   }
@@ -198,7 +198,8 @@ class LocalApiServer {
       if (request.aborted || response.destroyed) cancelRead();
       let result;
       try {
-        const lane = /^files\.cleanup\.(preview|inspect|check|verify)$/.test(payload.method) ? 'review'
+        const lane = payload.method === 'sync.projectInventory' && payload.params?.metadataOnly === true ? 'summary'
+          : /^files\.cleanup\.(preview|inspect|check|verify)$/.test(payload.method) ? 'review'
           : /^(sync\.project(?:Tree|TreeState|FileStats)|remote\.listDirs)$/.test(payload.method) ? 'browse'
           : /^(sync\.|upload\.|download\.|agents\.|project\.|handoff\.|downloadScope\.|transfers\.reconcile$|files\.cleanup\.(?:preview|inspect|execute|verify))/.test(payload.method) ? 'files' : 'control';
         result = await this.rpcLanes[lane].run([Symbol(payload.method)], controller.signal, () => {

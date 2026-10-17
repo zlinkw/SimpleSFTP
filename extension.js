@@ -6,6 +6,7 @@ const { LatestSnapshotWriter } = require("./latest-snapshot-writer");
 const { TransferCapacity } = require("./transfer-capacity");
 const transferCapacity = new TransferCapacity();
 const metadataTreeCapacity = new TransferCapacity();
+const metadataInventoryCapacity = new TransferCapacity();
 const cleanupReadCapacity = new TransferCapacity();
 // Short, exact code checks cannot queue behind a recursive artifact inventory.
 // Each lane remains bounded to two servers globally and one read per server.
@@ -301,7 +302,7 @@ function startLocalApiServer(context) {
       "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
       "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
       "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1, tmuxSessionPrefix: 1 },
-      "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576, idlePolicy: "observe-filesystem", scopedTraversal: "direct-roots-v1", codeInventoryLane: 1, capacityTiming: 1 },
+      "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576, idlePolicy: "observe-filesystem", scopedTraversal: "direct-roots-v1", codeInventoryLane: 1, capacityTiming: 1, metadataOnly: 1 },
       "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
       "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, memoryWrapperResults: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024, memoryReadLane: 1, capacityTiming: 1 },
     },
@@ -1032,13 +1033,13 @@ async function projectInventory(options = {}) {
   if (scopePaths && scopePaths.length > 5000) throw new Error("一次清单最多 5000 个范围路径。");
   if (scopePaths && Buffer.byteLength(JSON.stringify(scopePaths), "utf8") > 1048576) throw new Error("清单范围超过 1 MiB。");
   if (relativePath !== "." && !projectTreePathAllowed(relativePath)) throw new Error("清单目录属于机器状态。");
-  const script = projectInventoryScript();
+  const script = projectInventoryScript(options.metadataOnly === true);
   const command = `python3 -c ${shellQuote(script)} ${shellQuote(source.remotePath)} ${shellQuote(relativePath)} ${recursive ? "1" : "0"} ${shellQuote(scopePaths ? "@stdin" : "null")}`;
   const output = scopePaths ? await runRemoteBatchSsh(source, command, scopePaths, transferTimeoutMs(source, options), { remoteMutation: false, stage: "产物清单校验" })
     : await runSsh(source, command, transferTimeoutMs(source, options));
   const result = JSON.parse(output);
   if (!result.files || typeof result.files !== "object" || Array.isArray(result.files)) throw new Error("远端项目清单无效。");
-  return { ok: true, files: result.files, unverifiedFiles: result.unverifiedFiles || {}, hashedFiles: result.hashedFiles, reusedFiles: result.reusedFiles, cacheRows: result.cacheRows, cacheStatus: result.cacheStatus };
+  return { ok: true, files: result.files, unverifiedFiles: result.unverifiedFiles || {}, ...(options.metadataOnly === true ? { comparisonBasis: "metadata" } : {}), hashedFiles: result.hashedFiles, reusedFiles: result.reusedFiles, cacheRows: result.cacheRows, cacheStatus: result.cacheStatus };
 }
 
 async function projectFileStats(options = {}) {
@@ -1074,7 +1075,7 @@ async function projectFileStats(options = {}) {
   return { ok: true, files: result.files, missing: Array.isArray(result.missing) ? result.missing : [] };
 }
 
-function projectInventoryScript() {
+function projectInventoryScript(metadataOnly = false) {
   return [
     "import hashlib,json,os,sqlite3,stat as statmod,sys,time,threading",
     "SQLITE_INT64_SPAN=1<<64",
@@ -1137,6 +1138,7 @@ function projectInventoryScript() {
     "try: target_info=os.stat(target,follow_symlinks=False)",
     "except FileNotFoundError: print(json.dumps({'files':{}})); sys.exit(0)",
     "if not (statmod.S_ISDIR(target_info.st_mode) or statmod.S_ISREG(target_info.st_mode)): raise ValueError('INVENTORY_TARGET_TYPE')",
+    ...(metadataOnly ? [] : [
     "cache={}; db=None; cache_status='ready'; cache_at=time.monotonic(); update_bytes=0; cache_root=hashlib.sha256(root.encode('utf-8')).hexdigest()",
     "try:",
     " cache_dir=os.environ.get('SIMPLE_SFTP_HASH_CACHE_DIR') or os.path.join(os.path.expanduser('~'),'.cache','simple-sftp')",
@@ -1146,6 +1148,7 @@ function projectInventoryScript() {
     "except (OSError,sqlite3.Error):",
     " if db is not None: db.close()",
     " db=None; cache={}; cache_status='unavailable'",
+    ]),
     "def fail_walk(error): raise error",
     "def scoped_walk():",
     " if scopes is None or '.' in scope_set or not recursive: roots=[relroot] if scopes is None or scope_set else []",
@@ -1174,12 +1177,27 @@ function projectInventoryScript() {
     "names=[]",
     "for current,dirs,files in walk:",
     " report_scan(1)",
+    ...(metadataOnly ? [" if scan_count>100000: raise ValueError('METADATA_ENTRY_LIMIT')"] : []),
     " if recursive: dirs[:]=[d for d in dirs if allowed(os.path.relpath(os.path.join(current,d),root),True) and in_scope(os.path.relpath(os.path.join(current,d),root).replace(os.sep,'/'),True) and not os.path.islink(os.path.join(current,d))]",
     " for name in files:",
     "  full=os.path.join(current,name); rel=os.path.relpath(full,root).replace(os.sep,'/')",
     "  if allowed(rel) and in_scope(rel): names.append((rel,full))",
     "  report_scan(1)",
+    ...(metadataOnly ? ["  if scan_count>100000 or len(names)>50000: raise ValueError('METADATA_ENTRY_LIMIT')"] : []),
     "report_scan(force=True)",
+    ...(metadataOnly ? [
+    "for rel,full in names:",
+    " try:",
+    "  physical=os.path.realpath(full)",
+    "  if physical!=os.path.abspath(full) or os.path.commonpath((root,physical))!=root: raise ValueError('symlink or escaped metadata path')",
+    "  info=os.lstat(full)",
+    "  if not statmod.S_ISREG(info.st_mode): raise ValueError('metadata target changed type')",
+    "  found[rel]={'size':info.st_size,'modifiedAtMs':info.st_mtime_ns//1000000}",
+    " except (OSError,ValueError) as exc: unverified[rel]=type(exc).__name__",
+    " report_scan(1)",
+    "print(json.dumps({'files':found,'unverifiedFiles':unverified,'comparisonBasis':'metadata'},ensure_ascii=False,separators=(',',':')))",
+    "sys.exit(0)",
+    ] : []),
     "if db is not None:",
     " try:",
     "  for offset in range(0,len(names),512):",
@@ -4544,7 +4562,8 @@ function createLocalApiMethods() {
           && Array.isArray(params.scopePaths) && params.scopePaths.length > 0 && !params.scopePaths.includes(".");
         const memoryRead = name === "sync.downloadMappedPaths" && params.memoryOnly === true && params.metricsOnly === true;
         const cleanupRead = ["files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.check", "files.cleanup.verify", "files.cleanup.status"].includes(name);
-        const pool = cleanupRead ? cleanupReadCapacity : memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
+        const metadataInventory = name === "sync.projectInventory" && params.metadataOnly === true;
+        const pool = cleanupRead ? cleanupReadCapacity : metadataInventory ? metadataInventoryCapacity : memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
           : ["sync.projectTree", "sync.projectTreeState", "sync.projectFileStats"].includes(name) ? metadataTreeCapacity : transferCapacity;
         const result = await transferContext.run(controller, () => withTransferCapacity(params, () => method(params), pool));
         if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认");
@@ -4552,7 +4571,7 @@ function createLocalApiMethods() {
           capacityQueuedAt: controller.capacityQueuedAt, capacityGrantedAt: controller.capacityGrantedAt,
           capacityWaitMs: controller.capacityWaitMs, processStartedAt: controller.processStartedAt,
           firstProgressAt: controller.firstProgressAt, completedAt: new Date().toISOString(),
-          lane: memoryRead ? "memory-results" : codeInventory ? "code-sync" : "bulk",
+          lane: metadataInventory ? "metadata-inventory" : memoryRead ? "memory-results" : codeInventory ? "code-sync" : "bulk",
         } };
         return result;
       } finally {

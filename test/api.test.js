@@ -156,7 +156,7 @@ test("disposal preserves a newer discovery and consumes its own fixed writing sl
 
 test("disconnected readers cancel while writes remain owned by durable operations", async () => {
   const { EventEmitter } = require("node:events");
-  for (const [method, readOnly, params = {}] of [["project.inventory", true], ["sync.projectInventory", true], ["sync.projectFileStats", true],
+  for (const [method, readOnly, params = {}] of [["project.inventory", true], ["sync.projectInventory", true], ["sync.projectInventory", true, {metadataOnly:true}], ["sync.projectFileStats", true],
       ["sync.projectTree", true], ["sync.planLogPaths", true], ["transfers.reconcile", true], ["upload.start", false],
       ["sync.serverToServerFpsync", false], ["sync.downloadMappedPaths", true, {memoryOnly:true}], ["sync.downloadMappedPaths", false]]) {
     let entered, release, captured;
@@ -179,19 +179,19 @@ test('busy file RPCs leave directory browsing and operation controls available',
   let release; const gate = new Promise(resolve => { release = resolve; });
   let starts = 0, serviceStarts = 0;
   const api = new LocalApiServer({ methods: {
-    'sync.projectInventory': async () => { starts++; await gate; return {}; },
+    'sync.projectInventory': async (params) => { if(params.metadataOnly)return {comparisonBasis:'metadata'};starts++; await gate; return {}; },
     'sync.projectTree': async () => ({ entries: [] }),
     'transfers.list': async () => ({ transfers: [] }),
     'files.cleanup.preview': async () => ({ reviewed: true }),
     'upload.files': async () => { assert.fail('disconnected queued write started'); },
     'agents.lifecycle': async () => { serviceStarts++; await gate; return {}; },
   } });
-  function rpc(method) {
+  function rpc(method, params = {}) {
     const req = new EventEmitter(), res = new EventEmitter();
     let body, status;
     res.writeHead = code => { status = code; }; res.end = text => { body = JSON.parse(text); };
     const done = api.handleRpc(req, res);
-    req.emit('data', Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: starts, method }))); req.emit('end');
+    req.emit('data', Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: starts, method, params }))); req.emit('end');
     return { done, res, result: () => ({ body, status }) };
   }
   const pending = Array.from({ length: 8 }, () => rpc('sync.projectInventory'));
@@ -202,6 +202,8 @@ test('busy file RPCs leave directory browsing and operation controls available',
     assert.deepEqual(tree.result().body.result, { entries: [] });
     assert.deepEqual(control.result().body.result, { transfers: [] });
     assert.deepEqual(review.result().body.result, { reviewed: true });
+    const summary = rpc('sync.projectInventory',{metadataOnly:true});await summary.done;
+    assert.equal(summary.result().body.result.comparisonBasis,'metadata','recursive stat reads bypass eight occupied bulk RPC slots');
     const cancelled = rpc('sync.projectInventory');
     await new Promise(setImmediate); assert.equal(starts, 8, 'ninth file query is queued');
     cancelled.res.emit('close'); await cancelled.done;
