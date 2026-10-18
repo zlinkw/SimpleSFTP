@@ -4,6 +4,14 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { atomicWriteText } = require("./state-store");
 const hash = value => crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
+// Binary numbers avoid JavaScript/Python decimal and exponent formatting differences.
+const canonical = value => typeof value === "number" ? "n" + (() => {
+  if (!Number.isFinite(value)) fail("CLEANUP_INPUT_CHANGED");
+  const bytes = Buffer.alloc(8); bytes.writeDoubleBE(value === 0 ? 0 : value); return bytes.toString("hex");
+})() : Array.isArray(value) ? "[" + value.map(row => canonical(row) ?? "null").join(",") + "]" : value && typeof value === "object"
+  ? "{" + Object.keys(value).filter(key => value[key] !== undefined).sort((a,b) => Buffer.compare(Buffer.from(a),Buffer.from(b)))
+    .map(key => JSON.stringify(key) + ":" + canonical(value[key])).join(",") + "}" : JSON.stringify(value);
+const targetHash = value => crypto.createHash("sha256").update(canonical(value)).digest("hex");
 const copy = value => JSON.parse(JSON.stringify(value));
 function cleanupRemoteLoader(source) {
   const packed = require('node:zlib').deflateSync(Buffer.from(source,'utf8')).toString('base64');
@@ -64,6 +72,7 @@ class CleanupFileApi {
     const row = { token: crypto.randomBytes(24).toString("hex"), operationId: "cleanup-" + crypto.randomBytes(16).toString("hex"), node: copy(node), rootIdentity: identity,
       action, observationMode, authorizationMode: pathOnly ? "confirmed_paths" : undefined, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, managedObservation: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, handleScan: pathOnly ? "confirmed_paths" : observationMode ? "managed_tmux" : "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
     row.tmuxSessionPrefix = tmuxSessionPrefix;
+    row.targetDigests = rows.map(targetHash);
     row.digest = hash({ node: row.node, rootIdentity: identity, action, targets: rows, safety: row.safety, tmuxSessionPrefix });
     this.previews.set(row.token, copy(row)); // Preview does not write a journal or a remote hash cache.
     return copy(row);
@@ -128,8 +137,10 @@ class CleanupFileApi {
         // A live OS mutation lock refused admission before any window was
         // created. The client may retry this same confirmed request, while
         // lifecycle checks continue reading actual tmux/filesystem evidence.
-        if (row.observationMode === "tmux" && error.code === "OPERATION_BUSY")
+        if (row.observationMode === "tmux" && error.code === "OPERATION_BUSY") {
+          row.states[index] = "pending"; await this.save(row);
           return { ok: true, state: "waiting", reason: "CLEANUP_MUTATION_BUSY", notStarted: true };
+        }
         throw error;
       }
     }
@@ -172,9 +183,14 @@ class CleanupFileApi {
   async observe(row, index) {
     if (row.observationMode === "filesystem" && this.localExecutions.has(row.token + ":" + index))
       return { ok: true, state: "executing", executor: { kind: "active_local_transfer" } };
+    const frozen = row.targets[index];
+    const compact = row.observationMode === "tmux" && ["executing", "completed"].includes(row.states[index]);
+    const target = compact ? Object.fromEntries(["relativePath", "destination", "type", "fingerprint", "contentFingerprint", "inode", "authorizationMode"]
+      .filter(key => frozen[key] !== undefined).map(key => [key, frozen[key]])) : frozen;
     return this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
       action: "managed-observe", cleanupAction: row.action, localObservation: row.observationMode === "filesystem",
-      operationId: row.operationId, target: row.targets[index] });
+      operationId: row.operationId, target,
+      ...(compact ? { frozenTargetDigest: row.targetDigests?.[index] || targetHash(frozen) } : {}) });
   }
   async status(params) {
     const row = await this.read(params.token);

@@ -12,9 +12,27 @@ import re
 import socket
 import shlex
 import stat
+import struct
 import subprocess
 import sys
 import time
+
+MAX_CLEANUP_REQUEST_BYTES = 32 * 1024 * 1024
+
+
+def decode_request(raw):
+    if len(raw) > MAX_CLEANUP_REQUEST_BYTES:
+        deny("REQUEST_TOO_LARGE")
+    request = json.loads(raw.decode("utf-8"))
+    inventory = request.get("target", {}).get("inventory")
+    if isinstance(inventory, list) and len(inventory) > 50000:
+        deny("INVENTORY_LIMIT")
+    # Replies already permit a 16 MiB frozen inventory. Large authenticated
+    # inventory-bearing lifecycle requests get a separate, still bounded budget.
+    if len(raw) > 1048576 and (not isinstance(inventory, list) or request.get("action") not in
+            ("managed-start", "managed-observe", "delete", "move", "restore", "inspect", "check", "verify", "settle")):
+        deny("REQUEST_TOO_LARGE")
+    return request
 
 
 class GuardError(Exception):
@@ -31,6 +49,24 @@ def deny(code, detail="", reason=""):
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def frozen_target_digest(value):
+    # Separate from existing inventory/operation hashes; match JSON numbers as doubles.
+    def canonical(item):
+        if isinstance(item, bool) or item is None:
+            return json.dumps(item)
+        if isinstance(item, (int, float)):
+            number = float(item)
+            if number != number or abs(number) == float("inf"):
+                deny("CLEANUP_INPUT_CHANGED")
+            return "n" + struct.pack(">d", 0.0 if number == 0 else number).hex()
+        if isinstance(item, list):
+            return "[" + ",".join(canonical(row) for row in item) + "]"
+        if isinstance(item, dict):
+            return "{" + ",".join(json.dumps(key, ensure_ascii=False) + ":" + canonical(item[key]) for key in sorted(item)) + "}"
+        return json.dumps(item, ensure_ascii=False)
+    return hashlib.sha256(canonical(value).encode("utf-8")).hexdigest()
 
 
 def below(root, value):
@@ -632,6 +668,39 @@ def managed_delete_progress(root, target):
             "totalBytes": sum(row.get("size", 0) for row in inventory)}
 
 
+def frozen_observation_target(root, request, key):
+    expected = request.get("frozenTargetDigest")
+    if not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected):
+        deny("CLEANUP_INPUT_CHANGED")
+    file = path_guard(root, "clean_dir/.operations/managed/" + key + ".json", True, True)
+    if not os.path.lexists(file):
+        return None
+    before = os.lstat(file)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > MAX_CLEANUP_REQUEST_BYTES:
+        deny("CLEANUP_INPUT_CHANGED", file)
+    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    with open(file, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        # Windows path stat may expose creation time as ctime while handle stat
+        # exposes change time. Compare each clock against itself across the read.
+        identity_fields = fields[:-1] if os.name == "nt" else fields
+        if opened.st_nlink != 1 or any(getattr(before, name) != getattr(opened, name) for name in identity_fields):
+            deny("CLEANUP_INPUT_CHANGED", file)
+        raw = stream.read(MAX_CLEANUP_REQUEST_BYTES + 1)
+        opened_after = os.fstat(stream.fileno())
+    record = decode_request(raw)
+    after = os.lstat(file)
+    if any(getattr(before, name) != getattr(after, name) or getattr(opened, name) != getattr(opened_after, name) for name in fields):
+        deny("CLEANUP_INPUT_CHANGED", file)
+    target = record.get("target")
+    if not isinstance(target, dict) or frozen_target_digest(target) != expected or record.get("root") != root or record.get("rootIdentity") != request.get("rootIdentity") \
+            or record.get("operationId") != request.get("operationId") or record.get("action") != request.get("cleanupAction") or record.get("managedInner") is not True:
+        deny("CLEANUP_INPUT_CHANGED", file)
+    if any(target.get(name) != request["target"].get(name) for name in ("relativePath", "destination", "type", "fingerprint", "contentFingerprint", "inode", "authorizationMode")):
+        deny("CLEANUP_INPUT_CHANGED", file)
+    return target
+
+
 def managed_observe(request):
     root, identity = root_guard(request["root"])
     if identity != request.get("rootIdentity"):
@@ -648,6 +717,13 @@ def managed_observe(request):
                         "exitCode": int(fields[3]) if re.fullmatch(r"-?\d+", fields[3]) else None}
             if not executor["dead"]:
                 break
+    if request.get("frozenTargetDigest") and (executor and not executor["dead"] or os.path.lexists(source)):
+        frozen = frozen_observation_target(root, request, key)
+        if frozen is None:
+            if executor and not executor["dead"]:
+                return {"ok": True, "state": "executing", "executor": executor, "rootIdentity": identity, "progress": None}
+            return {"ok": True, "state": "unknown", "code": "CLEANUP_FROZEN_INPUT_MISSING", "rootIdentity": identity}
+        target = frozen
     if executor and not executor["dead"]:
         progress = managed_delete_progress(root, target) if request["cleanupAction"] == "delete" else None
         return {"ok": True, "state": "executing", "executor": executor, "rootIdentity": identity, "progress": progress}
@@ -841,10 +917,8 @@ if __name__ == "__main__":
     lock = None
     request = {}
     try:
-        raw = sys.stdin.buffer.read(1048577).rstrip(b"\x00")
-        if len(raw) > 1048576:
-            deny("REQUEST_TOO_LARGE")
-        request = json.loads(raw.decode("utf-8"))
+        raw = sys.stdin.buffer.read(MAX_CLEANUP_REQUEST_BYTES + 1).rstrip(b"\x00")
+        request = decode_request(raw)
         if request.get("action") in ("move", "delete", "restore", "settle", "managed-start"):
             checked_root, _ = root_guard(request["root"])
             deadline = time.monotonic() + (3 if request.get("managedInner") else 0)
