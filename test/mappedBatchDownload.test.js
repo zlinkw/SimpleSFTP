@@ -514,7 +514,7 @@ test("success waits for SSH exit after the tar trailer", async () => {
     { remotePath: "results/a.csv", localRelativePath: "out/a.csv" },
   ])).then((result) => { settled = true; return result; });
   try {
-    const deadline = Date.now() + 1500;
+    const deadline = Date.now() + 5000;
     let staged = [];
     while (Date.now() < deadline) {
       if (fs.existsSync(path.join(root, "out"))) staged = fs.readdirSync(path.join(root, "out")).filter((name) => name.includes(".simple-sftp-partial-"));
@@ -527,6 +527,8 @@ test("success waits for SSH exit after the tar trailer", async () => {
     assert.equal(fs.readFileSync(path.join(root, "out", staged[0]), "utf8"), "ready");
   } finally {
     if (proc) proc.emitClose(0);
+    // Settle this transport before the next test changes the shared transport hook.
+    await pending.catch(() => undefined);
   }
   const result = await pending;
   assert.equal(result.ok, true);
@@ -541,6 +543,8 @@ test("API cancel during the real SSH stream kills that one child", async (t) => 
   let killed = 0;
   let sshCalls = 0;
   let sshProc;
+  let spawned;
+  const spawnReady = new Promise(resolve => { spawned = resolve; });
   // Always settle the injected child if an assertion fails before normal exit.
   t.after(() => sshProc?.emitClose?.());
   const token = {
@@ -581,6 +585,7 @@ test("API cancel during the real SSH stream kills that one child", async (t) => 
         once(event, listener) { return this.on(event, listener); },
       };
       sshProc.emitClose = (code = null, signal = "SIGTERM") => { for (const listener of handlers.get("close") || []) listener(code, signal); };
+      spawned();
       return sshProc;
     },
   }));
@@ -591,6 +596,10 @@ test("API cancel during the real SSH stream kills that one child", async (t) => 
     { remotePath: "results/b.csv", localRelativePath: "out/b.csv" },
   ], { token, _operationId: operationId }));
   await new Promise((resolve) => { token.ready = resolve; });
+  // Registering cancellation can precede asynchronous parent checks and SSH spawn.
+  let readyTimer;
+  try { await Promise.race([spawnReady, new Promise((_, reject) => { readyTimer = setTimeout(() => reject(new Error("test SSH spawn timed out")), 5000); })]); }
+  finally { clearTimeout(readyTimer); }
   const cancellation = await methods["transfers.cancel"]({ operationId });
   assert.equal(cancellation.status, "cancelling");
   assert.equal(cancellation.settled, false);

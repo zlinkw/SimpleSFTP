@@ -1,0 +1,13 @@
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),os=require('node:os'),Module=require('node:module'),{spawnSync}=require('node:child_process');
+const original=Module._load;Module._load=function(name,...args){return name==='vscode'?{TreeItem:class{},ProgressLocation:{Notification:1},window:{withProgress:(_o,run)=>run({report(){}})},workspace:{getConfiguration:()=>({get:(_k,f)=>f})}}:original.call(this,name,...args);};
+const {__test}=require('../extension');Module._load=original;
+test('cold and SQLite-reused exact content results expose the current filesystem identity',()=>{
+ const base=fs.mkdtempSync(path.join(os.tmpdir(),'sftp-content-identity-')),root=path.join(base,'project'),script=path.join(base,'inventory.py');fs.mkdirSync(path.join(root,'nested'),{recursive:true});fs.writeFileSync(path.join(root,'nested','a'),'same','utf8');fs.writeFileSync(path.join(root,'nested','b'),'keep','utf8');fs.writeFileSync(script,__test.projectInventoryScript(),'utf8');
+ const run=()=>{const child=spawnSync(process.platform==='win32'?'python':'python3',['-B','-X','utf8',script,root,'.','1','@stdin'],{input:Buffer.from('nested/a\0nested/b\0'),env:{...process.env,SIMPLE_SFTP_HASH_CACHE_DIR:path.join(base,'cache')},encoding:'utf8',timeout:10000,windowsHide:true});assert.equal(child.status,0,child.stderr||child.error?.message);return JSON.parse(child.stdout);};
+ const cold=run(),warm=run();assert.equal(cold.hashedFiles,2);assert.equal(warm.hashedFiles,0);assert.equal(warm.reusedFiles,2);
+ for(const result of [cold,warm])for(const row of Object.values(result.files)){assert.match(row.sha256,/^[a-f0-9]{64}$/);assert.match(row.device,/^\d+$/);assert.match(row.inode,/^\d+$/);assert.ok(Number.isFinite(row.changedAtMs));}
+ assert.deepEqual(warm.files,cold.files);
+ fs.writeFileSync(script,__test.projectInventoryScript(true),'utf8');const metadata=run();
+ for(const [name,row]of Object.entries(metadata.files)){assert.equal(row.sha256,undefined);assert.equal(row.device,cold.files[name].device);assert.equal(row.inode,cold.files[name].inode);assert.equal(row.changedAtMs,cold.files[name].changedAtMs);assert.match(row.contentRevision,/^\d+:\d+$/);}
+ fs.writeFileSync(script,__test.projectInventoryScript(),'utf8');fs.writeFileSync(path.join(root,'nested','a'),'diff','utf8');fs.utimesSync(path.join(root,'nested','a'),1700000000,1700000000);const changed=run();assert.equal(changed.hashedFiles,1);assert.equal(changed.reusedFiles,1);assert.notEqual(changed.files['nested/a'].sha256,cold.files['nested/a'].sha256);assert.deepEqual(changed.files['nested/b'],cold.files['nested/b']);
+});
