@@ -17,3 +17,13 @@
 `node --test --test-force-exit --test-timeout 20000 test/cleanupLargeInventory.test.js`：3 项通过。随后串行 `npm test`：45 文件、287 项通过；`npm run package -- --replace`：90 项构建门禁通过，显式替换本批尚未发布或安装的同版本工作包。远端压缩加载命令 18,172 字符，小于 20,000 上限。
 
 VSIX 身份/版本/平台/engine、26 个 ZIP 项与 23 个运行文件源字节闭包及秘密排除通过。冻结资产 `simple-sftp-0.2.100.vsix` 为 174,253 bytes，SHA256 `4285df21f7c5bdf489401522ba715d8aa666c60d629fa123e2910fcccef59506`；配套 `.vsix.sha256` 绑定此精确文件名。发行和安装另记真实回执。
+
+## 发行及安装回执
+
+源码 `c802dbb5134a610b7f02f32356a5f6bd5cc63e4b` 已普通推送至既有 `origin/master`，fetch 后一致。[稳定 Release v0.2.100](https://github.com/zlinkw/SimpleSFTP/releases/tag/v0.2.100) 绑定该提交，非 draft、非 prerelease；Latest 包含上述 VSIX 与逐包校验文件，资产名、大小和指纹均一致。首次创建请求因 GitHub HEAD 连接 EOF 失败，主动查询确认该版本不存在、Latest 仍为 0.2.99 后才重新创建；未覆盖历史 tag 或资产。
+
+已使用本机已安装 SimpleExperiment 0.5.382 的真实更新解析器，按 SimpleSFTP 0.2.99 检查匿名公开 Latest，识别 0.2.100 更新；实际匿名下载 SimpleSFTP 0.2.100、SimpleExperiment 0.5.382 及各自 `.vsix.sha256`，与各自冻结包字节一致，源提交、平台、版本和文件名绑定均通过。
+
+显式执行一次 `npm run install:latest`，无 force、无降级；已安装 SimpleSFTP 0.2.100 的 23 个运行文件与已发布包逐文件 SHA256 一致，VS Code CLI 确认 SimpleExperiment 仍为 0.5.382，`simple-sftp-api` 与 `simpleex` 入口存在。安装后停止当前插件 API/面板操作，等待用户 Developer: Reload Window；之后需要重新预览并双确认剩余精确目标，旧批次不自动重放。未执行用户真实文件删除或远端 Agent 部署。
+
+冻结包、实际下载和串行验证回执位于本机 `C:/Users/ZLK/AppData/Local/Temp/sftp-0100-acceptance-20261018`。本节属于交付后纯文档回执，不重打或重装运行包。
