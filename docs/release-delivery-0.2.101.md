@@ -7,3 +7,5 @@ metadataOnly 同时返回身份及纳秒修改时间/ctime 组成的逐文件版
 新增真实 Python 夹具：冷读取两文件计算两次，重复读取计算零次，改变一个文件仅计算一次；校验精确文件路径及返回身份。夹具仅在自己创建的临时目录内写入，不修改用户项目、服务器或实际产物。
 
 串行完整回归 46 文件、288 项及 `npm run package` 91 项门禁通过。VSIX 身份、版本、universal 平台、26 个 ZIP 条目、23 个实际运行文件源字节和秘密排除通过。冻结包 `simple-sftp-0.2.101.vsix` 为 174409 bytes，SHA256 `2f62c2833bfddafdefcf79d8599580b859306923c8bb550f338619a61f66be2c`。远端稳定发行与安装回执完成后另记；不自动部署远端 Agent。
+
+源码 `1151f5e5b7ae58be9edff0a346299ee321d378ba` 已普通推送并 fetch 核对。稳定 Latest [v0.2.101](https://github.com/zlinkw/SimpleSFTP/releases/tag/v0.2.101) 绑定该提交，VSIX 与逐包 SHA256 均按真实更新解析器实际下载核验，大小、指纹和冻结字节一致；已显式安装一次并核对 23 个运行文件及 CLI。等待用户 Reload Window；远端 Agent 未自动部署。
