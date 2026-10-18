@@ -38,6 +38,17 @@ def below(root, value):
     return value != root and os.path.commonpath((root, value)) == root
 
 
+def checked_parent(root, full, code="UNSAFE_PARENT"):
+    parent = os.path.dirname(full)
+    try:
+        valid = below(root, full) and (os.path.normcase(parent) == os.path.normcase(root) or below(root, parent))
+    except ValueError:
+        valid = False
+    if not valid:
+        deny(code, full, "目标必须在项目根目录内，直接父目录必须是项目根目录或其子目录")
+    return parent
+
+
 def mount_points():
     if not os.path.exists("/proc/self/mountinfo"):
         return set()
@@ -332,8 +343,7 @@ def inspect(root, target, archived=False):
         target = {key: value for key, value in target.items() if key not in ("expectedOwner", "expectedSha256")}
     rel = relative(target["relativePath"])
     full = path_guard(root, rel, archived)
-    if not below(root, os.path.dirname(full)):
-        deny("UNSAFE_PARENT")
+    checked_parent(root, full)
     if archived and (not rel.startswith("clean_dir/") or rel == "clean_dir/MANIFEST.md" or rel.startswith("clean_dir/.operations/")):
         deny("PROTECTED_PATH")
     if not path_only:
@@ -415,15 +425,13 @@ def inspect(root, target, archived=False):
 
 
 def parent_cd(root, full):
-    parent = os.path.dirname(full)
-    if not below(root, parent):
-        deny("PARENT_CD_FAILED")
+    parent = checked_parent(root, full, "PARENT_CD_FAILED")
     try:
         os.chdir(parent)
         if os.path.realpath(os.getcwd()) != parent:
-            deny("PARENT_CD_FAILED")
+            deny("PARENT_CD_FAILED", parent, "当前物理目录与目标直接父目录不一致")
     except OSError:
-        deny("PARENT_CD_FAILED")
+        deny("PARENT_CD_FAILED", parent, "无法进入或核验目标直接父目录")
     return "./" + os.path.basename(full)
 
 
@@ -720,8 +728,7 @@ def main(request):
     if action == "inventory":
         target = request["target"]
         full = path_guard(root, target["relativePath"], missing=request.get("allowMissing") is True)
-        if not below(root, os.path.dirname(full)):
-            deny("UNSAFE_PARENT")
+        checked_parent(root, full)
         live = {"executorsChecked": True, "executors": current_cleanup_executors(root, full)} if request.get("observeExecutors") else {}
         if not os.path.lexists(full):
             return {"ok": True, "rootIdentity": identity, **live, "target": {"missing": True, "type": target["type"], "absolutePath": full}}
@@ -782,8 +789,7 @@ def main(request):
     archived = action == "restore" or (action == "inspect" and request.get("archived") is True)
     if action == "inspect":
         full = path_guard(root, target["relativePath"], archived, True)
-        if not below(root, os.path.dirname(full)):
-            deny("UNSAFE_PARENT")
+        checked_parent(root, full)
         if not os.path.lexists(full):
             return {"ok": True, "rootIdentity": identity, "target": {"missing": True, "type": target["type"], "absolutePath": full}}
     value = inspect(root, target, archived)
