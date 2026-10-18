@@ -18,13 +18,15 @@ import time
 
 
 class GuardError(Exception):
-    def __init__(self, code, detail=""):
+    def __init__(self, code, detail="", reason=""):
         self.code = code
+        self.blocking_path = detail if os.path.isabs(detail) else ""
+        self.reason = reason
         super().__init__(detail or code)
 
 
-def deny(code, detail=""):
-    raise GuardError(code, detail)
+def deny(code, detail="", reason=""):
+    raise GuardError(code, detail, reason)
 
 
 def digest(value):
@@ -73,11 +75,19 @@ def root_guard(raw):
     return root, {"path": root, "device": str(st.st_dev), "inode": str(st.st_ino), "machine": socket.gethostname(), "user": str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "")}
 
 
-def path_guard(root, rel, allow_clean=False, missing=False):
+def path_guard(root, rel, allow_clean=False, missing=False, nested_git_root=None):
     relative(rel)
     parts = rel.split("/")
-    if ".git" in [p.lower() for p in parts] or (not allow_clean and "clean_dir" in [p.lower() for p in parts]):
-        deny("PROTECTED_PATH")
+    names = [p.lower() for p in parts]
+    if ".git" in names:
+        # Only internal executors receive this boundary, fixed to the approved
+        # whole directory. API target paths can never nominate .git directly.
+        allowed = nested_git_root and below(root, nested_git_root) and below(nested_git_root, os.path.join(root, *parts))
+        scope_parts = os.path.relpath(nested_git_root, root).replace(os.sep, "/").lower().split("/") if allowed else []
+        if not allowed or ".git" in scope_parts or "clean_dir" in scope_parts:
+            deny("PROTECTED_PATH", os.path.join(root, *parts), "仓库元数据不可作为独立删除目标")
+    if not allow_clean and "clean_dir" in names:
+        deny("PROTECTED_PATH", os.path.join(root, *parts), "归档区受保护")
     cursor = root
     device = os.stat(root).st_dev
     mounts = mount_points()
@@ -101,7 +111,7 @@ def path_guard(root, rel, allow_clean=False, missing=False):
     return physical
 
 
-def contents(root, full, expected_type, metadata_only=False, expected_inventory=()):
+def contents(root, full, expected_type, metadata_only=False, expected_inventory=(), allow_nested_git=False):
     st = os.lstat(full)
     actual = "directory" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "unknown"
     if actual != expected_type:
@@ -130,8 +140,9 @@ def contents(root, full, expected_type, metadata_only=False, expected_inventory=
             report()
             for leaf in sorted(os.listdir(value)):
                 relative(leaf)
-                if leaf.lower() in (".git", "clean_dir"):
-                    deny("PROTECTED_DESCENDANT", value)
+                if leaf.lower() == "clean_dir" or leaf.lower() == ".git" and not (allow_nested_git and metadata_only and below(root, full)):
+                    deny("PROTECTED_DESCENDANT", os.path.join(value, leaf),
+                         "归档区受保护，不能随父目录删除" if leaf.lower() == "clean_dir" else "仓库元数据仅允许随双确认的整个子目录删除")
                 visit(os.path.join(value, leaf), name + "/" + leaf if name else leaf)
         elif stat.S_ISREG(info.st_mode):
             shared = info.st_nlink > 1 or (str(info.st_dev), str(info.st_ino)) in shared_inodes
@@ -327,7 +338,8 @@ def inspect(root, target, archived=False):
         deny("PROTECTED_PATH")
     if not path_only:
         tracked_dirty(root, rel)
-    value = contents(root, full, target["type"], metadata_only=path_only, expected_inventory=target.get("inventory") or ())
+    value = contents(root, full, target["type"], metadata_only=path_only, expected_inventory=target.get("inventory") or (),
+                     allow_nested_git=path_only and target["type"] == "directory")
     if target.get("expectedSha256") and (target["type"] != "file" or value["inventory"][0].get("sha256") != target["expectedSha256"]):
         deny("OWNERSHIP_HASH_MISMATCH")
     owner = target.get("expectedOwner")
@@ -433,10 +445,10 @@ def no_replace(source, destination):
             deny("MOVE_FAILED", str(ctypes.get_errno()))
 
 
-def delete_file(root, full, expected, metadata_only=False):
+def delete_file(root, full, expected, metadata_only=False, nested_git_root=None):
     if expected.get("type") != "file":
         deny("UNCERTAIN_TYPE")
-    path_guard(root, os.path.relpath(full, root).replace(os.sep, "/"))
+    path_guard(root, os.path.relpath(full, root).replace(os.sep, "/"), nested_git_root=nested_git_root if metadata_only else None)
     actual = contents(root, full, "file", metadata_only=metadata_only, expected_inventory=[expected])["inventory"][0]
     if any(actual.get(key) != expected.get(key) for key in ("device", "inode", "size", "mtime", "ctime" if metadata_only else "sha256")):
         deny("CONTENT_CHANGED")
@@ -449,12 +461,12 @@ def delete_file(root, full, expected, metadata_only=False):
     os.unlink(child)
 
 
-def delete_directory(root, full, inventory, base="", metadata_only=False):
+def delete_directory(root, full, inventory, base="", metadata_only=False, nested_git_root=None):
     # Execute the immutable inventory. New children and runtime type changes never expand it.
     expected = next((row for row in inventory if row["path"] == base), None)
     if not expected or expected["type"] != "directory":
         deny("UNCERTAIN_TYPE")
-    path_guard(root, os.path.relpath(full, root).replace(os.sep, "/"))
+    path_guard(root, os.path.relpath(full, root).replace(os.sep, "/"), nested_git_root=nested_git_root if metadata_only else None)
     children = [row for row in inventory if row["path"] != base and row["path"].rsplit("/", 1)[0] == base] if base else [row for row in inventory if row["path"] and "/" not in row["path"]]
     leaves = sorted(row["path"].split("/")[-1] for row in children)
     if sorted(os.listdir(full)) != leaves:
@@ -466,9 +478,9 @@ def delete_directory(root, full, inventory, base="", metadata_only=False):
         if str(st.st_ino) != row["inode"] or str(st.st_dev) != row["device"]:
             deny("IDENTITY_CHANGED")
         if row["type"] == "file" and stat.S_ISREG(st.st_mode):
-            delete_file(root, value, row, metadata_only=metadata_only)
+            delete_file(root, value, row, metadata_only=metadata_only, nested_git_root=nested_git_root)
         elif row["type"] == "directory" and stat.S_ISDIR(st.st_mode):
-            delete_directory(root, value, inventory, row["path"], metadata_only=metadata_only)
+            delete_directory(root, value, inventory, row["path"], metadata_only=metadata_only, nested_git_root=nested_git_root)
         else:
             deny("TYPE_CHANGED")
     child = parent_cd(root, full)
@@ -798,7 +810,9 @@ def main(request):
         if target["type"] == "file":
             delete_file(root, value["absolutePath"], value["inventory"][0], metadata_only=target.get("authorizationMode") == "confirmed_paths")
         elif target["type"] == "directory":
-            delete_directory(root, value["absolutePath"], value["inventory"], metadata_only=target.get("authorizationMode") == "confirmed_paths")
+            path_only = target.get("authorizationMode") == "confirmed_paths"
+            delete_directory(root, value["absolutePath"], value["inventory"], metadata_only=path_only,
+                             nested_git_root=value["absolutePath"] if path_only else None)
         else:
             deny("UNCERTAIN_TYPE")
     else:
@@ -838,11 +852,16 @@ if __name__ == "__main__":
                     time.sleep(0.02)
         result = main(request)
     except GuardError as error:
-        result = {"ok": False, "error": {"code": error.code, "message": str(error)}}
-    except PermissionError:
-        result = {"ok": False, "error": {"code": "PERMISSION_DENIED", "message": "Permission denied"}}
+        result = {"ok": False, "error": {"code": error.code, "message": str(error),
+                  **({"blockingPath": error.blocking_path} if error.blocking_path else {}),
+                  **({"reason": error.reason} if error.reason else {})}}
+    except PermissionError as error:
+        result = {"ok": False, "error": {"code": "PERMISSION_DENIED", "message": "Permission denied", "reason": "没有权限读取或修改该路径",
+                  **({"blockingPath": error.filename} if error.filename and os.path.isabs(error.filename) else {})}}
     except Exception as error:
-        result = {"ok": False, "error": {"code": "INSPECTION_OR_AUDIT_FAILED", "message": type(error).__name__}}
+        result = {"ok": False, "error": {"code": "INSPECTION_OR_AUDIT_FAILED", "message": type(error).__name__,
+                  **({"blockingPath": error.filename, "reason": str(error.strerror or type(error).__name__)}
+                     if isinstance(error, OSError) and error.filename and os.path.isabs(error.filename) else {})}}
     finally:
         if lock is not None:
             lock.close()
