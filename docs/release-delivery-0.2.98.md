@@ -15,3 +15,9 @@ SimpleExperiment npm run lint、git diff --check、禁止端口、UTF-8 与中�
 冻结包：simple-experiment-0.5.378.vsix，3197378 字节，SHA256 e4e60c7aa97a5219eb7175bd81cc0d4eac483596f74618f530a614450b48b109，558 ZIP 条目、384 个 dist 文件、262 模块/2 入口；simple-sftp-0.2.98.vsix，172519 字节，SHA256 dcf2319a6470613e5938c4aaffb225dff224314432d6008602ad4fb76b38f79c，26 ZIP 条目、23 个声明文件。各自 .vsix.sha256 精确绑定文件名。验收日志、确定包和指纹位于 C:/Users/ZLK/AppData/Local/Temp/simpleex-0378-acceptance-20261018。
 
 源码、稳定发行和安装回执完成后补记。本记录验收回执于打包后补充，不改变已冻结包。真实窗口与真实服务器删除尚未执行验收，等待用户重载并重新进行精确路径双确认。
+
+发行与安装回执：SimpleSFTP 源码 b31655a08dff8afd2914aaffee7d68040b2ca85d、SimpleExperiment 源码 d31dc8280eb27e86d2de8b0894dd6959d8d71113 均普通推送各自 origin/master，fetch 核对一致。[SimpleSFTP v0.2.98](https://github.com/zlinkw/SimpleSFTP/releases/tag/v0.2.98) 先发布并核对真实 Latest，再发布 [SimpleExperiment v0.5.378](https://github.com/zlinkw/SimpleExperiment/releases/tag/v0.5.378)；两者 tag、targetCommitish 绑定上述源码提交，draft=false、prerelease=false。
+
+实际旧版 0.5.377 ReleaseClient 从公开 Latest 识别两项更新，并下载两个 VSIX 及各自 .vsix.sha256。精确名称、平台、身份、大小、SHA256、GitHub digest 和冻结字节全部一致。验证记录 live-release-verification.json 保留在上述隔离验收目录。
+
+显式各执行一次 npm run install:latest，先安装 SimpleSFTP 0.2.98，再安装 SimpleExperiment 0.5.378；无 force、无降级。立即核对已安装版本、SimpleSFTP 23 个声明文件、SimpleExperiment 384 个 dist 文件与 simpleex.cmd 均符合发布字节；simpleex --help 和 CLI 入口核对通过。安装后停止两套插件 API/面板及服务器操作，等待用户 Developer: Reload Window。未重放旧删除，未删除用户项目/服务器文件，未部署或重启远端 Agent。真实删除须在重载后由用户重新核对完整路径并完成双确认。本回执为打包后文档，不改变已发布包。
