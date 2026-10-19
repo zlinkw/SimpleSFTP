@@ -57,7 +57,18 @@ try:
     assert absent["target"]["missing"] and absent["executorsChecked"] and not absent["executors"]
     assert observe(deletion)["state"]=="completed"
     (root/"outputs/remove").mkdir();(root/"outputs/remove"/"new.txt").write_text("new job",encoding="utf-8")
-    assert observe(deletion)["state"]=="changed"
+    # C3 contract: the persisted completion identity is authoritative. A recreated
+    # canonical directory is new-run data; replay must report completed and never
+    # re-delete or re-open a window for the finished operation.
+    after_recreate=observe(deletion)
+    assert after_recreate["state"]=="completed" and after_recreate.get("verifiedBy")=="completion_receipt",after_recreate
+    replay=subprocess.run([sys.executable,"-B",str(engine)],input=json.dumps({**deletion,"action":"managed-start"}),capture_output=True,text=True,timeout=2,check=True).stdout
+    replayed=json.loads(replay)
+    assert replayed["state"]=="completed" and replayed.get("verifiedBy")=="completion_receipt",replay
+    assert (root/"outputs/remove"/"new.txt").read_text(encoding="utf-8")=="new job"
+    panes=subprocess.run(["tmux","list-panes","-a","-F","#{@sftp_cleanup}"],capture_output=True,text=True,timeout=1,check=True).stdout
+    # Self close released the exact pane: no bound cleanup pane remains.
+    assert not [line for line in panes.splitlines() if line.strip()],panes
     move=frozen("outputs/move","move")
     run({**move,"action":"managed-start"})
     await_done(move)

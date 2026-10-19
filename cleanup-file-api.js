@@ -52,7 +52,7 @@ class CleanupFileApi {
     const pathOnly = params.authorizationMode === "confirmed_paths";
     if (pathOnly && action !== "delete") fail("INVALID_ACTION");
     const observationMode = params.observationMode === "managed_tmux" || pathOnly ? node?.kind === "local" ? "filesystem" : "tmux" : undefined;
-    if (!node?.root || !["move", "delete", "restore"].includes(action) || !Array.isArray(targets) || !targets.length || targets.length > 500) fail("INVALID_REQUEST");
+    if (!node?.root || !["move", "delete", "restore", "isolate"].includes(action) || !Array.isArray(targets) || !targets.length || targets.length > 500) fail("INVALID_REQUEST");
     if (!pathOnly) await this.activity(node);
     const rows = []; let identity;
     for (const original of targets) {
@@ -61,16 +61,29 @@ class CleanupFileApi {
       else if (target.authorizationMode !== undefined) fail("INVALID_AUTHORIZATION_MODE");
       if (!target || !["file", "directory"].includes(target.type)) fail("UNCERTAIN_TYPE");
       if (target.archiveBatch !== undefined && !/^job-[a-f0-9]{48}$/.test(target.archiveBatch)) fail("UNSAFE_ARCHIVE_BATCH");
+      // C1: a controlled fast isolation always lands in an explicit job batch
+      // derived from this rerun intent; recovery of the same intent is stable.
+      if (action === "isolate" && target.archiveBatch === undefined) fail("UNSAFE_ARCHIVE_BATCH");
+      if (target.requiredInputs !== undefined && (!Array.isArray(target.requiredInputs) || target.requiredInputs.length > 200
+        || target.requiredInputs.some(name => typeof name !== "string" || !name || name.length > 4096
+          || /[\\\x00-\x1f:*?[\]{}]/.test(name) || name.startsWith("/")
+          || name.split("/").some(part => part === "" || part === "." || part === "..")))) fail("INVALID_REQUEST");
+      // C4: confirmed-path permanent deletion reaches only registered isolated
+      // artifact subtrees; the clean_dir root, MANIFEST, locks and runtime stay out.
+      const archivedDelete = pathOnly && /^clean_dir\/job-[a-f0-9]{48}\//.test(String(target.relativePath || ""));
+      if (pathOnly && String(target.relativePath || "").startsWith("clean_dir/") && !archivedDelete) fail("UNSAFE_DESTINATION");
       const archivePrefix = "clean_dir/" + (target.archiveBatch ? target.archiveBatch + "/" : "");
-      if (action === "restore" ? !target.relativePath?.startsWith(archivePrefix) || target.destination !== target.relativePath.slice(archivePrefix.length)
+      if (archivedDelete ? target.destination !== target.relativePath
+        : action === "restore" ? !target.relativePath?.startsWith(archivePrefix) || target.destination !== target.relativePath.slice(archivePrefix.length)
         : target.destination !== archivePrefix + target.relativePath) fail("UNSAFE_DESTINATION");
-      const result = await this.checked({ node, root: node.root, action: "inspect", archived: action === "restore", target });
+      const result = await this.checked({ node, root: node.root, action: "inspect", archived: action === "restore",
+        ...(action === "isolate" ? { isolate: true } : {}), target });
       if (identity && hash(identity) !== hash(result.rootIdentity)) fail("ROOT_IDENTITY_CHANGED");
       identity = result.rootIdentity;
       rows.push({ ...copy(target), ...result.target, destination: target.destination });
     }
     const row = { token: crypto.randomBytes(24).toString("hex"), operationId: "cleanup-" + crypto.randomBytes(16).toString("hex"), node: copy(node), rootIdentity: identity,
-      action, observationMode, authorizationMode: pathOnly ? "confirmed_paths" : undefined, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, managedObservation: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, handleScan: pathOnly ? "confirmed_paths" : observationMode ? "managed_tmux" : "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
+      action, observationMode, authorizationMode: pathOnly ? "confirmed_paths" : undefined, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, managedObservation: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: action === "isolate" ? 1 : undefined, requiredInputGuard: action === "isolate" ? 1 : undefined, registeredIsolationDeletion: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1, handleScan: pathOnly ? "confirmed_paths" : observationMode ? "managed_tmux" : "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
     row.tmuxSessionPrefix = tmuxSessionPrefix;
     row.targetDigests = rows.map(targetHash);
     row.digest = hash({ node: row.node, rootIdentity: identity, action, targets: rows, safety: row.safety, tmuxSessionPrefix });
@@ -161,7 +174,8 @@ class CleanupFileApi {
           } catch (error) {
             if (error.code !== "SOURCE_RECREATED_OR_NOT_MOVED") throw error;
             // The remote lock must have settled; an unchanged source with absent destination can retry.
-            const unchanged = await this.checked({ ...request, action: "inspect", archived: row.action === "restore" });
+            const unchanged = await this.checked({ ...request, action: "inspect", archived: row.action === "restore",
+              ...(row.action === "isolate" ? { isolate: true } : {}) });
             if (unchanged.target.fingerprint !== request.target.fingerprint || hash(unchanged.rootIdentity) !== hash(row.rootIdentity)) fail("SOURCE_RECREATED_OR_CHANGED");
             row.states[index] = "pending"; await this.save(row);
           }
@@ -169,7 +183,8 @@ class CleanupFileApi {
         // Preflight the complete node batch again before the first mutation.
         for (let i = 0; i < row.targets.length; i++) {
           if (row.states[i] === "completed") continue;
-          const result = await this.checked({ ...request, action: "inspect", archived: row.action === "restore", target: row.targets[i] });
+          const result = await this.checked({ ...request, action: "inspect", archived: row.action === "restore",
+            ...(row.action === "isolate" ? { isolate: true } : {}), target: row.targets[i] });
           if (hash(result.rootIdentity) !== hash(row.rootIdentity) || Boolean(result.target.missing) !== Boolean(row.targets[i].missing)
             || result.target.fingerprint !== row.targets[i].fingerprint) fail("PREVIEW_CHANGED");
         }
@@ -185,7 +200,7 @@ class CleanupFileApi {
       return { ok: true, state: "executing", executor: { kind: "active_local_transfer" } };
     const frozen = row.targets[index];
     const compact = row.observationMode === "tmux" && ["executing", "completed"].includes(row.states[index]);
-    const target = compact ? Object.fromEntries(["relativePath", "destination", "type", "fingerprint", "contentFingerprint", "inode", "authorizationMode"]
+    const target = compact ? Object.fromEntries(["relativePath", "destination", "type", "fingerprint", "contentFingerprint", "inode", "fingerprintMode", "authorizationMode"]
       .filter(key => frozen[key] !== undefined).map(key => [key, frozen[key]])) : frozen;
     return this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
       action: "managed-observe", cleanupAction: row.action, localObservation: row.observationMode === "filesystem",
@@ -226,7 +241,8 @@ class CleanupFileApi {
             return { ok: true, state: "completed", receipt: settled.receipt };
           } catch (error) { if (error.code !== "SOURCE_RECREATED_OR_NOT_MOVED") throw error; }
         }
-        const unchanged = await this.checked({ ...request, action: "inspect", archived: row.action === "restore" });
+        const unchanged = await this.checked({ ...request, action: "inspect", archived: row.action === "restore",
+          ...(row.action === "isolate" ? { isolate: true } : {}) });
         if (unchanged.target.fingerprint !== target.fingerprint || hash(unchanged.rootIdentity) !== hash(row.rootIdentity)) fail("SOURCE_RECREATED_OR_CHANGED");
         row.states[index] = "pending"; await this.save(row); return { ok: true, state: "pending" };
       });

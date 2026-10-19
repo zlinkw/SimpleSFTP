@@ -30,7 +30,7 @@ def decode_request(raw):
     # Replies already permit a 16 MiB frozen inventory. Large authenticated
     # inventory-bearing lifecycle requests get a separate, still bounded budget.
     if len(raw) > 1048576 and (not isinstance(inventory, list) or request.get("action") not in
-            ("managed-start", "managed-observe", "delete", "move", "restore", "inspect", "check", "verify", "settle")):
+            ("managed-start", "managed-observe", "delete", "move", "restore", "isolate", "inspect", "check", "verify", "settle")):
         deny("REQUEST_TOO_LARGE")
     return request
 
@@ -535,14 +535,28 @@ def delete_directory(root, full, inventory, base="", metadata_only=False, nested
 
 
 def audit(root, row):
-    manifest = path_guard(root, "clean_dir/MANIFEST.md", True, True)
-    if os.path.lexists(manifest) and os.lstat(manifest).st_nlink != 1:
-        deny("SHARED_HARDLINK")
-    os.makedirs(os.path.join(root, "clean_dir"), exist_ok=True)
-    with open(os.path.join(root, "clean_dir", "MANIFEST.md"), "a", encoding="utf-8", newline="\n") as stream:
-        stream.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    # A MANIFEST append is a short control transaction; it must never be the
+    # reason a background deletion holds the root lock for a long traversal.
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            control = mutation_lock(root)
+            break
+        except GuardError as error:
+            if error.code != "OPERATION_BUSY" or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+    try:
+        manifest = path_guard(root, "clean_dir/MANIFEST.md", True, True)
+        if os.path.lexists(manifest) and os.lstat(manifest).st_nlink != 1:
+            deny("SHARED_HARDLINK")
+        os.makedirs(os.path.join(root, "clean_dir"), exist_ok=True)
+        with open(os.path.join(root, "clean_dir", "MANIFEST.md"), "a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        control.close()
 
 
 def mutation_lock(root):
@@ -565,6 +579,209 @@ def mutation_lock(root):
     return stream
 
 
+# --- Controlled fast isolation, registered archive deletion, and per-subtree
+# single-writer locks (paired plan C1-C4). The root mutation lock is reserved
+# for short control transactions (window admission, MANIFEST append). Long
+# traversals hold only the exact isolation subtree chain. ---
+ARCHIVED_BATCH_RE = re.compile(r"^clean_dir/(job-[a-f0-9]{48})/(.+)$")
+
+
+def archived_control_rel(target):
+    """Exact confirmed-path deletion target for one registered isolated subtree."""
+    rel = target.get("relativePath")
+    if target.get("authorizationMode") != "confirmed_paths" or not isinstance(rel, str):
+        return None
+    return rel if ARCHIVED_BATCH_RE.match(rel) else None
+
+
+def isolation_control_rel(destination_rel):
+    return "clean_dir/.operations/isolation/" + hashlib.sha256(
+        ("isolation:" + os.path.normcase(destination_rel)).encode("utf-8")).hexdigest() + ".json"
+
+
+def completion_control_rel(key):
+    return "clean_dir/.operations/managed/complete-" + key + ".json"
+
+
+def read_control_json(root, control_rel, limit=65536):
+    full = path_guard(root, control_rel, True, True)
+    if not os.path.lexists(full):
+        return None
+    before = os.lstat(full)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > limit:
+        deny("CLEANUP_CONTROL_CHANGED", full)
+    with open(full, "rb") as stream:
+        raw = stream.read(limit + 1)
+    after = os.lstat(full)
+    if len(raw) > limit or (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+        deny("CLEANUP_CONTROL_CHANGED", full)
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        deny("CLEANUP_CONTROL_CHANGED", full)
+    if not isinstance(value, dict):
+        deny("CLEANUP_CONTROL_CHANGED", full)
+    return value
+
+
+def write_control_json(root, control_rel, value):
+    full = path_guard(root, control_rel, True, True)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    path_guard(root, control_rel, True, True)
+    temp = full + "." + os.urandom(6).hex() + ".tmp"
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    with open(temp, "xb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temp, full)
+
+
+def isolation_state(root, destination_rel):
+    record = read_control_json(root, isolation_control_rel(destination_rel))
+    if record is None:
+        return None
+    if record.get("schemaVersion") != 1 or record.get("destination") != destination_rel:
+        deny("CLEANUP_CONTROL_CHANGED")
+    return record
+
+
+def register_isolation(root, destination_rel, source_rel, operation_id, value, moment):
+    # The pending isolation mapping survives a lost response; it is removed
+    # only by a user-confirmed permanent deletion or a completed restore.
+    write_control_json(root, isolation_control_rel(destination_rel), {
+        "schemaVersion": 1, "state": "isolated", "operationId": operation_id, "destination": destination_rel,
+        "source": source_rel, "type": value["type"], "inode": value["inode"], "isolatedAt": moment})
+
+
+def top_identity(full, expected_type):
+    st = os.lstat(full)
+    actual = "directory" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "unknown"
+    if actual != expected_type:
+        deny("TYPE_CHANGED")
+    row = {"type": actual, "device": str(st.st_dev), "inode": str(st.st_ino), "mtime": str(st.st_mtime_ns), "ctime": str(st.st_ctime_ns)}
+    if actual == "file":
+        row["size"] = st.st_size
+    row["fingerprint"] = digest({"fingerprintMode": "top_level", **row})
+    return row
+
+
+FAST_MANIFEST_NAMES = ("artifact_manifest.json", "formal_job_owner.json", "run_wrapper_report.json", "checkpoint_manifest.json")
+
+
+def top_manifest_rows(root, rel, full):
+    rows = []
+    if not os.path.isdir(full):
+        return rows
+    for name in FAST_MANIFEST_NAMES + ("config.yaml", "config_snapshot.yaml"):
+        file = path_guard(root, rel + "/" + name, True, True)
+        if not os.path.isfile(file) or os.path.getsize(file) > 1024 * 1024:
+            continue
+        rows.append({**contents(root, file, "file")["inventory"][0], "path": name})
+    return rows
+
+
+def isolate_inspect(root, target, operation_id=None):
+    """C1 pre-write authorization bounded to top-level identity plus declared
+    ownership and real writer checks. Never hashes tree contents in foreground."""
+    rel = relative(target["relativePath"])
+    full = path_guard(root, rel)
+    checked_parent(root, full)
+    if target.get("authorizationMode") == "confirmed_paths":
+        deny("INVALID_AUTHORIZATION_MODE", full, "快速隔离必须走精确声明与确认范围")
+    tracked_dirty(root, rel)
+    value = top_identity(full, target["type"])
+    value["fingerprintMode"] = "top_level"
+    value["inventory"] = top_manifest_rows(root, rel, full)
+    value["manifests"] = manifest_records(root, full, value)
+    value["references"] = []
+    owner = target.get("expectedOwner")
+    if isinstance(owner, dict) and owner.get("resultPathPolicy") == "declared":
+        owner_hash = formal_cleanup_owner(root, target, owner)
+        value["formalOwnerSha256"] = owner_hash
+        value["fingerprint"] = digest({"target": value["fingerprint"], "formalOwnerSha256": owner_hash})
+    if target.get("activityEvidenceMode") == "managed_tmux":
+        managed_active(root, target, full, value)
+    for executor in current_cleanup_executors(root, full, operation_id):
+        deny("ACTIVE_CLEANUP_EXECUTOR", executor["windowId"], "已有清理执行器正在处理重叠目标")
+    for name in target.get("requiredInputs") or ():
+        input_full = path_guard(root, relative(name), True, True)
+        if os.path.lexists(input_full) and (input_full == full or below(full, input_full)):
+            deny("ISOLATE_REQUIRED_INPUT_OVERLAP", input_full, "新运行仍按原路径引用该必需输入，不能移动其依赖源")
+    destination = path_guard(root, target["destination"], True, True)
+    if os.path.lexists(destination):
+        deny("DESTINATION_EXISTS")
+    ancestor = os.path.dirname(destination)
+    while ancestor != root and not os.path.lexists(ancestor):
+        ancestor = os.path.dirname(ancestor)
+    if os.stat(ancestor).st_dev != os.stat(full).st_dev:
+        deny("CROSS_FILESYSTEM", destination, "隔离必须与源在同一文件系统，不静默降级为复制")
+    value.update({"absolutePath": full, "parent": os.path.dirname(full), "leaf": os.path.basename(full), "destination": destination})
+    return value
+
+
+def subtree_lock_rel(component_rel):
+    return "clean_dir/.operations/locks/" + hashlib.sha256(
+        ("subtree:" + os.path.normcase(component_rel)).encode("utf-8")).hexdigest() + ".lock"
+
+
+def acquire_target_locks(root, rels):
+    """C2 exact subtree single writer: leaf exclusive, ancestors shared.
+    Non-overlapping targets run in parallel; parent/child overlap blocks."""
+    wanted = {}
+    for rel in rels:
+        parts = relative(rel).split("/")
+        for index in range(1, len(parts) + 1):
+            component = "/".join(parts[:index])
+            mode = "exclusive" if index == len(parts) else "shared"
+            wanted[component] = "exclusive" if (mode == "exclusive" or wanted.get(component) == "exclusive") else "shared"
+    opened = []
+    try:
+        for component in sorted(wanted, key=subtree_lock_rel):
+            full = path_guard(root, subtree_lock_rel(component), True, True)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            path_guard(root, subtree_lock_rel(component), True, True)
+            stream = open(full, "a+b")
+            try:
+                if os.name == "nt":
+                    # msvcrt offers no shared range: Windows also serializes siblings.
+                    import msvcrt
+                    stream.seek(0)
+                    if not stream.read(1):
+                        stream.write(b"0"); stream.flush()
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), (fcntl.LOCK_EX if wanted[component] == "exclusive" else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+            except OSError:
+                stream.close()
+                deny("OPERATION_BUSY")
+            opened.append(stream)
+    except BaseException:
+        for stream in opened:
+            stream.close()
+        raise
+    return opened
+
+
+def finalize_managed_window(root, request):
+    """C3 server-side self close: persist the minimal anti-replay completion
+    identity first, then release remain-on-exit only on this request's exactly
+    bound window. Failures keep the window for inspection; never re-delete."""
+    key = managed_key({**request, "cleanupAction": request["action"]})
+    write_control_json(root, completion_control_rel(key), {"schemaVersion": 1, "state": "completed", "cleanupKey": key,
+                                                           "operationId": request["operationId"], "action": request["action"], "completedAt": time.time()})
+    try:
+        fields = managed_tmux(["display-message", "-p", "#{window_id}\t#{@sftp_cleanup}"]).split("\t")
+        if len(fields) != 2 or fields[1] != key:
+            return {"finalized": False, "receiptWritten": True}
+        managed_tmux(["set-option", "-w", "-t", fields[0], "remain-on-exit", "off"])
+        return {"finalized": True, "receiptWritten": True}
+    except GuardError:
+        return {"finalized": False, "receiptWritten": True}
+
+
 def managed_tmux(args):
     result = subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=5)
     if result.returncode:
@@ -584,7 +801,7 @@ def managed_key(request):
                    "path": request["target"]["relativePath"], "action": request["cleanupAction"], "fingerprint": request["target"]["fingerprint"]})
 
 
-def current_cleanup_executors(root, full):
+def current_cleanup_executors(root, full, exclude_operation=None):
     if os.name == "nt":
         return []
     result = []
@@ -597,6 +814,9 @@ def current_cleanup_executors(root, full):
         except (ValueError, UnicodeError):
             deny("CLEANUP_WINDOW_BINDING_UNVERIFIED", fields[0])
         if binding.get("root") != root:
+            continue
+        # A managed window is never an external writer against itself.
+        if exclude_operation is not None and binding.get("operationId") == exclude_operation:
             continue
         for name in ("relativePath", "destination"):
             if not binding.get(name):
@@ -637,7 +857,7 @@ def managed_active(root, target, full, value):
 
 def managed_delete_progress(root, target):
     inventory = target.get("inventory") or []
-    source = path_guard(root, target["relativePath"], False, True)
+    source = path_guard(root, target["relativePath"], archived_control_rel(target) is not None, True)
     expected = {row["path"]: row for row in inventory}
     seen, mounts = set(), mount_points()
     def scan(full, rel):
@@ -696,7 +916,8 @@ def frozen_observation_target(root, request, key):
     if not isinstance(target, dict) or frozen_target_digest(target) != expected or record.get("root") != root or record.get("rootIdentity") != request.get("rootIdentity") \
             or record.get("operationId") != request.get("operationId") or record.get("action") != request.get("cleanupAction") or record.get("managedInner") is not True:
         deny("CLEANUP_INPUT_CHANGED", file)
-    if any(target.get(name) != request["target"].get(name) for name in ("relativePath", "destination", "type", "fingerprint", "contentFingerprint", "inode", "authorizationMode")):
+    if any(target.get(name) != request["target"].get(name) for name in
+           ("relativePath", "destination", "type", "fingerprint", "contentFingerprint", "inode", "fingerprintMode", "authorizationMode")):
         deny("CLEANUP_INPUT_CHANGED", file)
     return target
 
@@ -706,7 +927,8 @@ def managed_observe(request):
     if identity != request.get("rootIdentity"):
         deny("ROOT_IDENTITY_CHANGED")
     key, target = managed_key(request), request["target"]
-    source = path_guard(root, target["relativePath"], request["cleanupAction"] == "restore", True)
+    archived_source = request["cleanupAction"] == "restore" or archived_control_rel(target) is not None
+    source = path_guard(root, target["relativePath"], archived_source, True)
     destination = path_guard(root, target["destination"], True, True)
     executor = None
     inventory = "" if request.get("localObservation") else managed_tmux(["list-panes", "-a", "-F", "#{window_id}\t#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{@sftp_cleanup}"])
@@ -717,6 +939,18 @@ def managed_observe(request):
                         "exitCode": int(fields[3]) if re.fullmatch(r"-?\d+", fields[3]) else None}
             if not executor["dead"]:
                 break
+    # A persisted completion identity is authoritative even while the bound
+    # pane lingers: never re-delete and never re-capture a recreated canonical
+    # directory as this operation's source.
+    if not request.get("localObservation"):
+        receipt = read_control_json(root, completion_control_rel(key), 4096)
+        if receipt is not None and (receipt.get("schemaVersion") != 1 or receipt.get("cleanupKey") != key
+                or receipt.get("operationId") != request.get("operationId") or receipt.get("action") != request.get("cleanupAction")
+                or receipt.get("state") != "completed"):
+            deny("CLEANUP_INPUT_CHANGED")
+        if receipt is not None:
+            return {"ok": True, "state": "completed", "verifiedBy": "completion_receipt", "irreversible": request["cleanupAction"] == "delete",
+                    "finalizePending": bool(executor and not executor["dead"]), "rootIdentity": identity, "executor": executor}
     if request.get("frozenTargetDigest") and (executor and not executor["dead"] or os.path.lexists(source)):
         frozen = frozen_observation_target(root, request, key)
         if frozen is None:
@@ -732,11 +966,19 @@ def managed_observe(request):
             return {"ok": True, "state": "completed", "verifiedBy": "source_absence", "irreversible": True, "rootIdentity": identity, "executor": executor}
         if not os.path.lexists(destination):
             return {"ok": True, "state": "partial", "code": "SOURCE_AND_DESTINATION_MISSING", "rootIdentity": identity, "executor": executor}
+        if target.get("fingerprintMode") == "top_level":
+            after = top_identity(destination, target["type"])
+            if after["inode"] != target.get("inode") or after["device"] != target.get("device"):
+                return {"ok": True, "state": "changed", "code": "DESTINATION_CHANGED", "rootIdentity": identity, "executor": executor}
+            return {"ok": True, "state": "completed", "verifiedBy": "destination_identity", "rootIdentity": identity, "executor": executor}
         value = contents(root, destination, target["type"])
         if value["contentFingerprint"] != target["contentFingerprint"] or value["inode"] != target["inode"]:
             return {"ok": True, "state": "changed", "code": "DESTINATION_CHANGED", "rootIdentity": identity, "executor": executor}
         return {"ok": True, "state": "completed", "verifiedBy": "destination_identity", "rootIdentity": identity, "executor": executor}
-    value = inspect(root, target, request["cleanupAction"] == "restore")
+    if target.get("fingerprintMode") == "top_level":
+        value = isolate_inspect(root, target, request.get("operationId"))
+    else:
+        value = inspect(root, target, archived_source)
     state = "pending" if value["fingerprint"] == target["fingerprint"] else "changed"
     return {"ok": True, "state": state, "rootIdentity": identity, "executor": executor}
 
@@ -793,13 +1035,13 @@ def main(request):
         deny("OWNERSHIP_UNVERIFIED")
     action = request["action"]
     if request.get("target", {}).get("authorizationMode") == "confirmed_paths":
-        if action in ("move", "restore", "settle") or action in ("managed-start", "managed-observe") and request.get("cleanupAction") != "delete":
+        if action in ("move", "restore", "settle", "isolate") or action in ("managed-start", "managed-observe") and request.get("cleanupAction") != "delete":
             deny("INVALID_AUTHORIZATION_MODE")
     if action == "managed-observe":
         return managed_observe(request)
     if action == "managed-start":
         return managed_start(request)
-    if action not in ("check", "verify", "inventory", "inspect", "move", "delete", "restore", "settle"):
+    if action not in ("check", "verify", "inventory", "inspect", "isolate", "move", "delete", "restore", "settle"):
         deny("UNKNOWN_ACTION")
     if action == "inventory":
         target = request["target"]
@@ -836,11 +1078,23 @@ def main(request):
         if request.get("rootIdentity") and request["rootIdentity"] != identity:
             deny("ROOT_IDENTITY_CHANGED")
         target = request["target"]
-        source = path_guard(root, target["relativePath"], True, True)
+        archived_rel = archived_control_rel(target)
+        already_deleted = False
+        if archived_rel is not None:
+            archived_state = isolation_state(root, archived_rel)
+            already_deleted = bool(archived_state and archived_state.get("state") == "deleted")
+        source = path_guard(root, target["relativePath"], archived_rel is not None, True)
         destination = path_guard(root, target["destination"], True, True)
+        if already_deleted:
+            # A finished permanent deletion stays completed even if the same
+            # name reappears; a rebuilt path never authorizes re-deletion.
+            return {"ok": True, "state": "completed", "verifiedBy": "isolation_deleted", "irreversible": True, "rootIdentity": identity}
         if os.path.lexists(source):
             if action == "check":
-                value = inspect(root, target) if target.get("authorizationMode") == "confirmed_paths" or (target.get("expectedOwner") or {}).get("resultPathPolicy") == "declared" else contents(root, source, target["type"])
+                if target.get("fingerprintMode") == "top_level":
+                    value = isolate_inspect(root, target, request.get("operationId"))
+                else:
+                    value = inspect(root, target) if target.get("authorizationMode") == "confirmed_paths" or (target.get("expectedOwner") or {}).get("resultPathPolicy") == "declared" else contents(root, source, target["type"])
                 if value["fingerprint"] != target["fingerprint"]:
                     deny("SOURCE_RECREATED_OR_CHANGED")
                 if os.path.lexists(destination):
@@ -853,16 +1107,74 @@ def main(request):
             return {"ok": True, "irreversible": True}
         if not os.path.lexists(destination):
             deny("RECEIPT_UNVERIFIED")
-        value = contents(root, destination, target["type"])
-        if value["contentFingerprint"] != target["contentFingerprint"] or value["inode"] != target["inode"]:
-            deny("CONTENT_CHANGED")
+        if target.get("fingerprintMode") == "top_level":
+            value = top_identity(destination, target["type"])
+            if value["inode"] != target.get("inode") or value["device"] != target.get("device"):
+                deny("CONTENT_CHANGED")
+        else:
+            value = contents(root, destination, target["type"])
+            if value["contentFingerprint"] != target["contentFingerprint"] or value["inode"] != target["inode"]:
+                deny("CONTENT_CHANGED")
         if action == "check":
             return {"ok": True, "state": "completed", "rootIdentity": identity}
         if action == "settle":
-            audit(root, {"operationId": request["operationId"], "action": request.get("settledAction", "move"), "phase": "completed-after-settlement", "source": source, "destination": destination, **value})
-        return {"ok": True, "rootIdentity": identity, "receipt": value}
+            if target.get("fingerprintMode") == "top_level":
+                # Crash-window repair: the rename committed but the completion
+                # record never did. Trust only the frozen binding; re-register
+                # idempotently, never re-move and never auto-rollback.
+                destination_rel = os.path.relpath(destination, root).replace(os.sep, "/")
+                if isolation_state(root, destination_rel) is None:
+                    register_isolation(root, destination_rel, relative(target["relativePath"]), request["operationId"],
+                                       {"type": target["type"], "inode": target.get("inode")}, time.time())
+            audit(root, {"operationId": request["operationId"], "action": request.get("settledAction", "move"), "phase": "completed-after-settlement",
+                         "source": source, "destination": destination,
+                         **({"fingerprintMode": "top_level", "fingerprint": target.get("fingerprint")} if target.get("fingerprintMode") == "top_level" else value)})
+        return {"ok": True, "rootIdentity": identity, "receipt": ({"fingerprintMode": "top_level", "fingerprint": target.get("fingerprint"), "destination": value}
+                                                                  if target.get("fingerprintMode") == "top_level" else value)}
     target = request["target"]
-    archived = action == "restore" or (action == "inspect" and request.get("archived") is True)
+    if request.get("isolate") is True:
+        if action != "inspect":
+            deny("INVALID_REQUEST")
+        return {"ok": True, "rootIdentity": identity, "target": isolate_inspect(root, target, request.get("operationId"))}
+    if action == "isolate":
+        batch = target.get("archiveBatch")
+        if batch is None or not isinstance(batch, str) or not re.fullmatch(r"job-[a-f0-9]{48}", batch):
+            deny("UNSAFE_ARCHIVE_BATCH")
+        if target.get("destination") != "clean_dir/" + batch + "/" + target["relativePath"]:
+            deny("UNSAFE_DESTINATION")
+        value = isolate_inspect(root, target, request.get("operationId"))
+        record = {"operationId": request["operationId"], "action": "isolate", "source": value["absolutePath"], "destination": value["destination"],
+                  "type": target["type"], "fingerprint": value["fingerprint"], "sourceRelativePath": target["relativePath"], "time": time.time()}
+        audit(root, {**record, "phase": "intent"})
+        checked = isolate_inspect(root, target, request.get("operationId"))
+        if checked["fingerprint"] != value["fingerprint"]:
+            deny("CONTENT_CHANGED")
+        path_guard(root, target["destination"], True, True)
+        os.makedirs(os.path.dirname(value["destination"]), exist_ok=True)
+        path_guard(root, target["destination"], True, True)
+        child = parent_cd(root, value["absolutePath"])
+        no_replace(child, value["destination"])
+        # Foreground proof is top-level identity plus the rename result, not a
+        # recursive content hash of the isolated tree.
+        after = top_identity(value["destination"], target["type"])
+        if after["inode"] != value["inode"] or after["device"] != value["device"] or after["mtime"] != value["mtime"]:
+            deny("MOVE_VERIFICATION_FAILED")
+        if os.path.lexists(value["absolutePath"]):
+            deny("SOURCE_STILL_EXISTS")
+        register_isolation(root, os.path.relpath(value["destination"], root).replace(os.sep, "/"), relative(target["relativePath"]),
+                           request["operationId"], value, time.time())
+        audit(root, {**record, "phase": "completed"})
+        return {"ok": True, "rootIdentity": identity, "receipt": {**record, "phase": "completed"}}
+    archived_control = archived_control_rel(target)
+    if archived_control is not None and action == "delete":
+        archived_state = isolation_state(root, archived_control)
+        if archived_state and archived_state.get("state") == "deleted":
+            # Replay of a completed permanent deletion: minimal identity only.
+            return {"ok": True, "rootIdentity": identity, "alreadyDeleted": True, "state": "completed", "verifiedBy": "isolation_deleted"}
+        if not archived_state or archived_state.get("state") != "isolated":
+            deny("NOT_REGISTERED_ISOLATION", archived_control, "只有已登记的隔离产物子树可以经确认路径永久删除")
+    archived = action == "restore" or (action == "inspect" and request.get("archived") is True) \
+        or (archived_control is not None and action in ("inspect", "delete"))
     if action == "inspect":
         full = path_guard(root, target["relativePath"], archived, True)
         checked_parent(root, full)
@@ -877,7 +1189,10 @@ def main(request):
     if batch is not None and (not isinstance(batch, str) or not re.fullmatch(r"job-[a-f0-9]{48}", batch)):
         deny("UNSAFE_ARCHIVE_BATCH")
     archive_prefix = "clean_dir/" + (batch + "/" if batch else "")
-    if action in ("move", "delete") and target["destination"] != archive_prefix + target["relativePath"]:
+    if archived_control is not None and action == "delete":
+        if target["destination"] != archived_control:
+            deny("UNSAFE_DESTINATION")
+    elif action in ("move", "delete") and target["destination"] != archive_prefix + target["relativePath"]:
         deny("UNSAFE_DESTINATION")
     if action == "restore" and (not target["relativePath"].startswith(archive_prefix) or target["destination"] != target["relativePath"][len(archive_prefix):]):
         deny("UNSAFE_DESTINATION")
@@ -908,6 +1223,16 @@ def main(request):
             deny("MOVE_VERIFICATION_FAILED")
     if os.path.lexists(value["absolutePath"]):
         deny("SOURCE_STILL_EXISTS")
+    if archived_control is not None and action == "delete":
+        # Separate lifecycles: the pending isolation mapping ends here with a
+        # minimal opaque completion identity; no frozen list or fingerprint stays.
+        write_control_json(root, isolation_control_rel(archived_control), {"schemaVersion": 1, "state": "deleted",
+                                                                           "operationId": request["operationId"], "destination": archived_control, "deletedAt": time.time()})
+    if action == "restore" and ARCHIVED_BATCH_RE.match(target["relativePath"]):
+        restored_state = isolation_state(root, target["relativePath"])
+        if restored_state and restored_state.get("state") == "isolated":
+            write_control_json(root, isolation_control_rel(target["relativePath"]), {"schemaVersion": 1, "state": "restored",
+                                                                                     "operationId": request["operationId"], "destination": target["relativePath"], "restoredAt": time.time()})
     if target.get("authorizationMode") != "confirmed_paths":
         audit(root, {**record, "phase": "completed"})
     return {"ok": True, "rootIdentity": identity, "receipt": {**record, "phase": "completed"}}
@@ -915,12 +1240,18 @@ def main(request):
 
 if __name__ == "__main__":
     lock = None
+    locks = []
     request = {}
+    checked_root = None
     try:
         raw = sys.stdin.buffer.read(MAX_CLEANUP_REQUEST_BYTES + 1).rstrip(b"\x00")
         request = decode_request(raw)
-        if request.get("action") in ("move", "delete", "restore", "settle", "managed-start"):
+        action = request.get("action")
+        if action in ("move", "delete", "restore", "settle", "isolate", "managed-start"):
             checked_root, _ = root_guard(request["root"])
+        if action == "managed-start":
+            # C2: the root lock stays a short control transaction covering the
+            # frozen input write and exact window admission only.
             deadline = time.monotonic() + (3 if request.get("managedInner") else 0)
             while True:
                 try:
@@ -930,7 +1261,31 @@ if __name__ == "__main__":
                     if error.code != "OPERATION_BUSY" or time.monotonic() >= deadline:
                         raise
                     time.sleep(0.02)
+        elif action in ("move", "delete", "restore", "settle", "isolate"):
+            # C2: long traversals hold only the exact isolation subtree chain,
+            # so a background deletion never parks the next foreground isolate.
+            target = request.get("target") or {}
+            rels = [value for value in (target.get("relativePath"),
+                                        None if action == "delete" else target.get("destination"))
+                    if isinstance(value, str) and value]
+            deadline = time.monotonic() + (3 if request.get("managedInner") else 0)
+            while True:
+                try:
+                    locks = acquire_target_locks(checked_root, rels)
+                    break
+                except GuardError as error:
+                    if error.code != "OPERATION_BUSY" or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.02)
         result = main(request)
+        # C3: the server-side wrapper finalizes its own exact pane. The minimal
+        # anti-replay completion identity is persisted before the window is
+        # released; failure keeps remain-on-exit on and the window preserved.
+        if request.get("managedInner") is True and result.get("ok") and action in ("delete", "move", "restore", "isolate"):
+            try:
+                result["finalize"] = finalize_managed_window(checked_root, request)
+            except GuardError as error:
+                result["finalize"] = {"finalized": False, "receiptWritten": False, "code": error.code}
     except GuardError as error:
         result = {"ok": False, "error": {"code": error.code, "message": str(error),
                   **({"blockingPath": error.blocking_path} if error.blocking_path else {}),
@@ -943,6 +1298,8 @@ if __name__ == "__main__":
                   **({"blockingPath": error.filename, "reason": str(error.strerror or type(error).__name__)}
                      if isinstance(error, OSError) and error.filename and os.path.isabs(error.filename) else {})}}
     finally:
+        for stream in locks:
+            stream.close()
         if lock is not None:
             lock.close()
     sys.stdout.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
