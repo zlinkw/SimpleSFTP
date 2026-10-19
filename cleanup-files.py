@@ -18,8 +18,12 @@ import sys
 import time
 
 MAX_CLEANUP_REQUEST_BYTES = 32 * 1024 * 1024
-# Chunked frozen manifests keep every wire message bounded: the server walks
-# once, persists bounded chunks, and never carries a full inventory in JSON.
+# Chunked frozen manifests keep every wire message and the whole process
+# memory bounded: the server streams frozen rows into bounded persisted chunks
+# (peak memory is one chunk plus one directory's names, never the row list)
+# and never carries a full inventory in JSON. MAX_FROZEN_MANIFEST_ENTRIES is a
+# walk-stop guard, not the memory bound. Only registered isolated archives use
+# this chain; ordinary confirmed_paths scopes keep the 50000-entry boundary.
 CHUNKED_MANIFEST_THRESHOLD = 50000
 MAX_FROZEN_MANIFEST_ENTRIES = 2000000
 CHUNKED_MANIFEST_ROWS = 10000
@@ -229,6 +233,78 @@ def contents(root, full, expected_type, metadata_only=False, expected_inventory=
     content = [{k: v for k, v in row.items() if k not in ("mtime", "device", "inode")} for row in rows]
     return {"type": actual, "size": sum(row.get("size", 0) for row in rows), "fingerprint": digest(rows), "contentFingerprint": digest(content), "inventory": rows, "device": str(st.st_dev), "inode": str(st.st_ino),
             **({"fingerprintMode": "metadata"} if metadata_only else {})}
+
+
+def frozen_rows_stream(root, full, shared_inodes=frozenset(), allow_nested_git=True, entry_limit=MAX_FROZEN_MANIFEST_ENTRIES):
+    # Bounded-memory frozen walk for the >50000 chain: it yields exactly the
+    # metadata-only rows contents() would materialize, in the same pre-order,
+    # but never keeps the row list. Process memory stays O(entries of a single
+    # directory + tree depth + one chunk), no matter how large the archive is.
+    st = os.lstat(full)
+    if not stat.S_ISDIR(st.st_mode):
+        deny("TYPE_CHANGED")
+    mounts = mount_points()
+    progress = {"at": 0, "count": 0}
+
+    def report(force=False):
+        now = time.monotonic()
+        if force or now - progress["at"] >= 1:
+            sys.stderr.write("SIMPLE_PROGRESS " + json.dumps({"phase": "verifying", "processedFiles": progress["count"], "processedBytes": 0}) + "\n")
+            sys.stderr.flush()
+            progress["at"] = now
+
+    def emit(row):
+        progress["count"] += 1
+        if progress["count"] > entry_limit:
+            deny("INVENTORY_LIMIT")
+        report()
+        return row
+
+    def visit(value, name):
+        info = os.lstat(value)
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 1024:
+            deny("LINK_OR_REPARSE_POINT", value)
+        if info.st_dev != st.st_dev or (value != full and (os.path.ismount(value) or value in mounts)):
+            deny("MOUNT_ESCAPE", value)
+        if stat.S_ISDIR(info.st_mode):
+            yield emit({"path": name, "type": "directory", "device": str(info.st_dev), "inode": str(info.st_ino),
+                        "mtime": str(info.st_mtime_ns), "ctime": str(info.st_ctime_ns)})
+            for leaf in sorted(os.listdir(value)):
+                relative(leaf)
+                if leaf.lower() == "clean_dir" or leaf.lower() == ".git" and not (allow_nested_git and below(root, full)):
+                    deny("PROTECTED_DESCENDANT", os.path.join(value, leaf),
+                         "归档区受保护，不能随父目录删除" if leaf.lower() == "clean_dir" else "仓库元数据仅允许随双确认的整个子目录删除")
+                yield from visit(os.path.join(value, leaf), name + "/" + leaf if name else leaf)
+        elif stat.S_ISREG(info.st_mode):
+            after = os.lstat(value)
+            if (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                deny("CONTENT_CHANGED")
+            shared = info.st_nlink > 1 or (str(info.st_dev), str(info.st_ino)) in shared_inodes
+            yield emit({"path": name, "type": "file", "size": info.st_size, "mtime": str(info.st_mtime_ns), "device": str(info.st_dev), "inode": str(info.st_ino),
+                        **({"hardlink": True} if shared else {"ctime": str(info.st_ctime_ns)})})
+        else:
+            deny("UNCERTAIN_TYPE", value)
+
+    yield from visit(full, "")
+    report(True)
+
+
+def stream_frozen_preview(root, full, shared_inodes=frozenset(), entry_limit=MAX_FROZEN_MANIFEST_ENTRIES, collect_limit=None):
+    # Single streaming pass: returns (row count, frozen stream digest, rows)
+    # where rows are collected only while they still fit the small-path bound;
+    # once a larger scope is detected the collected list is released.
+    h = hashlib.sha256()
+    count = 0
+    collected = [] if collect_limit else None
+    for row in frozen_rows_stream(root, full, shared_inodes, True, entry_limit):
+        count += 1
+        h.update(json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8") + b"\n")
+        if collected is not None:
+            if len(collected) < collect_limit:
+                collected.append(row)
+            else:
+                collected = None
+    return count, h.hexdigest(), collected
 
 
 def open_handles(full):
@@ -613,65 +689,59 @@ def chunked_manifest_read(root, key, name, limit=262144):
             deny("CLEANUP_INPUT_CHANGED", full)
 
 
-def chunked_delete_rows(root, full, rows, key, nested_git_root, applied, fingerprint, total):
-    # Post-order (descending path) flat application. Fresh runs pre-check every
-    # directory against its frozen child set before anything disappears (the
-    # same guarantee the small path gives per directory); resumed runs keep the
-    # frozen identity checks and the empty-parent rule, so a recreated name or
-    # any new file is refused, never absorbed and never deleted.
-    index = build_inventory_index(rows)
-    ordered = sorted(rows, key=lambda row: row["path"], reverse=True)
-    if applied == 0:
-        # Freeze barrier: every bounded chunk exists and the applied watermark
-        # is persisted before the first unlink, so an interrupted run can only
-        # resume from a fully materialized manifest.
-        for start in range(0, len(ordered), CHUNKED_MANIFEST_ROWS):
-            chunked_manifest_write(root, key, "chunk-%06d.json" % (start // CHUNKED_MANIFEST_ROWS),
-                                   json.dumps(ordered[start:start + CHUNKED_MANIFEST_ROWS], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-        write_control_json(root, "clean_dir/.operations/frozen/%s/summary.json" % key,
-                           {"schemaVersion": 1, "fingerprint": fingerprint, "count": total, "applied": 0})
-        _, children_by_parent = index
-        for row in rows:
-            if row["type"] != "directory":
-                continue
-            probe = os.path.join(full, *row["path"].split("/")) if row["path"] else full
-            if not os.path.isdir(probe):
+def chunked_apply_rows(root, full, rows, run_fresh):
+    # Reversed pre-order application: the frozen stream recorded every directory
+    # strictly before its children, so applying rows in reverse (and chunks from
+    # last to first) guarantees children disappear before their parent without
+    # ever materializing a global sort. A recreated name or any new file fails
+    # the identity or empty-parent check: it is refused, never absorbed, never
+    # deleted, and the watermark only advances after a whole chunk succeeded.
+    for row in reversed(rows):
+        probe = os.path.join(full, *row["path"].split("/")) if row["path"] else full
+        if not os.path.lexists(probe):
+            if run_fresh:
                 deny("DIRECTORY_INVENTORY_CHANGED", probe)
-            expected_names = sorted(child["path"].split("/")[-1] for child in children_by_parent.get(row["path"], ()) if child["path"] != row["path"])
-            if sorted(os.listdir(probe)) != expected_names:
-                deny("DIRECTORY_INVENTORY_CHANGED", probe)
-    # On a resumed run `rows` are exactly the not-yet-applied frozen chunks in
-    # order; their files were materialized by the interrupted run.
-    for start in range(0, len(ordered), CHUNKED_MANIFEST_ROWS):
-        chunk_index = applied + start // CHUNKED_MANIFEST_ROWS
-        for row in ordered[start:start + CHUNKED_MANIFEST_ROWS]:
-            probe = os.path.join(full, *row["path"].split("/")) if row["path"] else full
-            if not os.path.lexists(probe):
-                if applied == 0:
-                    deny("DIRECTORY_INVENTORY_CHANGED", probe)
-                continue
-            if row["type"] == "file":
-                delete_file(root, probe, row, metadata_only=True, nested_git_root=nested_git_root, allow_clean=True)
-                continue
-            if row["type"] != "directory":
-                deny("UNCERTAIN_TYPE", probe)
-            st = os.lstat(probe)
-            if str(st.st_ino) != row["inode"] or str(st.st_dev) != row["device"]:
-                deny("IDENTITY_CHANGED", probe)
-            child = parent_cd(root, probe)
-            if os.listdir(child):
-                deny("DIRECTORY_INVENTORY_CHANGED", probe, "冻结范围内出现新内容，未确认的新文件不会被删除")
-            os.rmdir(child)
-        write_control_json(root, "clean_dir/.operations/frozen/%s/summary.json" % key,
-                           {"schemaVersion": 1, "fingerprint": fingerprint, "count": total, "applied": chunk_index + 1})
-        progress_heartbeat()
+            continue
+        if row["type"] == "file":
+            delete_file(root, probe, row, metadata_only=True, nested_git_root=full, allow_clean=True)
+            continue
+        if row["type"] != "directory":
+            deny("UNCERTAIN_TYPE", probe)
+        st = os.lstat(probe)
+        if str(st.st_ino) != row["inode"] or str(st.st_dev) != row["device"]:
+            deny("IDENTITY_CHANGED", probe)
+        child = parent_cd(root, probe)
+        if os.listdir(child):
+            deny("DIRECTORY_INVENTORY_CHANGED", probe, "冻结范围内出现新内容，未确认的新文件不会被删除")
+        os.rmdir(child)
+
+
+def chunked_read_chunk(root, key, index, expected_digest):
+    full = path_guard(root, "clean_dir/.operations/frozen/%s/chunk-%06d.json" % (key, index), True, True)
+    if not os.path.isfile(full) or os.lstat(full).st_nlink != 1 or os.lstat(full).st_size > 8 * 1024 * 1024:
+        deny("CLEANUP_INPUT_CHANGED", full)
+    with open(full, "rb") as stream:
+        blob = stream.read()
+    if expected_digest is not None and hashlib.sha256(blob).hexdigest() != expected_digest:
+        deny("CLEANUP_INPUT_CHANGED", full, "冻结块内容被篡改，请重新预览并双确认")
+    try:
+        rows = json.loads(blob.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        deny("CLEANUP_INPUT_CHANGED", full)
+    if not isinstance(rows, list):
+        deny("CLEANUP_INPUT_CHANGED", full)
+    return rows
 
 
 def chunked_permanent_delete(root, request, identity):
-    # The only >50000-entry deletion chain: one metadata-only frozen walk (the
-    # same verification strength as the confirmed-path small path), server-local
-    # bounded chunks, resumable per chunk, and only a minimal anti-replay
-    # identity survives completion — never the deleted file list.
+    # The only >50000-entry deletion chain (registered isolated archives with a
+    # confirmed exact path; ordinary confirmed_paths scopes keep the existing
+    # 50000-entry boundary and are NOT advertised as chunked). Every pass is
+    # streaming: two bounded walks (the same metadata-only verification
+    # strength as the confirmed-path small path) re-derive the frozen digest,
+    # then persist hash-bound chunks plus the applied watermark before the
+    # first unlink. Process memory never holds the whole row list. Only a
+    # minimal anti-replay identity survives completion, never the file list.
     target = request["target"]
     if target.get("authorizationMode") != "confirmed_paths" or target.get("type") != "directory" or target.get("chunked") is not True:
         deny("INVALID_REQUEST")
@@ -695,19 +765,54 @@ def chunked_permanent_delete(root, request, identity):
             or summary.get("fingerprint") != target["fingerprint"] or not isinstance(applied, int) or not 0 <= applied <= summary["count"]):
         deny("CLEANUP_INPUT_CHANGED")
     if summary is None:
-        value = contents(root, full, "directory", metadata_only=True, allow_nested_git=True, entry_limit=MAX_FROZEN_MANIFEST_ENTRIES)
-        rows = value["inventory"]
-        if len(rows) < CHUNKED_MANIFEST_THRESHOLD or digest(rows) != target["fingerprint"]:
+        # Pass 1 verifies the confirmed frozen digest with O(1) state; pass 2
+        # re-walks while writing hash-bound chunks. No unlink happens in either
+        # pass, so a scope that changed between confirmations is refused whole,
+        # exactly like the previous whole-tree pre-check barrier.
+        count1, digest1, _ = stream_frozen_preview(root, full, frozenset(), MAX_FROZEN_MANIFEST_ENTRIES, None)
+        if count1 < CHUNKED_MANIFEST_THRESHOLD or digest1 != target["fingerprint"]:
             deny("CONTENT_CHANGED", full, "冻结清单与当前目标不一致，请重新预览并双确认")
-        summary = {"schemaVersion": 1, "fingerprint": target["fingerprint"], "count": len(rows), "applied": 0}
-    else:
-        rows = []
-        for chunk_index in range(applied, (summary["count"] + CHUNKED_MANIFEST_ROWS - 1) // CHUNKED_MANIFEST_ROWS):
-            stored = chunked_manifest_read(root, key, "chunk-%06d.json" % chunk_index, limit=8 * 1024 * 1024)
-            if not isinstance(stored, list):
-                deny("CLEANUP_INPUT_CHANGED")
-            rows.extend(stored)
-    chunked_delete_rows(root, full, rows, key, full, applied, summary["fingerprint"], summary["count"])
+        h = hashlib.sha256()
+        count = 0
+        buffer = []
+        chunk_digests = []
+        for row in frozen_rows_stream(root, full):
+            count += 1
+            h.update(json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8") + b"\n")
+            buffer.append(row)
+            if len(buffer) == CHUNKED_MANIFEST_ROWS:
+                data = json.dumps(buffer, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                chunked_manifest_write(root, key, "chunk-%06d.json" % len(chunk_digests), data)
+                chunk_digests.append(hashlib.sha256(data).hexdigest())
+                buffer = []
+        if buffer:
+            data = json.dumps(buffer, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            chunked_manifest_write(root, key, "chunk-%06d.json" % len(chunk_digests), data)
+            chunk_digests.append(hashlib.sha256(data).hexdigest())
+        if count != count1 or h.hexdigest() != target["fingerprint"]:
+            deny("CONTENT_CHANGED", full, "冻结清单与当前目标不一致，请重新预览并双确认")
+        summary = {"schemaVersion": 1, "fingerprint": target["fingerprint"], "count": count, "applied": 0,
+                   "chunkDigests": chunk_digests}
+        write_control_json(root, "clean_dir/.operations/frozen/%s/summary.json" % key, summary)
+    total = summary["count"]
+    total_chunks = (total + CHUNKED_MANIFEST_ROWS - 1) // CHUNKED_MANIFEST_ROWS
+    chunk_digests = summary.get("chunkDigests")
+    if chunk_digests is not None and (not isinstance(chunk_digests, list) or len(chunk_digests) != total_chunks
+            or any(not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value) for value in chunk_digests)):
+        deny("CLEANUP_INPUT_CHANGED")
+    run_fresh = applied == 0
+    done = applied
+    while done < total_chunks:
+        # Watermark-driven apply loop: exactly one bounded chunk is in memory at
+        # a time, applied from the newest frozen chunk backwards; the watermark
+        # is persisted only after a whole chunk succeeded.
+        index = total_chunks - 1 - done
+        rows = chunked_read_chunk(root, key, index, chunk_digests[index] if chunk_digests is not None else None)
+        chunked_apply_rows(root, full, rows, run_fresh)
+        done += 1
+        write_control_json(root, "clean_dir/.operations/frozen/%s/summary.json" % key,
+                           {**summary, "applied": done})
+        progress_heartbeat()
     if os.path.lexists(full):
         deny("SOURCE_STILL_EXISTS", full)
     write_control_json(root, isolation_control_rel(archived_rel), {"schemaVersion": 1, "state": "deleted",
@@ -1497,17 +1602,23 @@ def main(request):
             return {"ok": True, "rootIdentity": identity, "target": {"missing": True, "type": target["type"], "absolutePath": full}}
         if archived and archived_control is not None and target.get("authorizationMode") == "confirmed_paths" and target["type"] == "directory":
             # A registered archive may exceed the single-message inventory cap.
-            # Preview then returns only the bounded frozen summary; the frozen
-            # digest (not any file list) is what both confirmations bind to.
-            probe = contents(root, full, "directory", metadata_only=True, expected_inventory=target.get("inventory") or (),
-                             allow_nested_git=True, entry_limit=MAX_FROZEN_MANIFEST_ENTRIES)
-            rows = probe["inventory"]
-            if len(rows) > CHUNKED_MANIFEST_THRESHOLD:
-                actual = os.lstat(full)
+            # The frozen walk streams: process memory is bounded regardless of
+            # archive size, and for a >50000 scope the preview returns only the
+            # bounded frozen summary. The frozen digest (not any file list) is
+            # what both confirmations bind to.
+            expected = target.get("inventory") or ()
+            shared = {(row.get("device"), row.get("inode")) for row in expected if row.get("hardlink") is True}
+            count, frozen_fingerprint, rows = stream_frozen_preview(root, full, shared,
+                                                                    MAX_FROZEN_MANIFEST_ENTRIES, CHUNKED_MANIFEST_THRESHOLD + 1)
+            actual = os.lstat(full)
+            if count > CHUNKED_MANIFEST_THRESHOLD:
                 return {"ok": True, "rootIdentity": identity, "target": {"type": "directory", "absolutePath": full, "chunked": True,
-                        "count": len(rows), "fingerprint": digest(rows), "device": str(actual.st_dev), "inode": str(actual.st_ino)}}
-            value = {**probe, "references": [], "manifests": [], "handleWarnings": [], "absolutePath": full,
-                     "parent": os.path.dirname(full), "leaf": os.path.basename(full),
+                        "count": count, "fingerprint": frozen_fingerprint, "device": str(actual.st_dev), "inode": str(actual.st_ino)}}
+            content = [{k: v for k, v in row.items() if k not in ("mtime", "device", "inode")} for row in rows]
+            value = {"type": "directory", "size": sum(row.get("size", 0) for row in rows), "fingerprint": digest(rows),
+                     "contentFingerprint": digest(content), "inventory": rows, "device": str(actual.st_dev), "inode": str(actual.st_ino),
+                     "fingerprintMode": "metadata", "references": [], "manifests": [], "handleWarnings": [],
+                     "absolutePath": full, "parent": os.path.dirname(full), "leaf": os.path.basename(full),
                      "destination": path_guard(root, target["destination"], True, True)}
             return {"ok": True, "rootIdentity": identity, "target": value}
     value = inspect(root, target, archived)

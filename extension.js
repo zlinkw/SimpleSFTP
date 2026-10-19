@@ -4938,18 +4938,38 @@ function watchTransferProcess(child, onIdle, fileStep = true, filenames = [], re
 }
 
 const remoteRuntimePrograms = new Set();
+const remoteRuntimeIdentities = new Map();
 async function ensureRemoteRuntimeProgram(source, runtime) {
   // One bounded installer transaction per node and engine version: content
   // addressed exclusive install/verification inside the managed program area.
-  const output = await runRemoteBatchSsh(source, remoteRuntimePrepareCommand(shellQuote), [JSON.stringify(runtime.request)], 60000,
-    { remoteMutation: true, stage: "清理程序准备" });
-  let result = null;
-  try { result = JSON.parse(String(output)); } catch { result = null; }
-  if (!result?.ok || !["installed", "verified"].includes(result.state)
-    || result.runtimeSha256 !== runtime.sha256 || result.programRelativePath !== runtime.programRelativePath) {
-    cleanupFail(result?.error?.code || "RUNTIME_PROGRAM_PREPARE_FAILED", result?.error?.message, result?.error || {});
+  // When a root identity is already known it travels in the request and the
+  // installer must observe the same verified root; the first install verifies
+  // the real selected root and binds the returned identity to this exact
+  // node/root/version key. Missing identity is never a license for any path.
+  const prepareOnce = async () => {
+    const output = await runRemoteBatchSsh(source, remoteRuntimePrepareCommand(shellQuote), [JSON.stringify(runtime.request)], 60000,
+      { remoteMutation: true, stage: "清理程序准备" });
+    let result = null;
+    try { result = JSON.parse(String(output)); } catch { result = null; }
+    if (!result?.ok || !["installed", "verified"].includes(result.state)
+      || result.runtimeSha256 !== runtime.sha256 || result.programRelativePath !== runtime.programRelativePath
+      || !result.rootIdentity || typeof result.rootIdentity.path !== "string") {
+      cleanupFail(result?.error?.code || "RUNTIME_PROGRAM_PREPARE_FAILED", result?.error?.message, result?.error || {});
+    }
+    if (runtime.request.rootIdentity && JSON.stringify(result.rootIdentity) !== JSON.stringify(runtime.request.rootIdentity)) cleanupFail("ROOT_IDENTITY_CHANGED");
+    remoteRuntimeIdentities.set(runtime.cacheKey, result.rootIdentity);
+    remoteRuntimePrograms.add(runtime.cacheKey);
+  };
+  try {
+    await prepareOnce();
+  } catch (error) {
+    if (String(error?.code || "") !== "ROOT_IDENTITY_CHANGED" || !runtime.request.rootIdentity) throw error;
+    // The root itself was recreated since the last session: rebind exactly once
+    // against the freshly verified root; never install against an unverified path.
+    remoteRuntimeIdentities.delete(runtime.cacheKey);
+    delete runtime.request.rootIdentity;
+    await prepareOnce();
   }
-  remoteRuntimePrograms.add(runtime.cacheKey);
 }
 
 async function cleanupFileTransport(request) {
@@ -4977,6 +4997,8 @@ async function cleanupFileTransport(request) {
     if (!path.isAbsolute(node.root)) cleanupFail("UNSAFE_ROOT");
     const runtime = runtimePrepareRequest({ root: node.root, source: script });
     runtime.cacheKey = `${node.host}|${node.port ?? 22}|${node.user ?? ""}|${node.root}|${runtime.sha256}`;
+    const knownIdentity = remoteRuntimeIdentities.get(runtime.cacheKey);
+    if (knownIdentity) runtime.request.rootIdentity = knownIdentity;
     const programPath = node.root.replace(/\/+$/, "") + "/" + runtime.programRelativePath;
     const command = remoteRuntimeCommand(programPath, shellQuote);
     const options = { remoteMutation: !["check", "inspect", "inventory", "verify", "managed-observe"].includes(request.action), stage: "PLAN 安全文件操作" };

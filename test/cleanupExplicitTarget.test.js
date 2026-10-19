@@ -5,6 +5,10 @@ test('real cleanup transport prepares the pinned program once and calls it by ex
  const engineSource='print(1)\n';
  const api=require('../cleanup-file-api');
  const expected=api.runtimePrepareRequest({root:'/fixture/project',source:engineSource});
+ // Identity binding: the real object contract travels when known; a wrong
+ // shape refuses loudly instead of silently dropping the binding.
+ assert.deepEqual(api.runtimePrepareRequest({root:'/fixture/project',source:engineSource,rootIdentity:{path:'/fixture/project',device:'7',inode:'9',machine:'h',user:'u'}}).request.rootIdentity,{path:'/fixture/project',device:'7',inode:'9',machine:'h',user:'u'});
+ assert.throws(()=>api.runtimePrepareRequest({root:'/fixture/project',source:engineSource,rootIdentity:'stale-string'}),/INVALID_REQUEST/);
  const calls=[];
  const context={fs:{readFileSync:()=>engineSource},path:require('node:path'),__dirname:'.',JSON,Buffer,
   normalizeSshPort:value=>{assert.ok(Number.isInteger(value)&&value>0&&value<65536);return value;},
@@ -15,7 +19,7 @@ test('real cleanup transport prepares the pinned program once and calls it by ex
   runRemoteBatchSsh:async(target,command,paths)=>{
    calls.push({command,stdin:paths&&paths[0]});
    if(paths&&paths[0].includes('"action":"runtime-prepare"'))
-    return JSON.stringify({ok:true,state:'installed',runtimeSha256:expected.sha256,programRelativePath:expected.programRelativePath});
+    return JSON.stringify({ok:true,state:'installed',runtimeSha256:expected.sha256,programRelativePath:expected.programRelativePath,rootIdentity:{path:'/fixture/project',device:'7',inode:'9',machine:'fixture-host',user:'fixture'}});
    assert.deepEqual(JSON.parse(JSON.stringify(target)),{host:'fixture-ip',username:'fixture',remotePath:'/fixture/project',port:30222});
    return '{"ok":true}';}};
  vm.createContext(context);vm.runInContext(extract('function directSyncTarget(', 'function directSyncRelativePath('),context);

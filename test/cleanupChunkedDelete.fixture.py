@@ -1,10 +1,11 @@
 """v1.5 chunked frozen-manifest contract: a >50000-entry registered archive is
-deleted only through bounded frozen chunks. The fresh run materializes every
-chunk and the applied watermark before the first unlink and pre-checks the
-whole tree against the frozen child sets; an interrupted run resumes from the
-watermark; unconfirmed new files are refused and never absorbed; completion
-keeps only the minimal anti-replay identity; a rebuilt same-name directory is
-new data that replay never touches. Fresh disposable temp root only."""
+deleted only through bounded frozen chunks. Fresh runs stream two bounded
+passes (O(1) state) that re-derive the frozen digest, then materialize every
+hash-bound chunk and the applied watermark before the first unlink; an
+interrupted run resumes from the watermark; unconfirmed new files are refused
+and never absorbed; completion keeps only the minimal anti-replay identity; a
+rebuilt same-name directory is new data that replay never touches. Fresh
+disposable temp root only."""
 import hashlib, json, os, pathlib, re, runpy, subprocess, sys, tempfile
 
 engine_path = pathlib.Path(sys.argv[1]).resolve()
@@ -99,7 +100,10 @@ if stage == "abort":
     real_unlink = os.unlink
     def bomb(name):
         unlinks.append(name)
-        if len(unlinks) == 12000:
+        # Chunks apply newest-first (reversed frozen pre-order). The 5000th
+        # unlink lands inside the second applied chunk, after the newest chunk
+        # completed with a single unlink, so the watermark must read exactly 1.
+        if len(unlinks) == 5000:
             raise OSError("fixture-interrupt")
         real_unlink(name)
     os.unlink = bomb
@@ -112,11 +116,16 @@ if stage == "abort":
         os.unlink = real_unlink
     state["manifestKey"] = engine["manifest_key"](OP_ID, dest, dest)
     summary, frozen = summary_now()
+    digests = summary.pop("chunkDigests", None)
     assert summary == {"schemaVersion": 1, "fingerprint": state["fingerprint"],
                        "count": 50001, "applied": 1}, summary
     chunks = sorted(name for name in os.listdir(frozen) if name.startswith("chunk-"))
     assert chunks == ["chunk-%06d.json" % index for index in range(6)], chunks
-    assert not (root / dest / "zz1999").exists(), "chunk 0 must have been applied"
+    assert isinstance(digests, list) and len(digests) == 6, digests
+    for index, value in enumerate(digests):
+        blob = (frozen / ("chunk-%06d.json" % index)).read_bytes()
+        assert re.fullmatch(r"[0-9a-f]{64}", value) and hashlib.sha256(blob).hexdigest() == value, index
+    assert not (root / dest / "zz1999").exists(), "the newest applied chunk must have been applied"
     assert (root / dest / "yy31999").exists() and (root / dest / "zz0005" / "g0").exists()
     state_path.write_text(json.dumps(state), encoding="utf-8")
     print("ok")
@@ -129,7 +138,11 @@ if stage == "refuse":
     assert result.get("ok") is not True and result["error"]["code"] == "DIRECTORY_INVENTORY_CHANGED", result
     assert injector.read_text(encoding="utf-8") == "user data", "new data must never be absorbed"
     summary, _ = summary_now()
-    assert summary["applied"] == 1, "a refusal inside a chunk never advances the watermark"
+    assert summary["applied"] == 2, summary
+    assert summary["chunkDigests"] and len(summary["chunkDigests"]) == 6
+    # The refusal happened while applying the third newest chunk (zz0005 was no
+    # longer empty): finishing the second chunk advanced the watermark once and
+    # the refusing chunk never advanced it.
     injector.unlink()
     print("ok")
     sys.exit(0)
