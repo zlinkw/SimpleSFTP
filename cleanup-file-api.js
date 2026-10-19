@@ -13,10 +13,79 @@ const canonical = value => typeof value === "number" ? "n" + (() => {
     .map(key => JSON.stringify(key) + ":" + canonical(value[key])).join(",") + "}" : JSON.stringify(value);
 const targetHash = value => crypto.createHash("sha256").update(canonical(value)).digest("hex");
 const copy = value => JSON.parse(JSON.stringify(value));
-function cleanupRemoteLoader(source) {
-  const packed = require('node:zlib').deflateSync(Buffer.from(source,'utf8')).toString('base64');
-  const command = 'import base64,zlib;exec(compile(zlib.decompress(base64.b64decode(' + JSON.stringify(packed) + ')),\'simple_sftp_cleanup\',\'exec\'))';
-  if(command.length > 20000) fail('REMOTE_LOADER_TOO_LARGE');
+// The only remote deletion chain runs a content-addressed engine program that
+// was pinned into the protected managed program area; requests never carry a
+// copy of the source through argv. Commands stay far below the Windows argv
+// quoting budget because only a fixed short invocation crosses the wire.
+const REMOTE_COMMAND_BUDGET = 20000;
+const RUNTIME_PROGRAM_DIR = "clean_dir/.operations/managed";
+function runtimeProgramRelativePath(sha256) {
+  if (!/^[a-f0-9]{64}$/.test(String(sha256))) fail("INVALID_REQUEST");
+  return RUNTIME_PROGRAM_DIR + "/runtime-" + sha256 + ".py";
+}
+function runtimePrepareRequest({ root, source, rootIdentity }) {
+  if (typeof source !== "string" || !source || Buffer.byteLength(source) > 262144) fail("INVALID_REQUEST");
+  const sha256 = crypto.createHash("sha256").update(source).digest("hex");
+  const request = { action: "runtime-prepare", root, runtimeSha256: sha256, runtimeSource: source };
+  if (typeof rootIdentity === "string" && rootIdentity) request.rootIdentity = rootIdentity;
+  return { sha256, programRelativePath: runtimeProgramRelativePath(sha256), request };
+}
+const RUNTIME_PREPARE_BOOTSTRAP = [
+  "import hashlib,json,os,sys",
+  "def out(code,detail=''):",
+  "    sys.stdout.write(json.dumps({'ok':False,'error':{'code':code,'message':detail}}));raise SystemExit(1)",
+  "def done(state):",
+  "    sys.stdout.write(json.dumps({'ok':True,'state':state,'runtimeSha256':sha,'programRelativePath':'" + RUNTIME_PROGRAM_DIR + "/runtime-'+sha+'.py'}));raise SystemExit(0)",
+  "try:",
+  "    req=json.loads(sys.stdin.buffer.read(4194304).rstrip(b" + "\"\\x00\"" + ").decode('utf-8'))",
+  "except Exception:",
+  "    out('INVALID_REQUEST')",
+  "if not isinstance(req,dict) or req.get('action')!='runtime-prepare':out('INVALID_REQUEST')",
+  "src=req.get('runtimeSource');sha=req.get('runtimeSha256')",
+  "if not isinstance(src,str) or not isinstance(sha,str):out('INVALID_REQUEST')",
+  "code=src.encode('utf-8')",
+  "if len(code)==0 or len(code)>262144 or len(sha)!=64 or hashlib.sha256(code).hexdigest()!=sha:out('RUNTIME_CODE_MISMATCH')",
+  "root=req.get('root')",
+  "if not isinstance(root,str) or not os.path.isabs(root) or chr(0) in root:out('UNSAFE_ROOT')",
+  "if os.path.normpath(os.path.realpath(root))!=os.path.normpath(root):out('ROOT_IDENTITY_CHANGED')",
+  "managed=os.path.join(root,'clean_dir','.operations','managed')",
+  "try:",
+  "    os.makedirs(managed,exist_ok=True)",
+  "except OSError as error:",
+  "    out('RUNTIME_PROGRAM_PREPARE_FAILED',str(error))",
+  "for probe in (root,os.path.join(root,'clean_dir'),os.path.join(root,'clean_dir','.operations'),managed):",
+  "    if os.path.islink(probe):out('LINK_OR_REPARSE_POINT',probe)",
+  "prog=os.path.join(managed,'runtime-'+sha+'.py')",
+  "if os.path.islink(prog):out('LINK_OR_REPARSE_POINT',prog)",
+  "def check_existing():",
+  "    info=os.lstat(prog)",
+  "    if not os.path.isfile(prog) or info.st_nlink!=1 or info.st_size!=len(code):out('RUNTIME_PROGRAM_MISMATCH',prog)",
+  "    handle=open(prog,'rb')",
+  "    same=handle.read()==code",
+  "    handle.close()",
+  "    if not same:out('RUNTIME_PROGRAM_MISMATCH',prog)",
+  "if os.path.lexists(prog):",
+  "    check_existing();done('verified')",
+  "try:",
+  "    fd=os.open(prog,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)",
+  "except FileExistsError:",
+  "    check_existing();done('verified')",
+  "os.write(fd,code);os.fsync(fd);os.close(fd)",
+  "handle=open(prog,'rb')",
+  "same=handle.read()==code",
+  "handle.close()",
+  "if not same:out('RUNTIME_PROGRAM_MISMATCH',prog)",
+  "done('installed')",
+].join("\n");
+function remoteRuntimePrepareCommand(shellQuote) {
+  const command = "python3 -B -c " + shellQuote(RUNTIME_PREPARE_BOOTSTRAP);
+  if (command.length > REMOTE_COMMAND_BUDGET) fail("REMOTE_COMMAND_TOO_LARGE");
+  return command;
+}
+function remoteRuntimeCommand(programPath, shellQuote) {
+  if (typeof programPath !== "string" || !programPath.startsWith("/") || programPath.includes("\0")) fail("UNSAFE_ROOT");
+  const command = "python3 -B -X utf8 " + shellQuote(programPath);
+  if (command.length > REMOTE_COMMAND_BUDGET) fail("REMOTE_COMMAND_TOO_LARGE");
   return command;
 }
 function fail(code, message = code, details = {}) { const error = new Error(message); error.code = code; error.apiCode = code === "CONFIRM_REQUIRED" ? 2001 : 2010; error.apiData = { code };
@@ -83,7 +152,7 @@ class CleanupFileApi {
       rows.push({ ...copy(target), ...result.target, destination: target.destination });
     }
     const row = { token: crypto.randomBytes(24).toString("hex"), operationId: "cleanup-" + crypto.randomBytes(16).toString("hex"), node: copy(node), rootIdentity: identity,
-      action, observationMode, authorizationMode: pathOnly ? "confirmed_paths" : undefined, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, managedObservation: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: action === "isolate" ? 1 : undefined, requiredInputGuard: action === "isolate" ? 1 : undefined, registeredIsolationDeletion: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1, handleScan: pathOnly ? "confirmed_paths" : observationMode ? "managed_tmux" : "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
+      action, observationMode, authorizationMode: pathOnly ? "confirmed_paths" : undefined, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, managedObservation: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: action === "isolate" ? 1 : undefined, requiredInputGuard: action === "isolate" ? 1 : undefined, registeredIsolationDeletion: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1, chunkedFrozenManifest: 1, pinnedRuntimeProgram: 1, handleScan: pathOnly ? "confirmed_paths" : observationMode ? "managed_tmux" : "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
     row.tmuxSessionPrefix = tmuxSessionPrefix;
     row.targetDigests = rows.map(targetHash);
     row.digest = hash({ node: row.node, rootIdentity: identity, action, targets: rows, safety: row.safety, tmuxSessionPrefix });
@@ -200,7 +269,7 @@ class CleanupFileApi {
       return { ok: true, state: "executing", executor: { kind: "active_local_transfer" } };
     const frozen = row.targets[index];
     const compact = row.observationMode === "tmux" && ["executing", "completed"].includes(row.states[index]);
-    const target = compact ? Object.fromEntries(["relativePath", "destination", "type", "fingerprint", "contentFingerprint", "inode", "fingerprintMode", "authorizationMode"]
+    const target = compact ? Object.fromEntries(["relativePath", "destination", "type", "fingerprint", "contentFingerprint", "inode", "fingerprintMode", "authorizationMode", "chunked", "count"]
       .filter(key => frozen[key] !== undefined).map(key => [key, frozen[key]])) : frozen;
     return this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
       action: "managed-observe", cleanupAction: row.action, localObservation: row.observationMode === "filesystem",
@@ -259,4 +328,4 @@ class CleanupFileApi {
     return this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity, target, action: "verify", deleted: row.action === "delete" });
   }
 }
-module.exports = { CleanupFileApi, fail, hash, cleanupRemoteLoader };
+module.exports = { CleanupFileApi, fail, hash, runtimePrepareRequest, runtimeProgramRelativePath, RUNTIME_PREPARE_BOOTSTRAP, remoteRuntimePrepareCommand, remoteRuntimeCommand, REMOTE_COMMAND_BUDGET };

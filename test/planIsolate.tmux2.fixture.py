@@ -3,7 +3,7 @@ subtree writer exits non-zero and stays preserved without any receipt; after
 the writer releases, the re-confirmed intent completes through its own window
 self-close, and a rebuilt same-name directory after completion is new data the
 replay never re-deletes. Fresh disposable temp root and own TMUX_TMPDIR."""
-import json, os, pathlib, subprocess, sys, tempfile, time
+import hashlib, json, os, pathlib, subprocess, sys, tempfile, time
 
 engine_path = pathlib.Path(sys.argv[1]).resolve()
 source = engine_path.read_text(encoding="utf-8")
@@ -58,6 +58,18 @@ def wait_state(request, wanted, deadline_seconds=5):
         time.sleep(.05)
     raise AssertionError(("timeout", wanted, last))
 
+prepared = run({"root": str(root), "action": "runtime-prepare",
+                     "runtimeSha256": hashlib.sha256(source.encode("utf-8")).hexdigest(), "runtimeSource": source})
+pinned = root / "clean_dir" / ".operations" / "managed" / ("runtime-" + prepared["runtimeSha256"] + ".py")
+
+def run_pinned(request, timeout=6):
+    proc = subprocess.run([sys.executable, "-B", str(pinned)], input=json.dumps(request),
+                          capture_output=True, text=True, timeout=timeout)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    value = json.loads(proc.stdout)
+    assert value.get("ok"), value
+    return value
+
 def isolation_states():
     return [json.loads(p.read_text(encoding="utf-8"))
             for p in (root / "clean_dir" / ".operations" / "isolation").glob("*.json")]
@@ -72,8 +84,8 @@ try:
     isolate = {"root": str(root), "rootIdentity": inspected["rootIdentity"], "operationId": "iso-job-a",
                "cleanupAction": "isolate",
                "target": {**iso_target, **inspected["target"], "destination": iso_target["destination"]},
-               "runtimeSource": source, "tmuxSessionPrefix": "iso"}
-    assert run({**isolate, "action": "managed-start"})["state"] == "requested"
+               "tmuxSessionPrefix": "iso"}
+    assert run_pinned({**isolate, "action": "managed-start"})["state"] == "requested"
     wait_state(isolate, "completed")
 
     # A real external writer (held subtree chain lock, like a background
@@ -89,8 +101,8 @@ try:
     delete = {"root": str(root), "rootIdentity": deleted_preview["rootIdentity"], "operationId": "del-job-a",
               "cleanupAction": "delete",
               "target": {**delete_target, **deleted_preview["target"], "destination": archived},
-              "runtimeSource": source, "tmuxSessionPrefix": "iso"}
-    assert run({**delete, "action": "managed-start"})["state"] == "requested"
+              "tmuxSessionPrefix": "iso"}
+    assert run_pinned({**delete, "action": "managed-start"})["state"] == "requested"
     deadline = time.monotonic() + 5
     failed = None
     while time.monotonic() < deadline:
@@ -109,7 +121,7 @@ try:
     second = run({"root": str(root), "action": "inspect", "target": dict(delete_target)})
     delete2 = {**delete, "rootIdentity": second["rootIdentity"],
                "target": {**delete_target, **second["target"], "destination": archived}}
-    assert run({**delete2, "action": "managed-start"})["state"] == "requested"
+    assert run_pinned({**delete2, "action": "managed-start"})["state"] == "requested"
     deleted = wait_state(delete2, "completed")
     assert deleted.get("verifiedBy") == "completion_receipt" and deleted.get("irreversible") is True, deleted
     assert not (root / archived).exists()

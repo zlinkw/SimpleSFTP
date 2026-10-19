@@ -32,7 +32,7 @@ const { execFile, spawn } = require("child_process");
 const { resolveWorkspaceLocation } = require("./workspace-path.js");
 const { toTarPath: tarEntryPath, writeTarEntriesToStream } = require("./tar-writer.js");
 const { LocalApiServer, confirmationRequired, currentApiRequestContext } = require("./api-server.js");
-const { CleanupFileApi, fail: cleanupFail, cleanupRemoteLoader } = require("./cleanup-file-api");
+const { CleanupFileApi, fail: cleanupFail, runtimePrepareRequest, remoteRuntimePrepareCommand, remoteRuntimeCommand } = require("./cleanup-file-api");
 let cleanupFileApi;
 const {
   HostOperationLeaseConflictError,
@@ -4937,11 +4937,25 @@ function watchTransferProcess(child, onIdle, fileStep = true, filenames = [], re
   return { dispose: () => idle.dispose(), receive, update };
 }
 
+const remoteRuntimePrograms = new Set();
+async function ensureRemoteRuntimeProgram(source, runtime) {
+  // One bounded installer transaction per node and engine version: content
+  // addressed exclusive install/verification inside the managed program area.
+  const output = await runRemoteBatchSsh(source, remoteRuntimePrepareCommand(shellQuote), [JSON.stringify(runtime.request)], 60000,
+    { remoteMutation: true, stage: "清理程序准备" });
+  let result = null;
+  try { result = JSON.parse(String(output)); } catch { result = null; }
+  if (!result?.ok || !["installed", "verified"].includes(result.state)
+    || result.runtimeSha256 !== runtime.sha256 || result.programRelativePath !== runtime.programRelativePath) {
+    cleanupFail(result?.error?.code || "RUNTIME_PROGRAM_PREPARE_FAILED", result?.error?.message, result?.error || {});
+  }
+  remoteRuntimePrograms.add(runtime.cacheKey);
+}
+
 async function cleanupFileTransport(request) {
   const node = request.node;
   let output;
   const script = fs.readFileSync(path.join(__dirname, "cleanup-files.py"), "utf8");
-  if (request.action === "managed-start") request.runtimeSource = script;
   if (node?.kind === "local") {
     if (!path.isAbsolute(node.root)) cleanupFail("UNSAFE_ROOT");
     output = await new Promise((resolve, reject) => {
@@ -4958,9 +4972,27 @@ async function cleanupFileTransport(request) {
     // The frozen, fully specified node is the authority for this exact operation.
     // Never merge an active profile or require a second spelling of an SSH alias.
     // SSH authentication and canonical root/parent checks still apply.
-    const loader = cleanupRemoteLoader(script);
-    output = await runRemoteBatchSsh(source, `python3 -B -c ${shellQuote(loader)}`, [JSON.stringify(request)], 60000,
-      { remoteMutation: !["check", "inspect", "inventory", "verify", "managed-observe"].includes(request.action), stage: "PLAN 安全文件操作" });
+    // The engine executes only as the pinned program in the managed program
+    // area; requests cross as bounded stdin, never as an argv source copy.
+    if (!path.isAbsolute(node.root)) cleanupFail("UNSAFE_ROOT");
+    const runtime = runtimePrepareRequest({ root: node.root, source: script });
+    runtime.cacheKey = `${node.host}|${node.port ?? 22}|${node.user ?? ""}|${node.root}|${runtime.sha256}`;
+    const programPath = node.root.replace(/\/+$/, "") + "/" + runtime.programRelativePath;
+    const command = remoteRuntimeCommand(programPath, shellQuote);
+    const options = { remoteMutation: !["check", "inspect", "inventory", "verify", "managed-observe"].includes(request.action), stage: "PLAN 安全文件操作" };
+    const missingProgram = error => /can't open file|No such file or directory|RUNTIME_PROGRAM_MISSING|RUNTIME_CODE_MISMATCH/i.test(String(error?.stderr || "") + String(error?.message || ""));
+    if (!remoteRuntimePrograms.has(runtime.cacheKey)) await ensureRemoteRuntimeProgram(source, runtime);
+    try {
+      output = await runRemoteBatchSsh(source, command, [JSON.stringify(request)], 60000, options);
+    } catch (error) {
+      if (!missingProgram(error)) throw error;
+      // A removed or mutated pinned program is reinstalled for this exact
+      // version once and the same request retries once; there is no older
+      // source-argv channel to fall back to.
+      remoteRuntimePrograms.delete(runtime.cacheKey);
+      await ensureRemoteRuntimeProgram(source, runtime);
+      output = await runRemoteBatchSsh(source, command, [JSON.stringify(request)], 60000, options);
+    }
   }
   return JSON.parse(String(output));
 }

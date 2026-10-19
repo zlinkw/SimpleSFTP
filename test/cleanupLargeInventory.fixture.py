@@ -101,22 +101,33 @@ os.unlink = fixture_remove
 os.rmdir = fixture_remove
 '''
 source = source.replace('if __name__ == "__main__":',patch + '\nif __name__ == "__main__":')
+# The window program comes only from the pinned managed program area: the
+# exact verified bytes are installed there first and the very same pinned
+# file then performs managed-start and runs as the window's child process.
+import hashlib
+prepared = run(json.dumps({'root':root_text,'action':'runtime-prepare',
+                           'runtimeSha256':hashlib.sha256(source.encode('utf-8')).hexdigest(),'runtimeSource':source}))
+assert prepared.get('ok') and prepared.get('state') in ('installed','verified'), prepared
+pinned = managed / ('runtime-' + prepared['runtimeSha256'] + '.py')
+assert pinned.name == 'runtime-' + hashlib.sha256(source.encode('utf-8')).hexdigest() + '.py'
 start = {'root':root_text,'rootIdentity':identity,'operationId':'large-child','action':'managed-start','cleanupAction':'delete',
-         'target':t,'runtimeSource':source,'localObservation':True}
+         'target':t,'localObservation':True}
 original_run = subprocess.run
+original_unlink, original_rmdir = os.unlink, os.rmdir
 from types import SimpleNamespace
 subprocess.run = lambda *args, **kwargs: SimpleNamespace(returncode=0)
-env['managed_tmux'] = lambda args: '%fixture' if args[0] == 'new-window' else ''
+pinned_main = runpy.run_path(str(pinned))['main']
+pinned_env = pinned_main.__globals__
+pinned_env['managed_tmux'] = lambda args: '%fixture' if args[0] == 'new-window' else ''
 try:
-    assert engine['main'](start)['state'] == 'requested'
+    assert pinned_main(start)['state'] == 'requested'
 finally:
     subprocess.run = original_run
+    os.unlink, os.rmdir = original_unlink, original_rmdir
 key2 = engine['managed_key'](start)
 raw_input = (managed / (key2 + '.json')).read_bytes()
 assert len(raw_input) > 1048576
-import hashlib
-runtime = managed / ('runtime-' + hashlib.sha256(source.encode('utf-8')).hexdigest() + '.py')
-child = subprocess.run([sys.executable,'-B','-X','utf8',str(runtime)],input=raw_input,capture_output=True,timeout=4)
+child = subprocess.run([sys.executable,'-B','-X','utf8',str(pinned)],input=raw_input,capture_output=True,timeout=4)
 assert child.returncode == 0 and json.loads(child.stdout).get('ok'), (child.stderr,child.stdout)
 assert not second.exists()
 assert any(p.is_file() and p.read_text(encoding='utf-8') == 'preserve child bytes' for p in archive.glob('child-*'))

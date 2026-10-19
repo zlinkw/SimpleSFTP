@@ -18,6 +18,17 @@ import sys
 import time
 
 MAX_CLEANUP_REQUEST_BYTES = 32 * 1024 * 1024
+# Chunked frozen manifests keep every wire message bounded: the server walks
+# once, persists bounded chunks, and never carries a full inventory in JSON.
+CHUNKED_MANIFEST_THRESHOLD = 50000
+MAX_FROZEN_MANIFEST_ENTRIES = 2000000
+CHUNKED_MANIFEST_ROWS = 10000
+RUNTIME_PROGRAM_RE = re.compile(r"runtime-([0-9a-f]{64})\.py")
+
+
+def manifest_key(operation_id, relative_path, destination):
+    return hashlib.sha256(json.dumps({"operationId": operation_id, "relativePath": relative_path, "destination": destination},
+                                     sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def decode_request(raw):
@@ -158,7 +169,7 @@ def path_guard(root, rel, allow_clean=False, missing=False, nested_git_root=None
     return physical
 
 
-def contents(root, full, expected_type, metadata_only=False, expected_inventory=(), allow_nested_git=False):
+def contents(root, full, expected_type, metadata_only=False, expected_inventory=(), allow_nested_git=False, entry_limit=50000):
     st = os.lstat(full)
     actual = "directory" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "unknown"
     if actual != expected_type:
@@ -211,7 +222,7 @@ def contents(root, full, expected_type, metadata_only=False, expected_inventory=
             report()
         else:
             deny("UNCERTAIN_TYPE", value)
-        if len(rows) > 50000:
+        if len(rows) > entry_limit:
             deny("INVENTORY_LIMIT")
     visit(full, "")
     report(True)
@@ -489,13 +500,34 @@ def no_replace(source, destination):
             deny("MOVE_FAILED", str(ctypes.get_errno()))
 
 
+_progress_state = {"at": 0.0, "files": 0}
+
+
+def progress_heartbeat():
+    # A long deletion keeps the live progress moving without the old per-file
+    # stderr flood: at most one bounded line per second.
+    now = time.monotonic()
+    if now - _progress_state["at"] >= 1:
+        sys.stderr.write("SIMPLE_PROGRESS " + json.dumps({"phase": "deleting", "processedFiles": _progress_state["files"]}) + "\n")
+        sys.stderr.flush()
+        _progress_state["at"] = now
+
+
 def delete_file(root, full, expected, metadata_only=False, nested_git_root=None, allow_clean=False):
     if expected.get("type") != "file":
         deny("UNCERTAIN_TYPE")
     path_guard(root, os.path.relpath(full, root).replace(os.sep, "/"), allow_clean, nested_git_root=nested_git_root if metadata_only else None)
-    actual = contents(root, full, "file", metadata_only=metadata_only, expected_inventory=[expected])["inventory"][0]
-    if any(actual.get(key) != expected.get(key) for key in ("device", "inode", "size", "mtime", "ctime" if metadata_only else "sha256")):
-        deny("CONTENT_CHANGED")
+    if not metadata_only:
+        # A hash-bound confirmation re-verifies the bytes before entering the
+        # parent; the post-chdir check below still re-checks every frozen field.
+        actual = contents(root, full, "file", expected_inventory=[expected])["inventory"][0]
+        if any(actual.get(key) != expected.get(key) for key in ("device", "inode", "size", "mtime", "sha256")):
+            deny("CONTENT_CHANGED")
+    # A metadata-only confirmation binds the exact frozen identity row: the
+    # post-chdir lstat below compares inode/device/size/mtime/ctime (with the
+    # frozen hardlink ctime exemption) against that row, and path_guard above
+    # already refused links, reparse points, mounts and protected names on
+    # every component of this path, so a second pre-lstat pass added no check.
     child = parent_cd(root, full)
     info = os.lstat(child)
     if not stat.S_ISREG(info.st_mode) or str(info.st_ino) != expected["inode"] or str(info.st_dev) != expected["device"]:
@@ -503,15 +535,30 @@ def delete_file(root, full, expected, metadata_only=False, nested_git_root=None,
     if info.st_size != expected["size"] or str(info.st_mtime_ns) != expected["mtime"] or metadata_only and not expected.get("hardlink") and str(info.st_ctime_ns) != expected["ctime"]:
         deny("CONTENT_CHANGED")
     os.unlink(child)
+    _progress_state["files"] += 1
+    progress_heartbeat()
 
 
-def delete_directory(root, full, inventory, base="", metadata_only=False, nested_git_root=None, allow_clean=False):
+def build_inventory_index(inventory):
+    # One pass over the frozen manifest replaces the per-directory rescan that
+    # used to cost O(directories x manifest length) on every recursive level.
+    rows = {}
+    children = {}
+    for row in inventory:
+        rows[row["path"]] = row
+        parent = row["path"].rsplit("/", 1)[0] if "/" in row["path"] else ""
+        children.setdefault(parent, []).append(row)
+    return rows, children
+
+
+def delete_directory(root, full, inventory, base="", metadata_only=False, nested_git_root=None, allow_clean=False, index=None):
     # Execute the immutable inventory. New children and runtime type changes never expand it.
-    expected = next((row for row in inventory if row["path"] == base), None)
+    rows, children_by_parent = index if index is not None else build_inventory_index(inventory)
+    expected = rows.get(base)
     if not expected or expected["type"] != "directory":
         deny("UNCERTAIN_TYPE")
     path_guard(root, os.path.relpath(full, root).replace(os.sep, "/"), allow_clean, nested_git_root=nested_git_root if metadata_only else None)
-    children = [row for row in inventory if row["path"] != base and row["path"].rsplit("/", 1)[0] == base] if base else [row for row in inventory if row["path"] and "/" not in row["path"]]
+    children = [row for row in children_by_parent.get(base, ()) if row["path"] != base]
     leaves = sorted(row["path"].split("/")[-1] for row in children)
     if sorted(os.listdir(full)) != leaves:
         deny("DIRECTORY_INVENTORY_CHANGED")
@@ -524,7 +571,7 @@ def delete_directory(root, full, inventory, base="", metadata_only=False, nested
         if row["type"] == "file" and stat.S_ISREG(st.st_mode):
             delete_file(root, value, row, metadata_only=metadata_only, nested_git_root=nested_git_root, allow_clean=allow_clean)
         elif row["type"] == "directory" and stat.S_ISDIR(st.st_mode):
-            delete_directory(root, value, inventory, row["path"], metadata_only=metadata_only, nested_git_root=nested_git_root, allow_clean=allow_clean)
+            delete_directory(root, value, inventory, row["path"], metadata_only=metadata_only, nested_git_root=nested_git_root, allow_clean=allow_clean, index=index)
         else:
             deny("TYPE_CHANGED")
     child = parent_cd(root, full)
@@ -532,6 +579,149 @@ def delete_directory(root, full, inventory, base="", metadata_only=False, nested
     if not stat.S_ISDIR(info.st_mode) or str(info.st_ino) != expected["inode"] or str(info.st_dev) != expected["device"]:
         deny("TYPE_CHANGED")
     os.rmdir(child)
+
+
+def chunked_manifest_dir(root, key):
+    return path_guard(root, "clean_dir/.operations/frozen/" + key, True)
+
+
+def chunked_manifest_write(root, key, name, data):
+    # The frozen manifest area is created only for a >50000 confirmation; the
+    # first materialization builds the exact bounded directory before its
+    # strict re-check, so a vanished parent can never write elsewhere.
+    directory = path_guard(root, "clean_dir/.operations/frozen/" + key, True, True)
+    os.makedirs(directory, exist_ok=True)
+    directory = chunked_manifest_dir(root, key)
+    full = path_guard(root, "clean_dir/.operations/frozen/" + key + "/" + name, True, True)
+    if os.path.lexists(full):
+        with open(full, "rb") as stream:
+            if stream.read() != data:
+                deny("CLEANUP_INPUT_CHANGED", full)
+        return
+    with open(full, "xb") as stream:
+        stream.write(data)
+
+
+def chunked_manifest_read(root, key, name, limit=262144):
+    full = path_guard(root, "clean_dir/.operations/frozen/" + key + "/" + name, True, True)
+    if not os.path.isfile(full) or os.lstat(full).st_nlink != 1 or os.lstat(full).st_size > limit:
+        return None
+    with open(full, "rb") as stream:
+        try:
+            return json.loads(stream.read().decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            deny("CLEANUP_INPUT_CHANGED", full)
+
+
+def chunked_delete_rows(root, full, rows, key, nested_git_root, applied, fingerprint, total):
+    # Post-order (descending path) flat application. Fresh runs pre-check every
+    # directory against its frozen child set before anything disappears (the
+    # same guarantee the small path gives per directory); resumed runs keep the
+    # frozen identity checks and the empty-parent rule, so a recreated name or
+    # any new file is refused, never absorbed and never deleted.
+    index = build_inventory_index(rows)
+    ordered = sorted(rows, key=lambda row: row["path"], reverse=True)
+    if applied == 0:
+        # Freeze barrier: every bounded chunk exists and the applied watermark
+        # is persisted before the first unlink, so an interrupted run can only
+        # resume from a fully materialized manifest.
+        for start in range(0, len(ordered), CHUNKED_MANIFEST_ROWS):
+            chunked_manifest_write(root, key, "chunk-%06d.json" % (start // CHUNKED_MANIFEST_ROWS),
+                                   json.dumps(ordered[start:start + CHUNKED_MANIFEST_ROWS], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        write_control_json(root, "clean_dir/.operations/frozen/%s/summary.json" % key,
+                           {"schemaVersion": 1, "fingerprint": fingerprint, "count": total, "applied": 0})
+        _, children_by_parent = index
+        for row in rows:
+            if row["type"] != "directory":
+                continue
+            probe = os.path.join(full, *row["path"].split("/")) if row["path"] else full
+            if not os.path.isdir(probe):
+                deny("DIRECTORY_INVENTORY_CHANGED", probe)
+            expected_names = sorted(child["path"].split("/")[-1] for child in children_by_parent.get(row["path"], ()) if child["path"] != row["path"])
+            if sorted(os.listdir(probe)) != expected_names:
+                deny("DIRECTORY_INVENTORY_CHANGED", probe)
+    # On a resumed run `rows` are exactly the not-yet-applied frozen chunks in
+    # order; their files were materialized by the interrupted run.
+    for start in range(0, len(ordered), CHUNKED_MANIFEST_ROWS):
+        chunk_index = applied + start // CHUNKED_MANIFEST_ROWS
+        for row in ordered[start:start + CHUNKED_MANIFEST_ROWS]:
+            probe = os.path.join(full, *row["path"].split("/")) if row["path"] else full
+            if not os.path.lexists(probe):
+                if applied == 0:
+                    deny("DIRECTORY_INVENTORY_CHANGED", probe)
+                continue
+            if row["type"] == "file":
+                delete_file(root, probe, row, metadata_only=True, nested_git_root=nested_git_root, allow_clean=True)
+                continue
+            if row["type"] != "directory":
+                deny("UNCERTAIN_TYPE", probe)
+            st = os.lstat(probe)
+            if str(st.st_ino) != row["inode"] or str(st.st_dev) != row["device"]:
+                deny("IDENTITY_CHANGED", probe)
+            child = parent_cd(root, probe)
+            if os.listdir(child):
+                deny("DIRECTORY_INVENTORY_CHANGED", probe, "冻结范围内出现新内容，未确认的新文件不会被删除")
+            os.rmdir(child)
+        write_control_json(root, "clean_dir/.operations/frozen/%s/summary.json" % key,
+                           {"schemaVersion": 1, "fingerprint": fingerprint, "count": total, "applied": chunk_index + 1})
+        progress_heartbeat()
+
+
+def chunked_permanent_delete(root, request, identity):
+    # The only >50000-entry deletion chain: one metadata-only frozen walk (the
+    # same verification strength as the confirmed-path small path), server-local
+    # bounded chunks, resumable per chunk, and only a minimal anti-replay
+    # identity survives completion — never the deleted file list.
+    target = request["target"]
+    if target.get("authorizationMode") != "confirmed_paths" or target.get("type") != "directory" or target.get("chunked") is not True:
+        deny("INVALID_REQUEST")
+    archived_rel = archived_control_rel(target)
+    if archived_rel is None:
+        deny("NOT_REGISTERED_ISOLATION")
+    archived_state = isolation_state(root, archived_rel)
+    if archived_state and archived_state.get("state") == "deleted":
+        return {"ok": True, "rootIdentity": identity, "alreadyDeleted": True, "state": "completed", "verifiedBy": "isolation_deleted"}
+    if not archived_state or archived_state.get("state") != "isolated":
+        deny("NOT_REGISTERED_ISOLATION", archived_rel, "只有已登记的隔离产物子树可以经确认路径永久删除")
+    if target["destination"] != archived_rel:
+        deny("UNSAFE_DESTINATION")
+    full = path_guard(root, archived_rel, True)
+    checked_parent(root, full)
+    key = manifest_key(request["operationId"], archived_rel, target["destination"])
+    summary = chunked_manifest_read(root, key, "summary.json")
+    applied = summary.get("applied", 0) if isinstance(summary, dict) else 0
+    if summary is not None and (summary.get("schemaVersion") != 1 or not isinstance(summary.get("fingerprint"), str)
+            or not isinstance(summary.get("count"), int)
+            or summary.get("fingerprint") != target["fingerprint"] or not isinstance(applied, int) or not 0 <= applied <= summary["count"]):
+        deny("CLEANUP_INPUT_CHANGED")
+    if summary is None:
+        value = contents(root, full, "directory", metadata_only=True, allow_nested_git=True, entry_limit=MAX_FROZEN_MANIFEST_ENTRIES)
+        rows = value["inventory"]
+        if len(rows) < CHUNKED_MANIFEST_THRESHOLD or digest(rows) != target["fingerprint"]:
+            deny("CONTENT_CHANGED", full, "冻结清单与当前目标不一致，请重新预览并双确认")
+        summary = {"schemaVersion": 1, "fingerprint": target["fingerprint"], "count": len(rows), "applied": 0}
+    else:
+        rows = []
+        for chunk_index in range(applied, (summary["count"] + CHUNKED_MANIFEST_ROWS - 1) // CHUNKED_MANIFEST_ROWS):
+            stored = chunked_manifest_read(root, key, "chunk-%06d.json" % chunk_index, limit=8 * 1024 * 1024)
+            if not isinstance(stored, list):
+                deny("CLEANUP_INPUT_CHANGED")
+            rows.extend(stored)
+    chunked_delete_rows(root, full, rows, key, full, applied, summary["fingerprint"], summary["count"])
+    if os.path.lexists(full):
+        deny("SOURCE_STILL_EXISTS", full)
+    write_control_json(root, isolation_control_rel(archived_rel), {"schemaVersion": 1, "state": "deleted",
+                                                                    "operationId": request["operationId"], "destination": archived_rel, "deletedAt": time.time()})
+    directory = chunked_manifest_dir(root, key)
+    for name in os.listdir(directory):
+        if re.fullmatch(r"((chunk-\d{6}|summary)\.json|summary\.json\.[0-9a-f]{12}\.tmp)", name):
+            os.remove(os.path.join(directory, name))
+    try:
+        os.rmdir(directory)
+    except OSError:
+        pass
+    return {"ok": True, "rootIdentity": identity, "receipt": {"operationId": request["operationId"], "action": "delete", "phase": "completed",
+            "chunked": True, "count": summary["count"], "fingerprint": summary["fingerprint"], "destination": target["destination"]}}
 
 
 def audit(root, row):
@@ -1016,10 +1206,55 @@ def managed_observe(request):
             # this isolation completed; nothing on the new path is touched.
             return {"ok": True, "state": "completed", "verifiedBy": proven, "rootIdentity": identity, "executor": executor}
         value = isolate_inspect(root, target, request.get("operationId"))
+    elif target.get("chunked") is True and request["cleanupAction"] == "delete" and archived_control_rel(target) is not None:
+        # Pending observation of a chunked deletion stays bounded: it reports
+        # the frozen summary watermark instead of walking the archive again.
+        manifest = chunked_manifest_read(root, manifest_key(request.get("operationId"), archived_control_rel(target), target["destination"]), "summary.json")
+        return {"ok": True, "state": "pending", "rootIdentity": identity, "executor": executor, "chunked": True,
+                "applied": manifest.get("applied", 0) if isinstance(manifest, dict) else 0, "count": target.get("count")}
     else:
         value = inspect(root, target, archived_source)
     state = "pending" if value["fingerprint"] == target["fingerprint"] else "changed"
     return {"ok": True, "state": state, "rootIdentity": identity, "executor": executor}
+
+
+def runtime_prepare(request):
+    # First-install/upgrade of the single new deletion engine into the existing
+    # protected program area: content-addressed, exclusive create, byte + hash
+    # verified; an unknown same-name file is refused, never overwritten.
+    source = request.get("runtimeSource")
+    sha = request.get("runtimeSha256")
+    if not isinstance(source, str) or not isinstance(sha, str) or not re.fullmatch(r"[a-f0-9]{64}", sha):
+        deny("INVALID_REQUEST")
+    code = source.encode("utf-8")
+    if len(code) > 262144 or hashlib.sha256(code).hexdigest() != sha:
+        deny("RUNTIME_CODE_MISMATCH")
+    root, identity = root_guard(request["root"])
+    if request.get("rootIdentity") is not None and identity != request["rootIdentity"]:
+        deny("ROOT_IDENTITY_CHANGED")
+    os.makedirs(path_guard(root, "clean_dir/.operations/managed", True, True), exist_ok=True)
+    name = "clean_dir/.operations/managed/runtime-" + sha + ".py"
+    full = path_guard(root, name, True, True)
+
+    def verified():
+        st = os.lstat(full)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size != len(code):
+            deny("RUNTIME_PROGRAM_MISMATCH", full)
+        with open(full, "rb") as handle:
+            if handle.read() != code:
+                deny("RUNTIME_PROGRAM_MISMATCH", full, "程序区域已有不同身份的同名文件，拒绝覆盖")
+    if os.path.lexists(full):
+        verified()
+        return {"ok": True, "state": "verified", "runtimeSha256": sha, "programRelativePath": name, "rootIdentity": identity}
+    try:
+        with open(full, "xb") as handle:
+            handle.write(code)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError:
+        verified()
+        return {"ok": True, "state": "verified", "runtimeSha256": sha, "programRelativePath": name, "rootIdentity": identity}
+    return {"ok": True, "state": "installed", "runtimeSha256": sha, "programRelativePath": name, "rootIdentity": identity}
 
 
 def managed_start(request):
@@ -1033,24 +1268,32 @@ def managed_start(request):
         deny("CLEANUP_TARGET_CHANGED")
     root, _ = root_guard(request["root"])
     key = managed_key(request)
-    # Immutable confirmed input and code are audit assets, never live state records.
-    directory = path_guard(root, "clean_dir/.operations/managed", True, True)
-    os.makedirs(directory, exist_ok=True)
-    path_guard(root, "clean_dir/.operations/managed", True)
-    code = request["runtimeSource"].encode("utf-8")
-    code_name = "clean_dir/.operations/managed/runtime-" + hashlib.sha256(code).hexdigest() + ".py"
+    # Immutable confirmed input is an audit asset, never a live state record.
+    # The window may only execute the verified program already pinned in the
+    # managed program area (installed by runtime-prepare), never a request-
+    # supplied source and never an argv-embedded copy of the engine.
+    program = os.path.abspath(__file__) if "__file__" in globals() else ""
+    pinned = RUNTIME_PROGRAM_RE.fullmatch(os.path.basename(program)) if program else None
+    managed_dir = path_guard(root, "clean_dir/.operations/managed", True)
+    if not pinned or os.path.normcase(os.path.dirname(program)) != os.path.normcase(managed_dir):
+        deny("RUNTIME_PROGRAM_REQUIRED", program, "清理托管窗口只能由已固化的受验程序路径启动")
+    code_name = "clean_dir/.operations/managed/" + pinned.group(0)
+    code_full = path_guard(root, code_name, True)
+    with open(code_full, "rb") as handle:
+        if hashlib.sha256(handle.read()).hexdigest() != pinned.group(1):
+            deny("RUNTIME_CODE_MISMATCH", code_full)
     command = {name: request[name] for name in ("root", "rootIdentity", "operationId", "target")}
     command.update(action=request["cleanupAction"], managedInner=True)
     input_name = "clean_dir/.operations/managed/" + key + ".json"
-    for relative_path, data in ((code_name, code), (input_name, json.dumps(command, ensure_ascii=False, sort_keys=True).encode("utf-8"))):
-        full = path_guard(root, relative_path, True, True)
-        if os.path.lexists(full):
-            with open(full, "rb") as handle:
-                if handle.read() != data:
-                    deny("CLEANUP_INPUT_CHANGED")
-        else:
-            with open(full, "xb") as handle:
-                handle.write(data)
+    full = path_guard(root, input_name, True, True)
+    data = json.dumps(command, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    if os.path.lexists(full):
+        with open(full, "rb") as handle:
+            if handle.read() != data:
+                deny("CLEANUP_INPUT_CHANGED")
+    else:
+        with open(full, "xb") as handle:
+            handle.write(data)
     session = prefix + "-clean-" + digest(root)[:16]
     if subprocess.run(["tmux", "has-session", "-t", session], capture_output=True, timeout=3).returncode:
         managed_tmux(["new-session", "-d", "-s", session])
@@ -1078,6 +1321,8 @@ def main(request):
     if expected_owner is not None and not isinstance(expected_owner, dict):
         deny("OWNERSHIP_UNVERIFIED")
     action = request["action"]
+    if action == "runtime-prepare":
+        return runtime_prepare(request)
     if request.get("target", {}).get("authorizationMode") == "confirmed_paths":
         if action in ("move", "restore", "settle", "isolate") or action in ("managed-start", "managed-observe") and request.get("cleanupAction") != "delete":
             deny("INVALID_AUTHORIZATION_MODE")
@@ -1142,6 +1387,12 @@ def main(request):
                 return {"ok": True, "state": "completed", "verifiedBy": proven_isolation, "rootIdentity": identity}
             if not proven_isolation:
                 if action == "check":
+                    if target.get("chunked") is True and archived_rel is not None:
+                        # Bounded resumable proof: the frozen summary watermark,
+                        # never a full re-walk, answers a chunked preflight.
+                        manifest = chunked_manifest_read(root, manifest_key(request.get("operationId"), archived_rel, target["destination"]), "summary.json")
+                        return {"ok": True, "state": "pending", "rootIdentity": identity, "chunked": True,
+                                "applied": manifest.get("applied", 0) if isinstance(manifest, dict) else 0, "count": target.get("count")}
                     if target.get("fingerprintMode") == "top_level":
                         value = isolate_inspect(root, target, request.get("operationId"))
                     else:
@@ -1233,6 +1484,10 @@ def main(request):
             return {"ok": True, "rootIdentity": identity, "alreadyDeleted": True, "state": "completed", "verifiedBy": "isolation_deleted"}
         if not archived_state or archived_state.get("state") != "isolated":
             deny("NOT_REGISTERED_ISOLATION", archived_control, "只有已登记的隔离产物子树可以经确认路径永久删除")
+        if target.get("chunked") is True:
+            # >50000-entry registered archives run only through the bounded
+            # frozen chunk manifest; the single-pass inventory path is closed.
+            return chunked_permanent_delete(root, request, identity)
     archived = action == "restore" or (action == "inspect" and request.get("archived") is True) \
         or (archived_control is not None and action in ("inspect", "delete"))
     if action == "inspect":
@@ -1240,6 +1495,21 @@ def main(request):
         checked_parent(root, full)
         if not os.path.lexists(full):
             return {"ok": True, "rootIdentity": identity, "target": {"missing": True, "type": target["type"], "absolutePath": full}}
+        if archived and archived_control is not None and target.get("authorizationMode") == "confirmed_paths" and target["type"] == "directory":
+            # A registered archive may exceed the single-message inventory cap.
+            # Preview then returns only the bounded frozen summary; the frozen
+            # digest (not any file list) is what both confirmations bind to.
+            probe = contents(root, full, "directory", metadata_only=True, expected_inventory=target.get("inventory") or (),
+                             allow_nested_git=True, entry_limit=MAX_FROZEN_MANIFEST_ENTRIES)
+            rows = probe["inventory"]
+            if len(rows) > CHUNKED_MANIFEST_THRESHOLD:
+                actual = os.lstat(full)
+                return {"ok": True, "rootIdentity": identity, "target": {"type": "directory", "absolutePath": full, "chunked": True,
+                        "count": len(rows), "fingerprint": digest(rows), "device": str(actual.st_dev), "inode": str(actual.st_ino)}}
+            value = {**probe, "references": [], "manifests": [], "handleWarnings": [], "absolutePath": full,
+                     "parent": os.path.dirname(full), "leaf": os.path.basename(full),
+                     "destination": path_guard(root, target["destination"], True, True)}
+            return {"ok": True, "rootIdentity": identity, "target": value}
     value = inspect(root, target, archived)
     if action == "inspect":
         return {"ok": True, "rootIdentity": identity, "target": value}
@@ -1309,6 +1579,15 @@ if __name__ == "__main__":
     request = {}
     checked_root = None
     try:
+        # A pinned program file may only run when its bytes still match the
+        # identity embedded in its name; tampering fails before any request is
+        # read, so a mutated runtime never touches a target.
+        program = os.path.abspath(__file__) if "__file__" in globals() else ""
+        pinned = RUNTIME_PROGRAM_RE.fullmatch(os.path.basename(program)) if program else None
+        if pinned:
+            with open(program, "rb") as stream:
+                if hashlib.sha256(stream.read()).hexdigest() != pinned.group(1):
+                    deny("RUNTIME_CODE_MISMATCH", program)
         raw = sys.stdin.buffer.read(MAX_CLEANUP_REQUEST_BYTES + 1).rstrip(b"\x00")
         request = decode_request(raw)
         action = request.get("action")

@@ -5,28 +5,65 @@ const path = require('node:path');
 const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 const guard = path.resolve(__dirname, '../cleanup-files.py');
-test('remote inspection loader fits Windows argv limits and preserves the exact UTF-8 safety controller', () => {
-  const { cleanupRemoteLoader } = require('../cleanup-file-api');
-  const source = fs.readFileSync(guard, 'utf8');
-  const loader = cleanupRemoteLoader ? cleanupRemoteLoader(source) :
-    'import base64;exec(compile(base64.b64decode(' + JSON.stringify(Buffer.from(source,'utf8').toString('base64')) + '),\'simple_sftp_cleanup\',\'exec\'))';
-  assert.ok(loader.length < 20000, 'loader exceeds the Windows SSH command budget');
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'simple-cleanup-loader-readonly-')));
-  fs.mkdirSync(path.join(root,'state'));
-  fs.writeFileSync(path.join(root, 'state/retained.txt'), 'retain 中文 bytes', 'utf8');
-  const script = path.join(root, 'loader.py');
-  fs.writeFileSync(script, loader, 'utf8');
+function bootstrapRun(root, payload, expectOk) {
+  const { RUNTIME_PREPARE_BOOTSTRAP } = require('../cleanup-file-api');
+  fs.mkdirSync(path.join(root, 'installer-tmp'), { recursive: true });
+  const script = path.join(root, 'installer-tmp', 'bootstrap-' + process.pid + '-' + Math.random().toString(16).slice(2) + '.py');
+  fs.writeFileSync(script, RUNTIME_PREPARE_BOOTSTRAP, 'utf8');
+  // The SSH transport writes NUL-terminated stdin chunks; the installer must
+  // tolerate the exact production framing.
   const result = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-B', '-X', 'utf8', script], {
-    input: JSON.stringify({root,action:'inventory',target:{type:'file',relativePath:'state/retained.txt'}}),
-    encoding:'utf8',timeout:10000,windowsHide:true});
-  assert.equal(result.status,0,result.stderr);
-  const report=JSON.parse(result.stdout);
-  assert.equal(report.ok,true,JSON.stringify(report));
-  assert.equal(fs.readFileSync(path.join(root,'state/retained.txt'),'utf8'),'retain 中文 bytes');
-  assert.equal(fs.existsSync(path.join(root,'clean_dir')),false);
-  const packed = JSON.parse(/base64\.b64decode\(("[^"]+")\)/.exec(loader)[1]);
-  assert.equal(require('node:zlib').inflateSync(Buffer.from(packed,'base64')).toString('utf8'),source);
-  assert.match(fs.readFileSync(path.resolve(__dirname,'../extension.js'),'utf8'),/const loader = cleanupRemoteLoader\(script\)/);
+    input: JSON.stringify(payload) + '\0', encoding: 'utf8', timeout: 10000, windowsHide: true });
+  fs.rmSync(script, { force: true });
+  if (expectOk) assert.equal(result.status, 0, result.stderr || result.stdout);
+  else assert.notEqual(result.status, 0, 'invalid installer input must fail closed');
+  return JSON.parse(result.stdout);
+}
+test('the pinned program area installs the exact engine once and only short path calls cross the wire', () => {
+  const api = require('../cleanup-file-api');
+  const source = fs.readFileSync(guard, 'utf8');
+  const extensionSource = fs.readFileSync(path.resolve(__dirname, '../extension.js'), 'utf8');
+  const apiSource = fs.readFileSync(path.resolve(__dirname, '../cleanup-file-api.js'), 'utf8');
+  // Full retirement of the old whole-source argv channel (v1.5 lane B).
+  assert.ok(!extensionSource.includes('cleanupRemoteLoader') && !apiSource.includes('cleanupRemoteLoader'), 'old loader entry remains');
+  assert.ok(!extensionSource.includes('request.runtimeSource'), 'managed-start must not smuggle engine source per request');
+  assert.match(extensionSource, /remoteRuntimeCommand\(programPath, shellQuote\)/);
+  const runtime = api.runtimePrepareRequest({ root: '/srv/project/', source });
+  assert.match(runtime.sha256, /^[a-f0-9]{64}$/);
+  assert.equal(runtime.programRelativePath, 'clean_dir/.operations/managed/runtime-' + runtime.sha256 + '.py');
+  const prepareCommand = api.remoteRuntimePrepareCommand(JSON.stringify);
+  const callCommand = api.remoteRuntimeCommand('/srv/project/' + runtime.programRelativePath, JSON.stringify);
+  assert.ok(prepareCommand.length < 20000 && callCommand.length < 20000, 'remote commands exceed the Windows argv budget');
+  assert.match(prepareCommand, /^python3 -B -c /);
+  assert.match(callCommand, /^python3 -B -X utf8 "\/srv\/project\/clean_dir\/\.operations\/managed\/runtime-[a-f0-9]{64}\.py"$/);
+  assert.throws(() => api.remoteRuntimeCommand('clean_dir/relative', JSON.stringify), /UNSAFE_ROOT/);
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'simple-cleanup-pinned-')));
+  fs.mkdirSync(path.join(root, 'state'));
+  fs.writeFileSync(path.join(root, 'state/retained.txt'), 'retain 中文 bytes', 'utf8');
+  const payload = { action: 'runtime-prepare', root, runtimeSha256: runtime.sha256, runtimeSource: source };
+  const installed = bootstrapRun(root, payload, true);
+  assert.equal(installed.state, 'installed', JSON.stringify(installed));
+  const pinned = path.join(root, runtime.programRelativePath);
+  assert.equal(fs.readFileSync(pinned, 'utf8'), source);
+  const again = bootstrapRun(root, payload, true);
+  assert.equal(again.state, 'verified', JSON.stringify(again));
+  fs.appendFileSync(pinned, '# mutated after pinning\n');
+  const tampered = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-B', '-X', 'utf8', pinned], {
+    input: JSON.stringify({ root, action: 'inventory', target: { type: 'file', relativePath: 'state/retained.txt' } }),
+    encoding: 'utf8', timeout: 10000, windowsHide: true });
+  assert.equal(tampered.status, 0, tampered.stderr);
+  assert.equal(JSON.parse(tampered.stdout).error.code, 'RUNTIME_CODE_MISMATCH', 'a mutated pinned program must refuse to run');
+  fs.copyFileSync(guard, pinned);
+  const viaPinned = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-B', '-X', 'utf8', pinned], {
+    input: JSON.stringify({ root, action: 'inventory', target: { type: 'file', relativePath: 'state/retained.txt' } }) + '\0',
+    encoding: 'utf8', timeout: 10000, windowsHide: true });
+  assert.equal(viaPinned.status, 0, viaPinned.stderr);
+  assert.equal(JSON.parse(viaPinned.stdout).ok, true);
+  assert.equal(fs.readFileSync(path.join(root, 'state/retained.txt'), 'utf8'), 'retain 中文 bytes');
+  // A request whose claimed identity does not match its content refuses without touching the pinned program.
+  const foreign = bootstrapRun(root, { ...payload, runtimeSha256: '0'.repeat(64) }, false);
+  assert.match(foreign.error.code, /RUNTIME_CODE_MISMATCH|INVALID_REQUEST/);
+  assert.equal(fs.readFileSync(pinned, 'utf8'), source, 'refusal never touched the pinned program');
 });
 function fixture() {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'simple-formal-owner-readonly-')));

@@ -2,7 +2,7 @@
 exactly its own bound window after a persisted completion identity; replaying
 the same intent completes from the receipt without opening a new window.
 Confined to a fresh disposable temp root and its own TMUX_TMPDIR socket."""
-import json, os, pathlib, subprocess, sys, tempfile, time
+import hashlib, json, os, pathlib, subprocess, sys, tempfile, time
 
 engine_path = pathlib.Path(sys.argv[1]).resolve()
 source = engine_path.read_text(encoding="utf-8")
@@ -14,6 +14,18 @@ BATCH = "job-" + "b" * 48
 
 def run(request, timeout=6):
     proc = subprocess.run([sys.executable, "-B", str(engine)], input=json.dumps(request),
+                          capture_output=True, text=True, timeout=timeout)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    value = json.loads(proc.stdout)
+    assert value.get("ok"), value
+    return value
+
+prepared = run({"root": str(root), "action": "runtime-prepare",
+                     "runtimeSha256": hashlib.sha256(source.encode("utf-8")).hexdigest(), "runtimeSource": source})
+pinned = root / "clean_dir" / ".operations" / "managed" / ("runtime-" + prepared["runtimeSha256"] + ".py")
+
+def run_pinned(request, timeout=6):
+    proc = subprocess.run([sys.executable, "-B", str(pinned)], input=json.dumps(request),
                           capture_output=True, text=True, timeout=timeout)
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     value = json.loads(proc.stdout)
@@ -62,8 +74,8 @@ try:
     start = {"root": str(root), "rootIdentity": inspected["rootIdentity"], "operationId": "iso-job-a",
              "cleanupAction": "isolate",
              "target": {**target, **inspected["target"], "destination": target["destination"]},
-             "runtimeSource": source, "tmuxSessionPrefix": "iso"}
-    started = run({**start, "action": "managed-start"})
+             "tmuxSessionPrefix": "iso"}
+    started = run_pinned({**start, "action": "managed-start"})
     assert started["state"] == "requested", started
     done = wait_state(start, "completed")
     assert done.get("verifiedBy") == "completion_receipt", done

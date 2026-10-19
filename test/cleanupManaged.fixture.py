@@ -1,5 +1,5 @@
 """Destructive operations are confined to new disposable CPU fixture files."""
-import base64, json, os, pathlib, subprocess, sys, tempfile, time
+import hashlib, base64, json, os, pathlib, subprocess, sys, tempfile, time
 engine=pathlib.Path(sys.argv[1]);source=engine.read_text(encoding="utf-8")
 root=pathlib.Path(tempfile.mkdtemp(prefix="se-clean-observe-"))
 engine=root/"engine.py"
@@ -10,13 +10,20 @@ def run(request):
     assert proc.returncode==0,(proc.stderr,proc.stdout)
     value=json.loads(proc.stdout);assert value.get("ok"),value
     return value
+prepared=run({"root":str(root),"action":"runtime-prepare","runtimeSha256":hashlib.sha256(source.encode("utf-8")).hexdigest(),"runtimeSource":source})
+pinned=root/"clean_dir"/".operations"/"managed"/("runtime-"+prepared["runtimeSha256"]+".py")
+def run_pinned(request):
+    proc=subprocess.run([sys.executable,"-B",str(pinned)],input=json.dumps(request),capture_output=True,text=True,timeout=4)
+    assert proc.returncode==0,(proc.stderr,proc.stdout)
+    value=json.loads(proc.stdout);assert value.get("ok"),value
+    return value
 def frozen(name,action):
     target={"relativePath":name,"type":"directory","destination":"clean_dir/"+name,"activityEvidenceMode":"managed_tmux"}
     inspected=run({"root":str(root),"action":"inspect","target":target})
     if name == "outputs/remove":
         assert any(row["binding"].get("planFile")=="experiments/plans/fixture.yaml" for row in inspected["target"].get("manifests",[]))
     return {"root":str(root),"rootIdentity":inspected["rootIdentity"],"target":{**target,**inspected["target"],"destination":target["destination"]},
-            "operationId":"fixture-"+name.replace("/","-"),"cleanupAction":action,"runtimeSource":source,"tmuxSessionPrefix":"research"}
+            "operationId":"fixture-"+name.replace("/","-"),"cleanupAction":action,"tmuxSessionPrefix":"research"}
 def observe(request):
     return run({**request,"action":"managed-observe"})
 def await_done(request):
@@ -45,10 +52,10 @@ try:
     subprocess.run(["tmux","set-option","-w","-t","writer","@sftp_cleanup_target",base64.urlsafe_b64encode(json.dumps(live).encode()).decode()],check=True,timeout=1)
     presence=run({"root":str(root),"action":"inventory","presenceOnly":True,"observeExecutors":True,"allowMissing":True,"target":{"relativePath":"outputs/remove","type":"directory"}})
     assert presence["target"]["missing"] is False and presence["executorsChecked"] and len(presence["executors"])==1
-    rejected=subprocess.run([sys.executable,"-B",str(engine)],input=json.dumps({**deletion,"action":"managed-start"}),capture_output=True,text=True,timeout=2)
+    rejected=subprocess.run([sys.executable,"-B",str(pinned)],input=json.dumps({**deletion,"action":"managed-start"}),capture_output=True,text=True,timeout=2)
     assert json.loads(rejected.stdout)["error"]["code"]=="ACTIVE_TMUX_TASK",rejected.stdout
     subprocess.run(["tmux","kill-window","-t","writer:0"],check=True,timeout=1)
-    run({**deletion,"action":"managed-start"})  # The caller deliberately ignores this transport response.
+    run_pinned({**deletion,"action":"managed-start"})  # The caller deliberately ignores this transport response.
     await_done(deletion)
     names=subprocess.run(["tmux","list-sessions","-F","#{session_name}"],capture_output=True,text=True,timeout=1,check=True).stdout.splitlines()
     assert names and all(name.startswith("research-clean-") for name in names),names
@@ -62,7 +69,7 @@ try:
     # re-delete or re-open a window for the finished operation.
     after_recreate=observe(deletion)
     assert after_recreate["state"]=="completed" and after_recreate.get("verifiedBy")=="completion_receipt",after_recreate
-    replay=subprocess.run([sys.executable,"-B",str(engine)],input=json.dumps({**deletion,"action":"managed-start"}),capture_output=True,text=True,timeout=2,check=True).stdout
+    replay=subprocess.run([sys.executable,"-B",str(pinned)],input=json.dumps({**deletion,"action":"managed-start"}),capture_output=True,text=True,timeout=2,check=True).stdout
     replayed=json.loads(replay)
     assert replayed["state"]=="completed" and replayed.get("verifiedBy")=="completion_receipt",replay
     assert (root/"outputs/remove"/"new.txt").read_text(encoding="utf-8")=="new job"
@@ -70,7 +77,7 @@ try:
     # Self close released the exact pane: no bound cleanup pane remains.
     assert not [line for line in panes.splitlines() if line.strip()],panes
     move=frozen("outputs/move","move")
-    run({**move,"action":"managed-start"})
+    run_pinned({**move,"action":"managed-start"})
     await_done(move)
     assert (root/"clean_dir/outputs/move/weight.pth").read_bytes()==b"fixture"
     assert observe(move)["state"]=="completed"
