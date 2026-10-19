@@ -733,6 +733,98 @@ def chunked_read_chunk(root, key, index, expected_digest):
     return rows
 
 
+def chunked_manifest_trim(root, key, summary, total_chunks):
+    # P0 metadata trim: only files this operation provably produced are ever
+    # removed, and the set is taken from the bound summary, never from scanning
+    # the directory. The exact bound set is summary.json plus the hash-bound
+    # chunk files enumerated by summary["chunkDigests"]. Each removal rechecks
+    # the canonical guarded path, regular type, single link and the bound
+    # digest/identity before entering the parent, then re-verifies the same
+    # inode/device/size/mtime after the production parent_cd guard really
+    # entered the direct parent (physical-cwd recheck), and only "./<leaf>"
+    # reaches unlink/rmdir. Unknown, injected, changed, oversized or linked
+    # entries are retained and reported; every skip or error is surfaced. The
+    # completed artifact-subtree deletion never fails because of this optional
+    # trim, and a directory that was not fully trimmed is never claimed as
+    # trimmed.
+    report = {"status": "retained", "removed": [], "retained": [], "errors": [],
+              "directoryRemoved": False, "unknownNames": []}
+    try:
+        directory = chunked_manifest_dir(root, key)
+    except (GuardError, OSError) as error:
+        report["errors"].append("manifest-dir:" + str(getattr(error, "code", type(error).__name__)))
+        return report
+    bound = {"summary.json": ("summary", None)}
+    digests = summary.get("chunkDigests") if isinstance(summary.get("chunkDigests"), list) else []
+    for index in range(total_chunks):
+        bound["chunk-%06d.json" % index] = ("chunk", digests[index] if index < len(digests) else None)
+    try:
+        directory_stat = os.lstat(directory)
+    except OSError as error:
+        report["errors"].append("directory-lstat:" + type(error).__name__)
+        return report
+    for name in sorted(bound):
+        kind, expected_digest = bound[name]
+        try:
+            full = path_guard(root, "clean_dir/.operations/frozen/%s/%s" % (key, name), True, True)
+            if not os.path.lexists(full):
+                report["retained"].append({"name": name, "reason": "missing"})
+                continue
+            st = os.lstat(full)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                report["retained"].append({"name": name, "reason": "type"})
+                continue
+            if st.st_nlink != 1 or st.st_size > (262144 if kind == "summary" else 8 * 1024 * 1024):
+                report["retained"].append({"name": name, "reason": "links-or-size"})
+                continue
+            with open(full, "rb") as stream:
+                blob = stream.read()
+            if kind == "chunk":
+                if expected_digest is None or hashlib.sha256(blob).hexdigest() != expected_digest:
+                    report["retained"].append({"name": name, "reason": "digest"})
+                    continue
+            else:
+                try:
+                    shown = json.loads(blob.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    report["retained"].append({"name": name, "reason": "summary-parse"})
+                    continue
+                if (not isinstance(shown, dict) or shown.get("schemaVersion") != 1
+                        or shown.get("fingerprint") != summary["fingerprint"] or shown.get("count") != summary["count"]):
+                    report["retained"].append({"name": name, "reason": "summary-identity"})
+                    continue
+            child = parent_cd(root, full)
+            after = os.lstat(child)
+            if (not stat.S_ISREG(after.st_mode) or after.st_ino != st.st_ino or after.st_dev != st.st_dev
+                    or after.st_size != st.st_size or after.st_mtime_ns != st.st_mtime_ns):
+                report["retained"].append({"name": name, "reason": "identity-after-cd"})
+                continue
+            os.unlink(child)
+            report["removed"].append(name)
+        except (GuardError, OSError) as error:
+            report["errors"].append("%s:%s" % (name, getattr(error, "code", type(error).__name__)))
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError as error:
+        report["errors"].append("listing:" + type(error).__name__)
+        return report
+    report["unknownNames"] = [name for name in entries if name not in bound]
+    if not entries:
+        try:
+            child = parent_cd(root, directory)
+            after = os.lstat(child)
+            if not stat.S_ISDIR(after.st_mode) or after.st_ino != directory_stat.st_ino or after.st_dev != directory_stat.st_dev:
+                report["errors"].append("directory:IDENTITY_AFTER_CD")
+            else:
+                os.rmdir(child)
+                report["directoryRemoved"] = True
+        except (GuardError, OSError) as error:
+            report["errors"].append("directory:" + str(getattr(error, "code", type(error).__name__)))
+    report["status"] = ("trimmed" if not entries and report["directoryRemoved"]
+                        and not report["retained"] and not report["errors"] else "retained")
+    return report
+
+
 def chunked_permanent_delete(root, request, identity):
     # The only >50000-entry deletion chain (registered isolated archives with a
     # confirmed exact path; ordinary confirmed_paths scopes keep the existing
@@ -817,16 +909,15 @@ def chunked_permanent_delete(root, request, identity):
         deny("SOURCE_STILL_EXISTS", full)
     write_control_json(root, isolation_control_rel(archived_rel), {"schemaVersion": 1, "state": "deleted",
                                                                     "operationId": request["operationId"], "destination": archived_rel, "deletedAt": time.time()})
-    directory = chunked_manifest_dir(root, key)
-    for name in os.listdir(directory):
-        if re.fullmatch(r"((chunk-\d{6}|summary)\.json|summary\.json\.[0-9a-f]{12}\.tmp)", name):
-            os.remove(os.path.join(directory, name))
-    try:
-        os.rmdir(directory)
-    except OSError:
-        pass
-    return {"ok": True, "rootIdentity": identity, "receipt": {"operationId": request["operationId"], "action": "delete", "phase": "completed",
+    trim = chunked_manifest_trim(root, key, summary, total_chunks)
+    result = {"ok": True, "rootIdentity": identity, "receipt": {"operationId": request["operationId"], "action": "delete", "phase": "completed",
             "chunked": True, "count": summary["count"], "fingerprint": summary["fingerprint"], "destination": target["destination"]}}
+    if trim["status"] != "trimmed":
+        # The artifact-subtree deletion fact stands on its own; an incomplete
+        # optional trim is a separate honestly-reported fact, never hidden and
+        # never turned into a second deletion pass.
+        result["manifestTrim"] = trim
+    return result
 
 
 def audit(root, row):
