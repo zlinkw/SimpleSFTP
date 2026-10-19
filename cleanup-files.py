@@ -489,10 +489,10 @@ def no_replace(source, destination):
             deny("MOVE_FAILED", str(ctypes.get_errno()))
 
 
-def delete_file(root, full, expected, metadata_only=False, nested_git_root=None):
+def delete_file(root, full, expected, metadata_only=False, nested_git_root=None, allow_clean=False):
     if expected.get("type") != "file":
         deny("UNCERTAIN_TYPE")
-    path_guard(root, os.path.relpath(full, root).replace(os.sep, "/"), nested_git_root=nested_git_root if metadata_only else None)
+    path_guard(root, os.path.relpath(full, root).replace(os.sep, "/"), allow_clean, nested_git_root=nested_git_root if metadata_only else None)
     actual = contents(root, full, "file", metadata_only=metadata_only, expected_inventory=[expected])["inventory"][0]
     if any(actual.get(key) != expected.get(key) for key in ("device", "inode", "size", "mtime", "ctime" if metadata_only else "sha256")):
         deny("CONTENT_CHANGED")
@@ -505,12 +505,12 @@ def delete_file(root, full, expected, metadata_only=False, nested_git_root=None)
     os.unlink(child)
 
 
-def delete_directory(root, full, inventory, base="", metadata_only=False, nested_git_root=None):
+def delete_directory(root, full, inventory, base="", metadata_only=False, nested_git_root=None, allow_clean=False):
     # Execute the immutable inventory. New children and runtime type changes never expand it.
     expected = next((row for row in inventory if row["path"] == base), None)
     if not expected or expected["type"] != "directory":
         deny("UNCERTAIN_TYPE")
-    path_guard(root, os.path.relpath(full, root).replace(os.sep, "/"), nested_git_root=nested_git_root if metadata_only else None)
+    path_guard(root, os.path.relpath(full, root).replace(os.sep, "/"), allow_clean, nested_git_root=nested_git_root if metadata_only else None)
     children = [row for row in inventory if row["path"] != base and row["path"].rsplit("/", 1)[0] == base] if base else [row for row in inventory if row["path"] and "/" not in row["path"]]
     leaves = sorted(row["path"].split("/")[-1] for row in children)
     if sorted(os.listdir(full)) != leaves:
@@ -522,9 +522,9 @@ def delete_directory(root, full, inventory, base="", metadata_only=False, nested
         if str(st.st_ino) != row["inode"] or str(st.st_dev) != row["device"]:
             deny("IDENTITY_CHANGED")
         if row["type"] == "file" and stat.S_ISREG(st.st_mode):
-            delete_file(root, value, row, metadata_only=metadata_only, nested_git_root=nested_git_root)
+            delete_file(root, value, row, metadata_only=metadata_only, nested_git_root=nested_git_root, allow_clean=allow_clean)
         elif row["type"] == "directory" and stat.S_ISDIR(st.st_mode):
-            delete_directory(root, value, inventory, row["path"], metadata_only=metadata_only, nested_git_root=nested_git_root)
+            delete_directory(root, value, inventory, row["path"], metadata_only=metadata_only, nested_git_root=nested_git_root, allow_clean=allow_clean)
         else:
             deny("TYPE_CHANGED")
     child = parent_cd(root, full)
@@ -720,6 +720,31 @@ def isolate_inspect(root, target, operation_id=None):
     return value
 
 
+def frozen_isolation_completion(root, target, destination):
+    """v1.2 recovery proof: a finished isolation is proven only by the frozen
+    pre-change identity still parked at the bound destination (rename keeps the
+    source inode/device) or by the registered isolation record. A recreated
+    canonical path is new-run data; it never revokes the completed operation,
+    and it is never re-moved or re-deleted. Insufficient proof stays unknown."""
+    if os.path.lexists(destination):
+        try:
+            after = top_identity(destination, target["type"])
+        except GuardError:
+            return None
+        if after["inode"] == target.get("inode") and after["device"] == target.get("device"):
+            return "destination_identity"
+        return None
+    destination_rel = os.path.relpath(destination, root).replace(os.sep, "/")
+    registered = isolation_state(root, destination_rel)
+    if not registered:
+        return None
+    if registered.get("state") == "deleted":
+        return "isolation_deleted"
+    if registered.get("state") == "isolated" and registered.get("source") == relative(target["relativePath"]):
+        return "destination_identity"
+    return None
+
+
 def subtree_lock_rel(component_rel):
     return "clean_dir/.operations/locks/" + hashlib.sha256(
         ("subtree:" + os.path.normcase(component_rel)).encode("utf-8")).hexdigest() + ".lock"
@@ -767,16 +792,24 @@ def acquire_target_locks(root, rels):
 
 def finalize_managed_window(root, request):
     """C3 server-side self close: persist the minimal anti-replay completion
-    identity first, then release remain-on-exit only on this request's exactly
-    bound window. Failures keep the window for inspection; never re-delete."""
+    identity first, then release exactly this request's bound pane — proven
+    live, matching @sftp_cleanup and still marked remain-on-exit — by turning
+    the flag off and destroying that single pane. A wrapper that exits without
+    closing (tmux 3.0a/3.2a/3.3a keep a remain-on-exit window through a later
+    flag change and shell teardown) must not leave a dead window behind.
+    Failures keep the window for inspection; never re-delete."""
     key = managed_key({**request, "cleanupAction": request["action"]})
     write_control_json(root, completion_control_rel(key), {"schemaVersion": 1, "state": "completed", "cleanupKey": key,
                                                            "operationId": request["operationId"], "action": request["action"], "completedAt": time.time()})
     try:
-        fields = managed_tmux(["display-message", "-p", "#{window_id}\t#{@sftp_cleanup}"]).split("\t")
-        if len(fields) != 2 or fields[1] != key:
+        pane = os.environ.get("TMUX_PANE", "")
+        if not pane:
+            return {"finalized": False, "receiptWritten": True}
+        fields = managed_tmux(["display-message", "-p", "-t", pane, "#{window_id}\t#{pane_id}\t#{pane_dead}\t#{@sftp_cleanup}\t#{remain-on-exit}"]).split("\t")
+        if len(fields) != 5 or fields[3] != key or fields[2] != "0" or fields[4] != "on":
             return {"finalized": False, "receiptWritten": True}
         managed_tmux(["set-option", "-w", "-t", fields[0], "remain-on-exit", "off"])
+        managed_tmux(["kill-pane", "-t", fields[1]])
         return {"finalized": True, "receiptWritten": True}
     except GuardError:
         return {"finalized": False, "receiptWritten": True}
@@ -976,6 +1009,12 @@ def managed_observe(request):
             return {"ok": True, "state": "changed", "code": "DESTINATION_CHANGED", "rootIdentity": identity, "executor": executor}
         return {"ok": True, "state": "completed", "verifiedBy": "destination_identity", "rootIdentity": identity, "executor": executor}
     if target.get("fingerprintMode") == "top_level":
+        proven = frozen_isolation_completion(root, target, destination)
+        if proven is not None:
+            # The canonical source reappeared as new-run data while no receipt
+            # was readable (crash before finalize): the frozen binding keeps
+            # this isolation completed; nothing on the new path is touched.
+            return {"ok": True, "state": "completed", "verifiedBy": proven, "rootIdentity": identity, "executor": executor}
         value = isolate_inspect(root, target, request.get("operationId"))
     else:
         value = inspect(root, target, archived_source)
@@ -1015,7 +1054,12 @@ def managed_start(request):
     session = prefix + "-clean-" + digest(root)[:16]
     if subprocess.run(["tmux", "has-session", "-t", session], capture_output=True, timeout=3).returncode:
         managed_tmux(["new-session", "-d", "-s", session])
-    launch = "exec " + shlex.join([sys.executable, "-B", "-X", "utf8", path_guard(root, code_name, True)]) + " < " + shlex.quote(path_guard(root, input_name, True))
+    # The window must never reach completion before the parent publishes its
+    # options: a pane that finished under remain-on-exit=off and was flagged
+    # on afterwards lingers dead forever. The wrapper waits (bounded) for the
+    # exact binding, then execs the engine.
+    launch = ("for i in $(seq 1 500); do [ -n \"$(tmux display-message -p -t \"$TMUX_PANE\" '#{@sftp_cleanup}')\" ] && break; sleep 0.01; done; exec "
+              + shlex.join([sys.executable, "-B", "-X", "utf8", path_guard(root, code_name, True)]) + " < " + shlex.quote(path_guard(root, input_name, True)))
     # The parent holds the existing mutation lock until window binding is published;
     # the child acquires that same lock before touching any approved target.
     pane = managed_tmux(["new-window", "-d", "-t", session, "-n", "cleanup-" + key[:12], "-c", root,
@@ -1090,21 +1134,37 @@ def main(request):
             # name reappears; a rebuilt path never authorizes re-deletion.
             return {"ok": True, "state": "completed", "verifiedBy": "isolation_deleted", "irreversible": True, "rootIdentity": identity}
         if os.path.lexists(source):
-            if action == "check":
-                if target.get("fingerprintMode") == "top_level":
-                    value = isolate_inspect(root, target, request.get("operationId"))
-                else:
-                    value = inspect(root, target) if target.get("authorizationMode") == "confirmed_paths" or (target.get("expectedOwner") or {}).get("resultPathPolicy") == "declared" else contents(root, source, target["type"])
-                if value["fingerprint"] != target["fingerprint"]:
-                    deny("SOURCE_RECREATED_OR_CHANGED")
-                if os.path.lexists(destination):
-                    deny("DESTINATION_EXISTS")
-                return {"ok": True, "state": "pending", "rootIdentity": identity}
-            deny("SOURCE_RECREATED_OR_NOT_MOVED")
+            proven_isolation = target.get("fingerprintMode") == "top_level" and frozen_isolation_completion(root, target, destination)
+            if proven_isolation and action == "check":
+                # The frozen binding proves the isolation finished before the
+                # new run recreated the canonical path; that new data never
+                # revokes the completed operation.
+                return {"ok": True, "state": "completed", "verifiedBy": proven_isolation, "rootIdentity": identity}
+            if not proven_isolation:
+                if action == "check":
+                    if target.get("fingerprintMode") == "top_level":
+                        value = isolate_inspect(root, target, request.get("operationId"))
+                    else:
+                        value = inspect(root, target) if target.get("authorizationMode") == "confirmed_paths" or (target.get("expectedOwner") or {}).get("resultPathPolicy") == "declared" else contents(root, source, target["type"])
+                    if value["fingerprint"] != target["fingerprint"]:
+                        deny("SOURCE_RECREATED_OR_CHANGED")
+                    if os.path.lexists(destination):
+                        deny("DESTINATION_EXISTS")
+                    return {"ok": True, "state": "pending", "rootIdentity": identity}
+                deny("SOURCE_RECREATED_OR_NOT_MOVED")
+            # settle/verify of a proven isolation continue below to the frozen
+            # destination verification and idempotent record repair; the
+            # recreated source itself is never read, moved or deleted.
         if request.get("deleted") is True:
             if action == "check":
                 return {"ok": True, "state": "completed" if request.get("receiptCompleted") is True else "absent_unverified", "rootIdentity": identity}
             return {"ok": True, "irreversible": True}
+        if target.get("fingerprintMode") == "top_level" and not os.path.lexists(destination):
+            registered = isolation_state(root, os.path.relpath(destination, root).replace(os.sep, "/"))
+            if registered and registered.get("state") == "deleted":
+                # The isolated subtree already finished its user-confirmed
+                # permanent deletion: that proves (and closes) the isolation.
+                return {"ok": True, "state": "completed", "verifiedBy": "isolation_deleted", "irreversible": True, "rootIdentity": identity}
         if not os.path.lexists(destination):
             deny("RECEIPT_UNVERIFIED")
         if target.get("fingerprintMode") == "top_level":
@@ -1204,12 +1264,17 @@ def main(request):
     if checked["fingerprint"] != value["fingerprint"]:
         deny("CONTENT_CHANGED")
     if action == "delete":
+        # C4: only a registered isolated artifact subtree may be deleted
+        # metadata-only through the confirmed-path flow; the traversal may
+        # therefore walk clean_dir, while the control regions were refused
+        # above and the frozen inventory can never expand.
+        archived_clean = archived_control is not None
         if target["type"] == "file":
-            delete_file(root, value["absolutePath"], value["inventory"][0], metadata_only=target.get("authorizationMode") == "confirmed_paths")
+            delete_file(root, value["absolutePath"], value["inventory"][0], metadata_only=target.get("authorizationMode") == "confirmed_paths", allow_clean=archived_clean)
         elif target["type"] == "directory":
             path_only = target.get("authorizationMode") == "confirmed_paths"
             delete_directory(root, value["absolutePath"], value["inventory"], metadata_only=path_only,
-                             nested_git_root=value["absolutePath"] if path_only else None)
+                             nested_git_root=value["absolutePath"] if path_only else None, allow_clean=archived_clean)
         else:
             deny("UNCERTAIN_TYPE")
     else:

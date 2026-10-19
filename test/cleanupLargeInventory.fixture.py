@@ -45,7 +45,7 @@ frozen_file = managed / (key + '.json')
 frozen = {'root':root_text,'rootIdentity':identity,'operationId':request['operationId'],'action':'delete','managedInner':True,'target':target}
 raw = json.dumps(frozen,ensure_ascii=False,sort_keys=True)
 frozen_file.write_text(raw,encoding='utf-8')
-compact_target = {name:target[name] for name in ('relativePath','destination','type','fingerprint','contentFingerprint','inode','authorizationMode')}
+compact_target = {name:target[name] for name in ('relativePath','destination','type','fingerprint','contentFingerprint','inode','fingerprintMode','authorizationMode')}
 compact = {**request,'action':'managed-observe','target':compact_target,'frozenTargetDigest':engine['frozen_target_digest'](target)}
 assert len(json.dumps(compact).encode('utf-8')) < 8192
 env['managed_tmux'] = lambda args: '@1\t%1\t0\t\t' + key

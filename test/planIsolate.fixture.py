@@ -1,9 +1,16 @@
 """C1/C2/C4 paired contract fixture: controlled fast isolation, exact subtree
 single-writer locks and registered isolated-subtree permanent deletion.
 Runs entirely inside fresh disposable temp roots; no tmux required."""
-import builtins, json, os, pathlib, runpy, sys, tempfile
+import builtins, json, os, pathlib, subprocess, sys, tempfile
 
-module = runpy.run_path(sys.argv[1])
+# exec into a shared namespace: runpy.run_path returns a *copy*, so function
+# patches must target the real globals the engine functions close over.
+engine_src = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+module = {"__name__": "cleanup_files_fixture", "__file__": str(pathlib.Path(sys.argv[1]).resolve())}
+exec(compile(engine_src, sys.argv[1], "exec"), module)
+# isolate renames run through parent_cd, which changes the process cwd;
+# any later subprocess must reference the engine by its absolute path.
+engine_path = str(pathlib.Path(sys.argv[1]).resolve())
 root = pathlib.Path(tempfile.mkdtemp(prefix='plan-isolate-'))
 outputs = root / 'work_dirs'
 weight_dir = outputs / 'run1'
@@ -68,30 +75,57 @@ manifest_lines = (root / 'clean_dir' / 'MANIFEST.md').read_text(encoding='utf-8'
 assert any('"phase":"intent"' in line for line in manifest_lines) and any('"phase":"completed"' in line for line in manifest_lines)
 assert not any('"inventory"' in line for line in manifest_lines), 'isolate audit must stay a compact fact'
 
-# 3) a new run recreates the canonical path; recovery only acknowledges the
-# frozen binding and never re-moves or reports the new data as the old source.
+# 3) a new run recreates the canonical path; the frozen binding keeps the
+# isolation completed — check/settle acknowledge it, and the new data is never
+# re-moved, re-deleted or mistaken for the old source.
 weight_dir.mkdir(parents=True)
 (weight_dir / 'new-run.txt').write_text('new run data', encoding='utf-8')
-settle_request = {'action': 'settle', 'settledAction': 'isolate', 'operationId': 'op-iso-run1',
-                  'target': {key: frozen[key] for key in ('relativePath', 'destination', 'type', 'fingerprint', 'inode', 'device', 'fingerprintMode')}}
-expect_code(settle_request, 'SOURCE_RECREATED_OR_NOT_MOVED')
-expect_code({**settle_request, 'action': 'check'}, 'SOURCE_RECREATED_OR_CHANGED')
+frozen_keys = ('relativePath', 'destination', 'type', 'fingerprint', 'inode', 'device', 'fingerprintMode')
+settle_target = {key: frozen[key] for key in frozen_keys}
+settled3 = run({'action': 'settle', 'settledAction': 'isolate', 'operationId': 'op-iso-run1', 'target': settle_target})
+assert settled3['ok'] and settled3['receipt']['fingerprintMode'] == 'top_level', settled3
+checked3 = run({'action': 'check', 'operationId': 'op-iso-run1', 'target': settle_target})
+assert checked3['state'] == 'completed' and checked3.get('verifiedBy') == 'destination_identity', checked3
 assert (weight_dir / 'new-run.txt').read_text(encoding='utf-8') == 'new run data'
+assert (moved / 'weight.bin').exists() and not data_reads
+
+# 3b) crash window plus recreation: rename committed, the registration never
+# landed, then the new run recreates the source path. The frozen destination
+# identity still proves completion; settle repairs the record and never
+# touches the recreated directory.
+(outputs / 'run8').mkdir()
+(outputs / 'run8' / 'old.bin').write_text('old', encoding='utf-8')
+frozen8 = isolate_request('run8')
+run({'action': 'isolate', 'operationId': 'op-iso-run8', 'target': frozen8})
+crashed8 = 'clean_dir/' + BATCH + '/work_dirs/run8'
+os.remove(root / module['isolation_control_rel'](crashed8))
+recreated8 = outputs / 'run8'
+recreated8.mkdir()
+(recreated8 / 'fresh.txt').write_text('fresh', encoding='utf-8')
+crashed8 = 'clean_dir/' + BATCH + '/work_dirs/run8'
+assert isolation_state(crashed8) is None
+settled8 = run({'action': 'settle', 'settledAction': 'isolate', 'operationId': 'op-iso-run8',
+                'target': {key: frozen8[key] for key in frozen_keys}})
+assert settled8['ok'] and settled8['receipt']['fingerprintMode'] == 'top_level', settled8
+assert isolation_state(crashed8)['state'] == 'isolated'
+assert (recreated8 / 'fresh.txt').read_text(encoding='utf-8') == 'fresh'
+
+# 3c) insufficient evidence: nothing was ever renamed and the canonical is
+# still present — settle stays unknown and moves nothing.
+(outputs / 'run9').mkdir()
+frozen9 = isolate_request('run9')
+expect_code({'action': 'settle', 'settledAction': 'isolate', 'operationId': 'op-iso-run9',
+             'target': {key: frozen9[key] for key in frozen_keys}}, 'SOURCE_RECREATED_OR_NOT_MOVED')
+assert (outputs / 'run9').is_dir() and not (root / 'clean_dir' / BATCH / 'work_dirs' / 'run9').exists()
 
 # 4) crash window: rename committed but the completion record never did.
-# Recovery trusts only the frozen binding, repairs the mapping, never re-moves.
+# Recreate exactly that filesystem state by dropping the registration file.
 (outputs / 'run2').mkdir()
 (outputs / 'run2' / 'epoch.ckpt').write_text('ckpt', encoding='utf-8')
 frozen2 = isolate_request('run2')
-real_register = module['register_isolation']
-patched = lambda *args, **kwargs: None
-try:
-    module['register_isolation'] = patched
-    assert module['isolate_inspect'] is not None
-    run({'action': 'isolate', 'operationId': 'op-iso-run2', 'target': frozen2})
-finally:
-    module['register_isolation'] = real_register
+run({'action': 'isolate', 'operationId': 'op-iso-run2', 'target': frozen2})
 crashed_rel = 'clean_dir/' + BATCH + '/work_dirs/run2'
+os.remove(root / module['isolation_control_rel'](crashed_rel))
 assert isolation_state(crashed_rel) is None and (root / crashed_rel).is_dir()
 settled = run({'action': 'settle', 'settledAction': 'isolate', 'operationId': 'op-iso-run2',
                'target': {key: frozen2[key] for key in ('relativePath', 'destination', 'type', 'fingerprint', 'inode', 'device', 'fingerprintMode')}})
@@ -117,20 +151,34 @@ expect_code({'action': 'isolate', 'operationId': 'op-x', 'target': {'relativePat
           'destination': 'clean_dir/work_dirs/run4', 'archiveBatch': BATCH}}, 'UNSAFE_DESTINATION')
 (outputs / 'run5').mkdir()
 (root / 'clean_dir' / BATCH / 'work_dirs' / 'run5').mkdir(parents=True)
-expect_code({'action': 'isolate', 'operationId': 'op-x', 'target': isolate_request('run5')}, 'DESTINATION_EXISTS')
+expect_code({'action': 'isolate', 'operationId': 'op-x', 'target': isolate_target('run5')}, 'DESTINATION_EXISTS')
 
-# 7) C2 subtree locks: leaf exclusive, ancestors shared. Siblings parallel;
-# parent/child and same-path overlap block with OPERATION_BUSY without ever
-# holding the root mutation lock.
+# 7) C2 subtree locks: leaf exclusive, ancestors shared. Disjoint siblings run
+# in parallel; parent/child and same-path overlap block with OPERATION_BUSY
+# without ever holding the root mutation lock. The engine entry itself refuses
+# an overlapping target while an external writer holds the subtree chain.
 held = module['acquire_target_locks'](str(root), ['work_dirs/run6/deep'])
 try:
     (outputs / 'run7').mkdir()
     sibling = isolate_request('run7')
-    run({'action': 'isolate', 'operationId': 'op-iso-run7', 'target': sibling})  # disjoint sibling succeeds
+    parallel = module['acquire_target_locks'](str(root), ['work_dirs/run7'])  # disjoint sibling chain is compatible
+    for stream in parallel:
+        stream.close()
+    run({'action': 'isolate', 'operationId': 'op-iso-run7', 'target': sibling})
     assert not (outputs / 'run7').exists()
     (outputs / 'run6').mkdir(exist_ok=True)
-    expect_code({'action': 'isolate', 'operationId': 'op-x', 'target': isolate_request('run6')}, 'OPERATION_BUSY')  # ancestor overlap blocks
-    expect_code({'action': 'delete', 'operationId': 'op-x', 'target': {'relativePath': 'work_dirs/run6', 'destination': 'clean_dir/work_dirs/run6', 'type': 'directory'}}, 'OPERATION_BUSY')
+    for overlap in (['work_dirs/run6'], ['work_dirs/run6/deep'], ['work_dirs/run6/deep/leaf']):
+        try:
+            module['acquire_target_locks'](str(root), overlap)
+        except module['GuardError'] as error:
+            assert error.code == 'OPERATION_BUSY', (overlap, error.code)
+        else:
+            raise AssertionError('expected OPERATION_BUSY for ' + overlap[-1])
+    busy = subprocess.run([sys.executable, '-B', engine_path],
+                          input=json.dumps({'root': str(root), 'action': 'isolate', 'operationId': 'op-x', 'target': isolate_target('run6')}),
+                          capture_output=True, text=True, timeout=8)
+    assert busy.returncode == 0 and json.loads(busy.stdout)['error']['code'] == 'OPERATION_BUSY', (busy.returncode, busy.stdout, busy.stderr)
+    assert (outputs / 'run6').is_dir()
 finally:
     for stream in held:
         stream.close()
@@ -153,16 +201,28 @@ replayed = run({'action': 'delete', 'operationId': 'op-del-run2-replay', 'target
 assert replayed.get('alreadyDeleted') is True and replayed['state'] == 'completed'
 check_after = run({'action': 'check', 'target': frozen_delete})
 assert check_after['state'] == 'completed' and check_after.get('verifiedBy') == 'isolation_deleted'
+# the original isolation operation of that deleted subtree also stays proven
+# completed through the registration, never revoked or re-moved.
+isolate_check = run({'action': 'check', 'operationId': 'op-iso-run2',
+                     'target': {key: frozen2[key] for key in ('relativePath', 'destination', 'type', 'fingerprint', 'inode', 'device', 'fingerprintMode')}})
+assert isolate_check['state'] == 'completed' and isolate_check.get('verifiedBy') == 'isolation_deleted', isolate_check
 # a rebuilt name after completion stays new data: replays complete and a fresh
 # deletion requires a fresh registration (anti-replay, never re-delete).
 (root / archived_rel).mkdir(parents=True); (root / archived_rel / 'fresh.bin').write_text('keep', encoding='utf-8')
 rebuilt = run({'action': 'delete', 'operationId': 'op-del-replay2', 'target': frozen_delete})
 assert rebuilt.get('alreadyDeleted') is True and (root / archived_rel / 'fresh.bin').read_text(encoding='utf-8') == 'keep'
-# re-isolating into the same destination re-registers and replaces the record
+# re-isolating into the recreated old destination stays refused (that
+# directory is new data; it is never overwritten or re-moved). A new rerun
+# intent derives a fresh batch, lands cleanly and registers there, while the
+# old batch keeps its completed deletion identity.
 (outputs / 'run2').mkdir()
-frozen2b = isolate_request('run2')
+expect_code({'action': 'isolate', 'operationId': 'op-x', 'target': isolate_target('run2')}, 'DESTINATION_EXISTS')
+fresh_batch = 'job-' + 'c' * 48
+frozen2b = isolate_request('run2', batch=fresh_batch)
 run({'action': 'isolate', 'operationId': 'op-iso-run2b', 'target': frozen2b})
-assert isolation_state(archived_rel)['state'] == 'isolated'
+assert isolation_state('clean_dir/' + fresh_batch + '/work_dirs/run2')['state'] == 'isolated'
+assert isolation_state(archived_rel)['state'] == 'deleted'
+assert (root / archived_rel / 'fresh.bin').read_text(encoding='utf-8') == 'keep'
 
 # 9) control regions and unregistered archive paths always stay refused.
 for rel, code in (('clean_dir', 'PROTECTED_PATH'), ('clean_dir/MANIFEST.md', 'PROTECTED_PATH'),
@@ -172,7 +232,9 @@ for rel, code in (('clean_dir', 'PROTECTED_PATH'), ('clean_dir/MANIFEST.md', 'PR
               'type': 'directory', 'authorizationMode': 'confirmed_paths'}}, code)
 
 # 10) restore clears the isolation registration so a later confirmed delete
-# requires a fresh registration.
+# requires a fresh registration. Restore keeps the ordinary move contract
+# (full content verification), so fast-path reads are snapshotted before it.
+fast_reads = list(data_reads)
 archived2 = 'clean_dir/' + BATCH + '/work_dirs/run3'
 restore_target = {'relativePath': archived2, 'type': 'directory', 'archiveBatch': BATCH, 'destination': 'work_dirs/run3'}
 restore_preview = run({'action': 'inspect', 'archived': True, 'target': dict(restore_target)})
@@ -183,5 +245,6 @@ assert isolation_state(archived2)['state'] == 'restored'
 expect_code({'action': 'delete', 'operationId': 'op-x', 'target': {'relativePath': archived2, 'destination': archived2,
           'type': 'directory', 'authorizationMode': 'confirmed_paths'}}, 'NOT_REGISTERED_ISOLATION')
 
-assert not data_reads, ('data content was read on fast paths', data_reads[:3])
+assert not fast_reads, ('data content was read on fast paths', fast_reads[:3])
+assert any('epoch.ckpt' in read for read in data_reads), 'ordinary restore must still verify restored content fully'
 print(json.dumps({'ok': True, 'fastIsolate': True, 'subtreeLocks': True, 'registeredDeletion': True}))

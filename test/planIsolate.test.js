@@ -7,7 +7,7 @@ function runFixture(name,timeout){const fixture=path.resolve(__dirname,name),eng
   const proc=spawnSync(process.platform==='win32'?'wsl.exe':'python3',args,{encoding:'utf8',timeout,windowsHide:true});
   assert.equal(proc.status,0,proc.stderr||proc.stdout);return JSON.parse(proc.stdout);}
 const BATCH='job-'+'a'.repeat(48);
-function makeApi(overrides={}){const requests=[];const api=new CleanupFileApi({storageRoot:path.join(os.tmpdir(),'plan-isolate-'+process.pid+'-'+Math.random().toString(36).slice(2)),activity:async()=>{},transport:async request=>{requests.push(JSON.parse(JSON.stringify(request)));
+function makeApi(overrides={}){const requests=[];const api=new CleanupFileApi({storageRoot:path.join(os.tmpdir(),'plan-isolate-'+process.pid+'-'+Math.random().toString(36).slice(2)),activity:async()=>{},lease:async(_node,_targets,fn)=>fn(),transport:async request=>{requests.push(JSON.parse(JSON.stringify(request)));
   if(request.action==='inspect'){if(overrides.inspect)return overrides.inspect(request);
     return {ok:true,rootIdentity:{path:'/scope'},target:{type:request.target.type,absolutePath:'/scope/'+request.target.relativePath,fingerprint:'top-'+request.target.relativePath,inode:'7',device:'1',fingerprintMode:'top_level',inventory:[]}};}
   if(request.action==='managed-start')return overrides.start?overrides.start(request):{ok:true,state:'requested',rootIdentity:{path:'/scope'}};
@@ -92,7 +92,7 @@ test('a lost isolation response settles, re-preflights only on the fast inspect,
   });
   const preview=await api.preview({node:{kind:'remote',root:'/scope'},action:'isolate',targets:[{...isolateTarget}]});
   await api.confirm({token:preview.token,digest:preview.digest,phase:1,confirm:true,exactTargets:['/scope/outputs/run1']});
-  await assert.rejects(api.execute({token:preview.token,digest:preview.digest,index:0}),/REQUEST_TIMEOUT/);
+  await assert.rejects(api.execute({token:preview.token,digest:preview.digest,index:0}),error=>error.code==='REQUEST_TIMEOUT');
   const retry=await api.execute({token:preview.token,digest:preview.digest,index:0});
   assert.equal(retry.ok,true);assert.equal(retry.receipt.phase,'completed');
   const mutates=requests.filter(request=>request.action==='isolate');
@@ -104,8 +104,11 @@ test('a lost isolation response settles, re-preflights only on the fast inspect,
 });
 
 test('controlled fast isolation, subtree single-writer locks and registered permanent deletion hold against the real engine',()=>{
-  assert.deepEqual(runFixture('planIsolate.fixture.py',15000),{ok:true,fastIsolate:true,subtreeLocks:true,registeredDeletion:true});
+  assert.deepEqual(runFixture('planIsolate.fixture.py',10000),{ok:true,fastIsolate:true,subtreeLocks:true,registeredDeletion:true});
 });
 test('managed isolation windows persist a completion receipt and release exactly their own bound window',()=>{
-  assert.deepEqual(runFixture('planIsolate.tmux.fixture.py',16000),{ok:true,serverSelfClose:true,failureWindowPreserved:true});
+  assert.deepEqual(runFixture('planIsolate.tmux.fixture.py',10000),{ok:true,serverSelfClose:true});
+});
+test('a blocked cleanup window stays preserved with a non-zero exit while the retried intent still self-closes',()=>{
+  assert.deepEqual(runFixture('planIsolate.tmux2.fixture.py',10000),{ok:true,failureWindowPreserved:true});
 });
