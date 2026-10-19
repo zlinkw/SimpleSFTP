@@ -18,15 +18,12 @@ function stage(name, stateFile) {
 test('a >50000-entry registered archive deletes only through resumable frozen chunks', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'simple-cleanup-chunked-'));
   const stateFile = path.join(root, 'state.json');
-  try {
-    assert.equal(stage('build', stateFile), 'ok');
-    assert.equal(stage('abort', stateFile), 'ok');
-    assert.equal(stage('refuse', stateFile), 'ok');
-    assert.equal(stage('complete', stateFile), 'ok');
-    assert.equal(stage('rebuild', stateFile), 'ok');
-  } finally {
-    const state = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) : null;
-    if (state && state.root && fs.existsSync(state.root)) fs.rmSync(state.root, { recursive: true, force: true });
-    fs.rmSync(root, { recursive: true, force: true });
-  }
+  assert.equal(stage('build', stateFile), 'ok');
+  assert.equal(stage('abort', stateFile), 'ok');
+  assert.equal(stage('refuse', stateFile), 'ok');
+  assert.equal(stage('complete', stateFile), 'ok');
+  assert.equal(stage('rebuild', stateFile), 'ok');
+  // Every artifact (state file, fixture root, the retained refusal file) is
+  // deliberately kept on disk after the run; the test performs no recursive
+  // optional cleanup that could hide a failure or destroy evidence.
 });

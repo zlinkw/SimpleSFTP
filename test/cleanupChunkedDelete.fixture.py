@@ -143,7 +143,19 @@ if stage == "refuse":
     # The refusal happened while applying the third newest chunk (zz0005 was no
     # longer empty): finishing the second chunk advanced the watermark once and
     # the refusing chunk never advanced it.
-    injector.unlink()
+    # The injected file is a test-owned artifact: move it (never delete it)
+    # into a retained directory inside this fixture root, so later stages see
+    # the frozen layout again while the evidence file survives. Verify the
+    # canonical fixture parent and a fresh non-existing target first, then do
+    # a no-overwrite rename.
+    assert os.path.realpath(str(root)) == str(root), "fixture root must be canonical"
+    retain = root / "refuse-retained"
+    retain.mkdir()
+    assert not os.path.islink(retain) and os.path.realpath(str(retain)) == str(retain)
+    retired = retain / injector.name
+    assert not os.path.lexists(str(retired)), "retention target must not pre-exist"
+    os.rename(str(injector), str(retired))
+    assert not injector.exists() and retired.read_text(encoding="utf-8") == "user data"
     print("ok")
     sys.exit(0)
 

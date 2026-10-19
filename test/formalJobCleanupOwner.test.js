@@ -14,7 +14,8 @@ function bootstrapRun(root, payload, expectOk) {
   // tolerate the exact production framing.
   const result = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-B', '-X', 'utf8', script], {
     input: JSON.stringify(payload) + '\0', encoding: 'utf8', timeout: 10000, windowsHide: true });
-  fs.rmSync(script, { force: true });
+  // The written bootstrap script is deliberately retained in the fixture root
+  // as an evidence artifact; the test never performs optional cleanup.
   if (expectOk) assert.equal(result.status, 0, result.stderr || result.stdout);
   else assert.notEqual(result.status, 0, 'invalid installer input must fail closed');
   return JSON.parse(result.stdout);
