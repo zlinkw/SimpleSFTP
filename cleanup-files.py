@@ -42,6 +42,13 @@ def decode_request(raw):
     inventory = request.get("target", {}).get("inventory")
     if isinstance(inventory, list) and len(inventory) > 50000:
         deny("INVENTORY_LIMIT")
+    # v1.10: a read-only observation round carries up to 5000 keyed entries
+    # without an inventory; it gets its own bounded budget and is refused
+    # before any filesystem work happens.
+    if request.get("action") == "batch-observe":
+        if len(raw) > 8 * 1048576:
+            deny("REQUEST_TOO_LARGE")
+        return request
     # Replies already permit a 16 MiB frozen inventory. Large authenticated
     # inventory-bearing lifecycle requests get a separate, still bounded budget.
     if len(raw) > 1048576 and (not isinstance(inventory, list) or request.get("action") not in
@@ -1169,6 +1176,131 @@ def batch_verify(root, identity, request):
     return {"ok": True, "rootIdentity": identity, "targets": rows}
 
 
+def cleanup_executor_inventory(root):
+    """One shared managed-pane sweep for a whole batch-observe request.
+
+    Returns (inventory, checked). checked is False when the sweep cannot be
+    performed here (Windows, or a tmux failure handled by the caller), so the
+    answer reports executor facts as unchecked instead of laundering an empty
+    list into "no executors". A malformed binding still refuses the round,
+    exactly like current_cleanup_executors: an untrusted sweep proves nothing.
+    """
+    if os.name == "nt":
+        return [], False
+    lines = managed_tmux(["list-panes", "-a", "-F", "#{window_id}\t#{pane_id}\t#{pane_dead}\t#{@sftp_cleanup_target}"]).splitlines()
+    inventory = []
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) != 4 or fields[2] == "1" or not fields[3]:
+            continue
+        try:
+            binding = json.loads(base64.urlsafe_b64decode(fields[3]).decode("utf-8"))
+        except (ValueError, UnicodeError):
+            deny("CLEANUP_WINDOW_BINDING_UNVERIFIED", fields[0])
+        if binding.get("root") == root:
+            inventory.append((fields[0], fields[1], binding))
+    return inventory, True
+
+
+def executors_for_paths(inventory, root, paths):
+    """Window facts for one group's exact paths, matched inside the shared sweep."""
+    result = []
+    for window_id, pane_id, binding in inventory:
+        for name in ("relativePath", "destination"):
+            if not binding.get(name):
+                continue
+            active = path_guard(root, relative(binding[name]), True, True)
+            if any(full == active or below(full, active) or below(active, full) for full in paths):
+                result.append({"windowId": window_id, "paneId": pane_id})
+                break
+    return result
+
+
+def observe_entry(root, rel, expected_type, device=None, inode=None):
+    """Current facts for one exact path under the existing guards; never follows links.
+
+    status stays inside the batch-verify vocabulary (present/gone/replaced):
+    same frozen identity with the same kind is present; anything else observed
+    on disk (identity drift, type change, link) is replaced - new data, never
+    the frozen entry.
+    """
+    full = path_guard(root, rel, bool(ARCHIVED_BATCH_RE.match(rel)), True)
+    if not os.path.lexists(full):
+        return {"status": "gone", "absolutePath": full,
+                "target": {"missing": True, "type": expected_type, "absolutePath": full}}
+    st = os.lstat(full)
+    kind = "directory" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "unknown"
+    same = (device is None or str(st.st_dev) == str(device)) and (inode is None or str(st.st_ino) == str(inode))
+    return {"status": "present" if same and kind == expected_type else "replaced", "absolutePath": full,
+            "target": {"missing": False, "type": kind, "absolutePath": full,
+                       "device": str(st.st_dev), "inode": str(st.st_ino)}}
+
+
+def batch_observe(root, identity, request):
+    """v1.10 exception recovery: one read-only observation round per request.
+
+    Every keyed entry answers with CURRENT filesystem facts (presence, kind,
+    identity against the frozen device/inode), executor facts taken from the
+    ONE shared window sweep, and - only where the caller supplied an explicit
+    isolation path - that residue probe. Nothing is guessed and nothing is
+    fabricated from local receipts: this walk takes no execution lock, writes
+    nothing, and grants no authority for a later step. A poisoned path answers
+    only for itself; the round never claims more than it observed.
+    """
+    entries = request.get("entries")
+    if not isinstance(entries, list) or not 1 <= len(entries) <= FAST_BATCH_LIMIT:
+        deny("FAST_BATCH_INVALID")
+    if not isinstance(request.get("observationId"), str) or not request.get("observationId"):
+        deny("INVALID_REQUEST")
+    if request.get("rootIdentity") and request["rootIdentity"] != identity:
+        deny("ROOT_IDENTITY_CHANGED")
+    keys = [item.get("key") if isinstance(item, dict) else None for item in entries]
+    if any(not isinstance(key, str) or not key for key in keys) or len(set(keys)) != len(keys):
+        deny("INVALID_REQUEST")
+    for item, key in zip(entries, keys):
+        if not isinstance(item.get("relativePath"), str):
+            deny("UNSAFE_PATH", key or "")
+        if item.get("type") not in ("file", "directory"):
+            deny("INVALID_REQUEST", key or "")
+        if item.get("isolationRelativePath") is not None and not isinstance(item["isolationRelativePath"], str):
+            deny("UNSAFE_PATH", key or "")
+    try:
+        inventory, checked = cleanup_executor_inventory(root)
+    except GuardError:
+        raise  # unverified binding: the round stays unknown, never an empty list
+    except Exception:
+        # No usable tmux here (missing binary, timeout): executor facts are
+        # explicitly unchecked, which is not the same as "no executors".
+        inventory, checked = [], False
+    observations = []
+    for item, key in zip(entries, keys):
+        row = {"key": key, "relativePath": item["relativePath"], "type": item["type"]}
+        iso_rel = item.get("isolationRelativePath")
+        try:
+            facts = observe_entry(root, relative(item["relativePath"]), item["type"], item.get("device"), item.get("inode"))
+            paths = [facts["absolutePath"]]
+            if iso_rel is not None:
+                iso_facts = observe_entry(root, relative(iso_rel), "directory")
+                paths.append(iso_facts["absolutePath"])
+                row["isolationStatus"] = iso_facts["status"]
+                row["isolationChecked"] = True
+            row["status"] = facts["status"]
+            row["target"] = facts["target"]
+            row["executors"] = executors_for_paths(inventory, root, paths) if checked else []
+            row["executorsChecked"] = checked
+        except GuardError as error:
+            row = {"key": key, "relativePath": item["relativePath"], "type": item.get("type"),
+                   "executors": [], "executorsChecked": False,
+                   "error": {"code": error.code, "message": str(error) or error.code}}
+            if iso_rel is not None:
+                row["isolationChecked"] = False
+        observations.append(row)
+    return {"ok": True, "observationId": request["observationId"], "rootIdentity": identity,
+            "capabilities": dict(FAST_CAPABILITIES, batchCleanupObservation=1),
+            "observations": observations,
+            "metrics": {"selected": len(observations), "executorQueries": 1 if checked else 0}}
+
+
 def fast_tree_remove(root, entry_abs, allow_clean, stats):
     """Post-order removal of one fully authorized tree under the ./<leaf> rule.
 
@@ -1813,6 +1945,8 @@ def main(request):
         return batch_inspect(root, identity, request)
     if action == "batch-verify":
         return batch_verify(root, identity, request)
+    if action == "batch-observe":
+        return batch_observe(root, identity, request)
     if action == "delete-fast":
         return delete_fast(root, identity, request)
     if request.get("target", {}).get("authorizationMode") == "confirmed_paths":

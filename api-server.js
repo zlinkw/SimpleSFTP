@@ -190,7 +190,7 @@ class LocalApiServer {
         return;
       }
       const controller = new AbortController();
-      const readOnly = /\.(list|get|status|schema)$/.test(payload.method) || ["files.cleanup.check", "files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.verify"].includes(payload.method) || /^(project\.(inventory|fileStats|tree)|sync\.(?:projectInventory|projectFileStats|projectTree|projectTreeState|planLogPaths|listPlanLogs)|transfers\.reconcile)$/.test(payload.method)
+      const readOnly = /\.(list|get|status|schema)$/.test(payload.method) || ["files.cleanup.check", "files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.verify", "files.cleanup.observeBatch"].includes(payload.method) || /^(project\.(inventory|fileStats|tree)|sync\.(?:projectInventory|projectFileStats|projectTree|projectTreeState|planLogPaths|listPlanLogs)|transfers\.reconcile)$/.test(payload.method)
         || payload.method === "sync.downloadMappedPaths" && payload.params?.memoryOnly === true;
       let queued = true;
       const cancelRead = () => { if (queued || readOnly) controller.abort(new Error("API_READ_CANCELLED")); };

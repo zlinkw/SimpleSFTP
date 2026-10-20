@@ -1,0 +1,272 @@
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');
+const {spawnSync}=require('node:child_process');
+// v1.10 contract tests for the public read-only recovery round
+// files.cleanup.observeBatch (cleanup-file-api observeBatch + engine
+// batch-observe): one caller round shares one engine sweep per batch, stays
+// inside the caller's 1/2 read budget (instance cap 2), answers per contract
+// key with CURRENT facts, refuses cross-node/root token reuse, and degrades
+// missing, duplicated, reordered or failed answers to explicit unknowns -
+// never to "gone". Pure fake transport plus the FakeOS engine fixture; no
+// real deletion, no runner, nothing here authorizes execution.
+const {CleanupFileApi}=require('../cleanup-file-api');
+const IDENTITY={path:'/srv/proj',device:'7',inode:'100',machine:'host',user:'0'};
+const JOB='clean_dir/job-'+('a'.repeat(48));
+const NODE={kind:'local',root:'/srv/proj'};
+const isoName=rel=>'iso_'+rel.slice('out/'.length);
+const expanded=entries=>entries.reduce((sum,e)=>sum+(e.isolationRelativePath?2:1),0);
+function harness(options={}){
+  const calls=[],stats={observeRpcs:[],active:0,peak:0};
+  const transport=async request=>{
+    calls.push(request);
+    if(request.action==='batch-inspect'){
+      return {ok:true,rootIdentity:IDENTITY,metrics:{entryReads:request.targets.length},
+        capabilities:{confirmedPathFastDelete:1,batchEntryInspect:1},
+        targets:request.targets.map(t=>({relativePath:t.relativePath,type:t.type,absolutePath:'/srv/proj/'+t.relativePath,
+          device:'7',inode:'2'+t.relativePath,
+          ...(t.relativePath.startsWith(JOB+'/')?{archived:true}
+            :t.type==='directory'?{isolationName:isoName(t.relativePath)}:{})}))};
+    }
+    if(request.action==='batch-observe'){
+      if(request.entries.length>5000||expanded(request.entries)>5000)
+        throw Object.assign(Error('FAST_BATCH_INVALID'),{code:'FAST_BATCH_INVALID'});
+      if(request.observationId===undefined)throw Object.assign(Error('INVALID_REQUEST'),{code:'INVALID_REQUEST'});
+      stats.observeRpcs.push(expanded(request.entries));
+      const n = stats.observeRpcs.length; // fixed at entry: delayed batches keep their own round number
+      stats.active++;stats.peak=Math.max(stats.peak,stats.active);
+      try{
+        if(options.delay)await new Promise(resolve=>setTimeout(resolve,10));
+        if(options.observeFails&&options.observeFails(request,n))
+          throw Object.assign(Error('OBSERVE_ROUND_FAILED'),{code:'OBSERVE_ROUND_FAILED'});
+        if(options.identityDrift)return {ok:false,error:{code:'ROOT_IDENTITY_CHANGED'}};
+        let rows=request.entries.map(e=>options.observe?options.observe(e,n):{key:e.key,status:'present',
+          target:{missing:false,type:e.type,absolutePath:'/srv/proj/'+e.relativePath,device:e.device||'7',inode:e.inode||'9'+e.relativePath},
+          executors:[],executorsChecked:true,
+          ...(e.isolationRelativePath?{isolationStatus:'present',isolationChecked:true}:{})});
+        if(options.dropRow)for(let k=rows.length-1;k>=0;k--)if(options.dropRow(rows[k]))rows.splice(k,1);
+        if(options.duplicateRow){const dup=rows.find(options.duplicateRow);if(dup)rows.push({...dup});}
+        if(options.shuffleRows)rows.reverse();
+        return {ok:true,observationId:options.wrongRound?'other-round':request.observationId,
+          rootIdentity:options.wrongIdentity&&n>1?{...IDENTITY,inode:'666'}:IDENTITY,
+          capabilities:{batchCleanupObservation:1,maxTargets:5000},observations:rows,metrics:{}};
+      } finally{ stats.active--; }
+    }
+    throw Object.assign(Error('UNEXPECTED_ACTION'),{code:'UNEXPECTED_ACTION'});
+  };
+  const storageRoot=fs.mkdtempSync(path.join('/tmp/opencode','observe-batch-'));
+  const api=new CleanupFileApi({storageRoot,transport,activity:async()=>({}),lease:async(n,t,run)=>run()});
+  return {api,calls,stats,storageRoot};
+}
+const dirs=n=>Array.from({length:n},(_,i)=>({relativePath:'out/d'+i,type:'directory'}));
+const residue=n=>dirs(n).map((t,i)=>({key:'k'+i,...t,isolationRelativePath:'out/iso_d'+i}));
+async function confirmed(api,targets){
+  const row=await api.preview({node:NODE,action:'delete',authorizationMode:'confirmed_paths',targets});
+  const exact=row.targets.filter(t=>!t.missing).map(t=>t.absolutePath);
+  await api.confirm({token:row.token,digest:row.digest,confirm:true,phase:1,exactTargets:exact});
+  await api.confirm({token:row.token,digest:row.digest,confirm:true,phase:2,exactTargets:exact});
+  return row;
+}
+const observe=(api,targets,options={})=>api.observeBatch({node:options.node||NODE,observationId:options.observationId||'round-1',
+  readConcurrency:options.readConcurrency??2,...(options.rootIdentity===undefined?{}:{rootIdentity:options.rootIdentity}),targets});
+
+test('one round answers 1200 residue dirs in ONE expanded batch with the contract echo',async()=>{
+  const {api,calls,stats}=harness();
+  const res=await observe(api,residue(1200),{observationId:'round-a'});
+  assert.deepEqual(stats.observeRpcs,[2400],'original+isolation ride together, counted as expanded entries');
+  assert.equal(calls.length,1,'1200 residue targets must never become per-file queries');
+  assert.equal(res.observationId,'round-a');
+  assert.deepEqual(res.capabilities,{batchCleanupObservation:1,maxTargets:5000});
+  assert.deepEqual(res.rootIdentity,IDENTITY);
+  assert.equal(res.observations.length,1200);
+  const first=res.observations[0];
+  assert.deepEqual({key:first.key,relativePath:first.relativePath,type:first.type,status:first.status},
+    {key:'k0',relativePath:'out/d0',type:'directory',status:'present'});
+  assert.equal(first.target.missing,false);assert.equal(first.executorsChecked,true);
+  assert.deepEqual(first.isolationStatus,'present');assert.equal(first.isolationChecked,true);
+  assert.equal(first.state,undefined,'no token means no claimed state');
+  assert.ok(res.observations.every(o=>o.error===undefined));
+});
+test('5000/6200 grow in batches across requests, and 3000 isolation dirs pack expanded, never one RPC per file',async()=>{
+  const files=n=>Array.from({length:n},(_,i)=>({key:'f'+i,relativePath:'out/f'+i+'.log',type:'file'}));
+  const one=harness();
+  await observe(one.api,files(5000)); // public cap: one request carries <=5000 original targets
+  await assert.rejects(observe(one.api,files(6200)),/INVALID_REQUEST/,'6200 originals need two rounds, never one oversized RPC');
+  await observe(one.api,files(1200));
+  assert.deepEqual(one.stats.observeRpcs,[5000,1200],'the rounds keep growing bounded batch by batch');
+  assert.ok(one.stats.peak<=2);
+  const two=harness();
+  await observe(two.api,residue(3000));
+  assert.deepEqual(two.stats.observeRpcs,[5000,1000],'expanded 6000 -> [5000,1000], pairs never split');
+  const three=harness();
+  await observe(three.api,residue(5000));
+  assert.deepEqual(three.stats.observeRpcs,[5000,5000],'5000 originals with twins split by EXPANDED entries');
+});
+test('read budget is honoured: peak 1 with readConcurrency=1, peak 2 with 2, instance-wide cap 2 across rounds',async()=>{
+  const slow=harness({delay:true});
+  await observe(slow.api,residue(3000),{readConcurrency:1});
+  assert.equal(slow.stats.peak,1,'readConcurrency=1 keeps a single engine read in flight');
+  const fast=harness({delay:true});
+  await observe(fast.api,residue(3000),{readConcurrency:2});
+  assert.ok(fast.stats.peak>=1&&fast.stats.peak<=2);
+  const shared=harness({delay:true}); // two concurrent calls splitting the SAME global budget
+  await Promise.all([observe(shared.api,residue(3000),{readConcurrency:2,observationId:'round-x'}),
+    observe(shared.api,residue(3000),{readConcurrency:2,observationId:'round-y'})]);
+  assert.equal(shared.stats.peak,2,'B API instance never exceeds two read-only requests in flight in total');
+});
+test('the next round re-queries the filesystem: fresh facts replace stale ones, nothing is cached',async()=>{
+  let round=0;
+  const {api,stats}=harness({observe:e=>{
+    const present=round===0||e.key!=='k1';
+    return {key:e.key,status:present?'present':'gone',
+      target:present?{missing:false,type:e.type,absolutePath:'/srv/proj/'+e.relativePath,device:'7',inode:'9'+e.relativePath}
+        :{missing:true,type:e.type,absolutePath:'/srv/proj/'+e.relativePath},
+      executors:[],executorsChecked:true,...(e.isolationRelativePath?{isolationStatus:present?'present':'gone',isolationChecked:true}:{})};
+  }});
+  const first=await observe(api,residue(3));
+  assert.ok(first.observations.every(o=>o.status==='present'));
+  round=1;
+  const second=await observe(api,residue(3));
+  assert.equal(second.observations[1].status,'gone','the new round observes the new fact');
+  assert.deepEqual(stats.observeRpcs,[6,6],'two rounds really issued two fresh requests');
+});
+test('backend tokens bind to the frozen target, node and root, and carry frozen identity plus the explicit isolation mapping',async()=>{
+  const seen=[];
+  const {api,calls}=harness({observe:e=>{seen.push(e);return {key:e.key,status:e.relativePath.includes('iso_')?'gone':'gone',
+    target:{missing:true,type:e.type,absolutePath:'/srv/proj/'+e.relativePath},executors:[],executorsChecked:true,
+    ...(e.isolationRelativePath?{isolationStatus:'gone',isolationChecked:true}:{})};}});
+  const row=await confirmed(api,dirs(2)); // out/d0..d1 gain isolationName iso_dX in the frozen row
+  const res=await observe(api,[
+    {key:'a',relativePath:'out/d0',type:'directory',backendToken:row.token,backendIndex:0,device:'9',inode:'99'},
+    {key:'b',relativePath:'out/d1',type:'directory',backendToken:row.token,backendIndex:1,isolationRelativePath:'elsewhere/wrong'},
+    {key:'x',relativePath:'out/d0',type:'directory',backendToken:row.token,backendIndex:9},
+    {key:'u',relativePath:'out/d0',type:'directory',backendToken:'f'.repeat(48),backendIndex:0},
+  ]);
+  const entry=seen.find(e=>e.key==='a');
+  assert.equal(entry.device,'7');
+  assert.equal(entry.inode,'2out/d0');
+  assert.notEqual(entry.device,'9');
+  assert.equal(entry.isolationRelativePath,'out/iso_d0','the frozen mapping is probed, never guessed');
+  const byKey=Object.fromEntries(res.observations.map(o=>[o.key,o]));
+  assert.equal(byKey.a.state,'completed','isolation gone + original gone settles the frozen entry as completed');
+  assert.equal(byKey.b.error.code,'TOKEN_TARGET_MISMATCH','an isolation claim the row contradicts is refused, not probed');
+  assert.equal(byKey.b.state,'unknown');
+  assert.equal(byKey.x.error.code,'TOKEN_TARGET_MISMATCH');
+  assert.equal(byKey.u.error.code,'TOKEN_UNAVAILABLE');
+  assert.ok(!seen.some(e=>['b','x','u'].includes(e.key)),'refused targets never ride the wire with wrong facts');
+  // same token, different node / different root: refused per target
+  const cross=await observe(api,[{key:'a',relativePath:'out/d0',type:'directory',backendToken:row.token,backendIndex:0}],
+    {node:{kind:'ssh',host:'h1',root:'/srv/proj'}});
+  assert.equal(cross.observations[0].error.code,'TOKEN_NODE_MISMATCH');
+  const crossRoot=await observe(api,[{key:'a',relativePath:'out/d0',type:'directory',backendToken:row.token,backendIndex:0}],
+    {rootIdentity:{...IDENTITY,inode:'666'}});
+  assert.equal(crossRoot.observations[0].error.code,'TOKEN_NODE_MISMATCH');
+});
+test('token rows answer the existing state semantics, including live executors and archived replacement',async()=>{
+  const rows={
+    live:{key:'live',status:'present',target:{missing:false,type:'file',absolutePath:'/srv/proj/out/live',device:'7',inode:'9'},
+      executors:[{windowId:'@1',paneId:'%1'}],executorsChecked:true},
+    hold:{key:'hold',status:'present',target:{missing:false,type:'directory',absolutePath:'/srv/proj/out/hold',device:'7',inode:'9'},
+      executors:[],executorsChecked:true,isolationStatus:'gone',isolationChecked:true},
+    drift:{key:'drift',status:'replaced',target:{missing:false,type:'file',absolutePath:'/srv/proj/out/back',device:'8',inode:'4242'},
+      executors:[],executorsChecked:true},
+    arch:{key:'arch',status:'replaced',target:{missing:false,type:'directory',absolutePath:'/srv/proj/'+JOB+'/out1',device:'8',inode:'4300'},
+      executors:[],executorsChecked:true},
+  };
+  const {api}=harness({observe:e=>rows[e.key]||{key:e.key,status:'present',
+    target:{missing:false,type:e.type,absolutePath:'/srv/proj/'+e.relativePath,device:'7',inode:'9'},executors:[],executorsChecked:true}});
+  const row=await confirmed(api,[{relativePath:'out/live',type:'file'},{relativePath:'out/hold',type:'directory'},
+    {relativePath:'out/back',type:'file'},{relativePath:JOB+'/out1',type:'directory',destination:JOB+'/out1'}]);
+  const res=await observe(api,[
+    {key:'live',relativePath:'out/live',type:'file',backendToken:row.token,backendIndex:0},
+    {key:'hold',relativePath:'out/hold',type:'directory',backendToken:row.token,backendIndex:1},
+    {key:'drift',relativePath:'out/back',type:'file',backendToken:row.token,backendIndex:2},
+    {key:'arch',relativePath:JOB+'/out1',type:'directory',backendToken:row.token,backendIndex:3},
+  ]);
+  const byKey=Object.fromEntries(res.observations.map(o=>[o.key,o]));
+  assert.equal(byKey.live.state,'executing','a live managed window on the exact path is executor evidence');
+  assert.deepEqual(byKey.live.executors,[{windowId:'@1',paneId:'%1'}]);
+  assert.equal(byKey.hold.state,'pending','no isolation residue and the original standing is pending');
+  assert.equal(byKey.drift.state,'completed','same-name replacement is new data, the frozen entry is gone');
+  assert.equal(byKey.arch.state,'unknown','archived replacement is new data at a reused path, not proof');
+});
+test('missing, duplicated, reordered and failed answers stay explicit unknowns and never contaminate siblings',async()=>{
+  const marks=new Set(['k2']);
+  const dropped=harness({dropRow:r=>r.key==='k3',shuffleRows:true,observe:e=>({key:e.key,status:marks.has(e.key)?'gone':'present',
+    target:{missing:marks.has(e.key),type:e.type,absolutePath:'/srv/proj/'+e.relativePath,device:'7',inode:'9'+e.relativePath},
+    executors:[],executorsChecked:true})});
+  const res=await observe(dropped.api,[...Array.from({length:5},(_,i)=>({key:'k'+i,relativePath:'out/d'+i,type:'file'}))]);
+  const byKey=Object.fromEntries(res.observations.map(o=>[o.key,o]));
+  assert.equal(byKey.k2.status,'gone','shuffled rows are matched by key, never by position');
+  assert.equal(byKey.k3.error.code,'ANSWER_MISSING');assert.equal(byKey.k3.executorsChecked,false);
+  assert.equal(byKey.k3.status,undefined,'an unanswered key is unknown, never silently absent');
+  assert.equal(byKey.k0.status,'present','other keys keep their fresh facts');
+
+  const dup=harness({duplicateRow:r=>r.key==='k1'});
+  const res2=await observe(dup.api,[{key:'k1',relativePath:'out/d1',type:'file'}]);
+  assert.equal(res2.observations[0].error.code,'DUPLICATE_ANSWER','a duplicated key is trusted by nobody');
+
+  const failed=harness({delay:true,observeFails:(r,n)=>n===2});
+  const res3=await observe(failed.api,residue(3000)); // expanded 6000 -> [5000,1000], second batch dies
+  assert.equal(res3.observations.filter(o=>o.error&&o.error.code==='OBSERVE_ROUND_FAILED').length,500);
+  assert.equal(res3.observations.filter(o=>o.status==='present').length,2500,'the surviving batch keeps its facts');
+  assert.ok(res3.observations.every(o=>o.state===undefined&&o.status!=='gone'),'a failed batch never writes anything off');
+
+  const drift=harness({identityDrift:true});
+  const res4=await observe(drift.api,residue(2));
+  assert.ok(res4.observations.every(o=>o.error.code==='ROOT_IDENTITY_CHANGED'));
+  assert.equal(res4.rootIdentity,undefined,'a round without a single trustworthy batch claims no root identity');
+
+  const round=harness({wrongRound:true});
+  const res5=await observe(round.api,residue(2));
+  assert.ok(res5.observations.every(o=>o.error.code==='ANSWER_MISMATCH'),'answers not bound to this round are untrusted');
+
+  const moved=harness({wrongIdentity:true});
+  const res6=await observe(moved.api,residue(3000)); // identity shifts mid-round on the second batch
+  const split=res6.observations.filter(o=>o.error&&o.error.code==='ROOT_IDENTITY_CHANGED').length;
+  assert.equal(split,500,'the batch whose root identity moved is unknown, the first batch stands');
+});
+test('engine per-row refusals pass through as row errors with their own unknowns',async()=>{
+  const {api}=harness({observe:e=>e.key==='bad'
+    ? {key:e.key,error:{code:'UNSAFE_PATH',message:'/etc/passwd'},executors:[],executorsChecked:false}
+    : {key:e.key,status:'present',target:{missing:false,type:e.type,absolutePath:'/srv/proj/'+e.relativePath,device:'7',inode:'9'},executors:[],executorsChecked:true}});
+  const res=await observe(api,[{key:'bad',relativePath:'out/bad',type:'file'},{key:'good',relativePath:'out/good',type:'file'}]);
+  const byKey=Object.fromEntries(res.observations.map(o=>[o.key,o]));
+  assert.equal(byKey.bad.error.code,'UNSAFE_PATH');assert.equal(byKey.bad.executorsChecked,false);
+  assert.equal(byKey.good.status,'present');assert.equal(byKey.good.error,undefined);
+});
+test('observeBatch performs zero local writes and never emits a mutating action',async()=>{
+  const {api,calls,storageRoot}=harness();
+  const row=await confirmed(api,dirs(2));
+  const before=fs.readdirSync(storageRoot);
+  await observe(api,[{key:'a',relativePath:'out/d0',type:'directory',backendToken:row.token,backendIndex:0},
+    ...residue(10).slice(1)]);
+  assert.deepEqual(fs.readdirSync(storageRoot),before,'the read-only round stores no row, journal or ledger');
+  assert.ok(calls.filter(c=>c.action!=='batch-inspect').every(c=>c.action==='batch-observe'),
+    'no confirm/execute/settle/delete ever leaves this entry point');
+});
+test('malformed observation requests are refused before anything touches the wire',async()=>{
+  const {api,calls}=harness();
+  const bad=[
+    {node:NODE,observationId:'r',readConcurrency:2,targets:[]},
+    {node:NODE,observationId:'r',readConcurrency:2,targets:residue(5001)},
+    {node:NODE,observationId:'r',readConcurrency:2,targets:[{key:'k',relativePath:'out/a',type:'file'},{key:'k',relativePath:'out/b',type:'file'}]},
+    {node:NODE,observationId:'',readConcurrency:2,targets:[{key:'k',relativePath:'out/a',type:'file'}]},
+    {node:NODE,observationId:'r',readConcurrency:3,targets:[{key:'k',relativePath:'out/a',type:'file'}]},
+    {node:NODE,observationId:'r',targets:[{key:'k',relativePath:'out/a',type:'file'}]},
+    {node:NODE,observationId:'r',readConcurrency:1,targets:[{key:'k',relativePath:'/etc/passwd',type:'file'}]},
+    {node:NODE,observationId:'r',readConcurrency:1,targets:[{key:'k',relativePath:'out/../x',type:'file'}]},
+    {node:NODE,observationId:'r',readConcurrency:1,targets:[{key:'k',relativePath:'out/a',type:'link'}]},
+    {node:NODE,observationId:'r',readConcurrency:1,targets:[{key:'k',relativePath:'repo/.git/config',type:'file'}]},
+    {node:NODE,observationId:'r',readConcurrency:1,targets:[{key:'k',relativePath:'clean_dir/anything',type:'directory'}]},
+  ];
+  for(const params of bad)await assert.rejects(api.observeBatch(params),/INVALID_REQUEST|PROTECTED_PATH|UNSAFE_DESTINATION/);
+  assert.equal(calls.filter(c=>c.action==='batch-observe').length,0);
+});
+test('engine batch_observe answers from current facts with one shared sweep and zero mutation primitives (FakeOS fixture)',()=>{
+  const fixture=path.resolve(__dirname,'cleanupObserveBatch.fixture.py'),engine=path.resolve(__dirname,'../cleanup-files.py');
+  const linux=p=>'/mnt/'+p[0].toLowerCase()+p.slice(2).replace(/\\/g,'/');
+  const args=process.platform==='win32'?['--distribution',process.env.SIMPLE_TEST_WSL_DISTRO||'Ubuntu-Codex','--exec','python3',linux(fixture),linux(engine)]:[fixture,engine];
+  const result=spawnSync(process.platform==='win32'?'wsl.exe':'python3',args,{encoding:'utf8',timeout:10000,windowsHide:true});
+  assert.equal(result.status,0,result.stderr||result.stdout);
+  assert.deepEqual(JSON.parse(result.stdout),{factsAndSingleSweep:true,executorFacts:true,identityCounterEvidence:true,
+    uncheckedExecutors:true,unverifiedBinding:true,shapeRefusals:true,rowIsolation:true,ok:true});
+});

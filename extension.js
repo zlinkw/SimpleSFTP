@@ -296,6 +296,7 @@ function startLocalApiServer(context) {
     methodOptions: {
       "agents.lifecycle": { actions: ["inspect", "ensure", "stop", "restart", "migrate"], independentService: 1, controlStrategy: "assigned_tmux_window", noPidSignals: true, runtimeHashProof: true, inspectZeroWrites: true, schedulerRuntimeEvidence: 1, localTunnelRequired: false, activeTasksBlockRestart: false, restartPreservesTasks: true, researchEnvironmentManagement: "external", agentResearchEnvironmentValidation: false, legacyMigration: { explicitFrozenDigest: true, noActiveJobs: false, preservesState: true } },
       "files.cleanup.inspect": { readOnly: true, zeroWrites: true },
+      "files.cleanup.observeBatch": { readOnly: true, zeroWrites: true, maxTargets: 5000, batchCleanupObservation: 1, readConcurrency: [1, 2] },
       "files.cleanup.check": { readOnly: true, zeroWrites: true, receiptOnly: true, automaticExecution: false },
       "files.cleanup.verify": { readOnly: true, completedReceiptRequired: true },
       "files.cleanup.settle": { frozenApprovalRequired: true, receiptOnly: true, startsNewMoves: false },
@@ -4067,6 +4068,7 @@ function createLocalApiMethods() {
     "files.cleanup.verify": params => cleanupFileApi.verify(params),
     "files.cleanup.settle": params => cleanupFileApi.settle(params),
     "files.cleanup.inspect": params => cleanupFileApi.inspect(params),
+    "files.cleanup.observeBatch": params => cleanupFileApi.observeBatch(params),
     "files.cleanup.preview": params => cleanupFileApi.preview(params),
     "files.cleanup.confirm": params => cleanupFileApi.confirm(params),
     "files.cleanup.execute": params => cleanupFileApi.execute(params),
@@ -4561,7 +4563,7 @@ function createLocalApiMethods() {
         const codeInventory = name === "sync.projectInventory" && params.inventoryPurpose === "code-sync"
           && Array.isArray(params.scopePaths) && params.scopePaths.length > 0 && !params.scopePaths.includes(".");
         const memoryRead = name === "sync.downloadMappedPaths" && params.memoryOnly === true && params.metricsOnly === true;
-        const cleanupRead = ["files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.check", "files.cleanup.verify", "files.cleanup.status"].includes(name);
+        const cleanupRead = ["files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.check", "files.cleanup.verify", "files.cleanup.status", "files.cleanup.observeBatch"].includes(name);
         const metadataInventory = name === "sync.projectInventory" && params.metadataOnly === true;
         const pool = cleanupRead ? cleanupReadCapacity : metadataInventory ? metadataInventoryCapacity : memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
           : ["sync.projectTree", "sync.projectTreeState", "sync.projectFileStats"].includes(name) ? metadataTreeCapacity : transferCapacity;

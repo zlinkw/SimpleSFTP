@@ -195,11 +195,26 @@ function fail(code, message = code, details = {}) { const error = new Error(mess
   if (typeof details.mutationStarted === "boolean") error.mutationStarted = details.mutationStarted;
   throw error; }
 
+// Discriminating identity fields of a CleanupNode; tokens bind to exactly one
+// node, so an observation request must agree on every field both sides carry.
+const sameNode = (a, b) => Boolean(a && b) && ["kind", "root", "host", "port", "user"].every(field => String(a[field] ?? "") === String(b[field] ?? ""));
+
 /** A path capability authorizes one frozen batch, never a later or remembered path. */
 class CleanupFileApi {
   constructor({ storageRoot, transport, activity, lease }) {
     this.storageRoot = storageRoot; this.transport = transport; this.activity = activity; this.lease = lease;
     this.previews = new Map(); this.busy = new Set(); this.localExecutions = new Map();
+    this.observeInFlight = 0; this.observeWaiters = [];
+  }
+  /** Shared read-only in-flight budget for one API instance: at most two
+   *  engine reads run at once, whatever the per-request readConcurrency is
+   *  (the caller splits the same global budget across observation groups). */
+  async observeSlot(limit, run) {
+    const cap = Math.min(2, Math.max(1, limit));
+    while (this.observeInFlight >= cap) await new Promise(resolve => this.observeWaiters.push(resolve));
+    this.observeInFlight += 1;
+    try { return await run(); }
+    finally { this.observeInFlight -= 1; const next = this.observeWaiters.shift(); if (next) next(); }
   }
   async checked(request) {
     const value = await this.transport(copy(request));
@@ -435,6 +450,153 @@ class CleanupFileApi {
       if (single && batchFailure) throw batchFailure; // single-index callers keep their own error handling
     }
     return single ? proofs[list[0]] : proofs;
+  }
+  /** v1.10 exception recovery: one public check call is one observation round.
+   *
+   * Answers contract questions per caller key with CURRENT facts only: the
+   * engine re-reads the filesystem and shares ONE managed-window sweep per
+   * batch; frozen receipts are never replayed as this round's evidence. A
+   * backend token additionally cross-checks the frozen target, node and root
+   * (a token never travels across nodes or roots) and contributes its entry
+   * identity plus the explicit isolation mapping - the isolation name is
+   * never guessed. Unanswered, duplicated, contradicted or failed keys stay
+   * unknown; nothing observed here authorizes a confirm/execute/settle step.
+   */
+  async observeBatch(params) {
+    const node = params.node, observationId = params.observationId, targets = params.targets;
+    if (!node?.root || typeof observationId !== "string" || !observationId
+        || !Array.isArray(targets) || !targets.length || targets.length > 5000) fail("INVALID_REQUEST");
+    if (params.readConcurrency !== 1 && params.readConcurrency !== 2) fail("INVALID_REQUEST");
+    const observedPath = value => typeof value === "string" && value && value.length <= 4096 && !value.startsWith("/")
+      && !/[\\\x00\r\n\x00-\x1f:*?[\]{}]/.test(value) && !value.split("/").some(part => !part || part === "." || part === "..");
+    const seen = new Set(), planned = [], plannedByKey = new Map(), early = new Map();
+    for (const target of targets) {
+      const key = target?.key, rel = target?.relativePath, type = target?.type;
+      if (typeof key !== "string" || !key || seen.has(key) || !["file", "directory"].includes(type)) fail("INVALID_REQUEST");
+      if (!observedPath(rel)) fail("INVALID_REQUEST");
+      if (rel.split("/").includes(".git")) fail("PROTECTED_PATH");
+      if (rel.startsWith("clean_dir/") && !/^clean_dir\/job-[a-f0-9]{48}\//.test(rel)) fail("UNSAFE_DESTINATION");
+      seen.add(key);
+      let device = target.device, inode = target.inode, row, archived = false;
+      let isolationRelativePath = target.isolationRelativePath, rootIdentity = params.rootIdentity;
+      if (target.backendToken !== undefined || target.backendIndex !== undefined) {
+        if (typeof target.backendToken !== "string" || !Number.isInteger(target.backendIndex) || target.backendIndex < 0
+            || isolationRelativePath !== undefined && typeof isolationRelativePath !== "string") fail("INVALID_REQUEST");
+        const unknown = code => { early.set(key, { key, relativePath: rel, type, state: "unknown", executors: [], executorsChecked: false,
+          ...(isolationRelativePath !== undefined ? { isolationChecked: false } : {}), error: { code, message: code } }); };
+        try { row = await this.read(target.backendToken); } catch { unknown("TOKEN_UNAVAILABLE"); continue; }
+        // Cross-node or cross-root token reuse is refused per target, never
+        // answered with the wrong root's facts.
+        if (!sameNode(row.node, node) || rootIdentity !== undefined && hash(row.rootIdentity) !== hash(rootIdentity)) { unknown("TOKEN_NODE_MISMATCH"); continue; }
+        const frozen = row.targets[target.backendIndex];
+        if (!frozen || frozen.relativePath !== rel || frozen.type !== type) { unknown("TOKEN_TARGET_MISMATCH"); continue; }
+        device = frozen.device; inode = frozen.inode; rootIdentity = row.rootIdentity; archived = Boolean(frozen.archived);
+        // Only the frozen mapping counts as an explicit isolation path; the
+        // observer never guesses one, and a caller claim the row contradicts
+        // is refused instead of probed.
+        const frozenIso = frozen.type === "directory" && !frozen.archived && frozen.isolationName
+          ? rel.slice(0, rel.lastIndexOf("/") + 1) + frozen.isolationName : undefined;
+        if (isolationRelativePath !== undefined && isolationRelativePath !== frozenIso) { unknown("TOKEN_TARGET_MISMATCH"); continue; }
+        isolationRelativePath = frozenIso;
+      }
+      if (isolationRelativePath !== undefined && !observedPath(isolationRelativePath)) fail("INVALID_REQUEST");
+      const item = { key, relativePath: rel, type, device, inode, isolationRelativePath, rootIdentity, row, archived,
+        index: row ? target.backendIndex : undefined };
+      planned.push(item); plannedByKey.set(key, item);
+    }
+    // Original and its explicit isolation probe travel together; batches are
+    // capped in EXPANDED entries (engine FAST_BATCH_LIMIT parity) and issued
+    // inside the caller's read budget, instance-capped at two in flight.
+    const groups = new Map();
+    for (const item of planned) {
+      const id = item.rootIdentity === undefined ? "absent" : hash(item.rootIdentity);
+      if (!groups.has(id)) groups.set(id, []);
+      groups.get(id).push(item);
+    }
+    const batches = [];
+    for (const items of groups.values()) {
+      let part = { items: [], size: 0 };
+      for (const item of items) {
+        const size = item.isolationRelativePath === undefined ? 1 : 2;
+        if (part.size && part.size + size > FAST_VERIFY_BATCH_LIMIT) { batches.push(part); part = { items: [], size: 0 }; }
+        part.items.push(item); part.size += size;
+      }
+      if (part.size) batches.push(part);
+    }
+    const batchIndex = new Map();
+    batches.forEach((part, index) => part.items.forEach(item => batchIndex.set(item.key, index)));
+    const responses = new Array(batches.length), failures = new Array(batches.length);
+    for (let s = 0; s < batches.length; s += params.readConcurrency) {
+      const settled = await Promise.allSettled(batches.slice(s, s + params.readConcurrency).map(part => {
+        const entries = part.items.map(item => ({ key: item.key, relativePath: item.relativePath, type: item.type,
+          ...(item.device === undefined ? {} : { device: item.device }),
+          ...(item.inode === undefined ? {} : { inode: item.inode }),
+          ...(item.isolationRelativePath === undefined ? {} : { isolationRelativePath: item.isolationRelativePath }) }));
+        const rootIdentity = part.items[0].rootIdentity;
+        return this.observeSlot(params.readConcurrency, () => this.checked({ node, root: node.root,
+          ...(rootIdentity === undefined ? {} : { rootIdentity }), action: "batch-observe", observationId, entries }));
+      }));
+      settled.forEach((outcome, k) => {
+        if (outcome.status === "fulfilled") responses[s + k] = outcome.value;
+        else failures[s + k] = outcome.reason;
+      });
+    }
+    const answers = new Map(), duplicate = new Set();
+    let roundIdentity;
+    responses.forEach((result, index) => {
+      if (!result) return;
+      const mismatch = code => { responses[index] = null; failures[index] = Object.assign(Error(code), { code }); };
+      // A response not bound to THIS round and root is untrusted wholesale.
+      if (result.observationId !== observationId) return mismatch("ANSWER_MISMATCH");
+      if (roundIdentity === undefined) roundIdentity = result.rootIdentity;
+      else if (hash(roundIdentity) !== hash(result.rootIdentity)) return mismatch("ROOT_IDENTITY_CHANGED");
+      for (const answered of Array.isArray(result.observations) ? result.observations : []) {
+        if (answers.has(answered.key)) { answers.delete(answered.key); duplicate.add(answered.key); }
+        else answers.set(answered.key, answered);
+      }
+    });
+    const deriveState = (item, answered, observation) => {
+      if (answered.error) return "unknown";
+      const status = observation.status, iso = observation.isolationStatus;
+      if (iso !== undefined) {
+        // Same rule as the fast-chain verify: while the entry-bound isolation
+        // tree stands (or went unanswered) the deletion is unfinished; a
+        // same-name recreation there is new data, never counted as residue.
+        if (observation.isolationChecked !== true || iso === "unknown" || iso === "present") return "unknown";
+        if (status === "gone" || status === "replaced") return "completed";
+        if (status !== "present") return "unknown";
+        return item.row.batchExecuting || item.row.states[item.index] === "executing" || item.row.states[item.index] === "completed" ? "unknown" : "pending";
+      }
+      if (status === "gone") return "completed";
+      if (status === "replaced") return item.archived ? "unknown" : "completed";
+      if (status !== "present") return "unknown";
+      if (observation.executorsChecked && observation.executors.length) return "executing";
+      return item.row.batchExecuting || item.row.states[item.index] === "executing" ? "unknown" : "pending";
+    };
+    const observations = [];
+    for (const target of targets) {
+      const key = target.key;
+      if (early.has(key)) { observations.push(early.get(key)); continue; }
+      const item = plannedByKey.get(key), base = { key, relativePath: item.relativePath, type: item.type };
+      const unknownWith = (code, message) => ({ ...base, executors: [], executorsChecked: false,
+        ...(item.isolationRelativePath === undefined ? {} : { isolationChecked: false }), error: { code, message: message || code } });
+      const index = batchIndex.get(item.key);
+      // A failed batch answers for NOTHING it carried: its keys are unknown,
+      // never "gone", while other batches' fresh facts stand untouched.
+      if (failures[index]) { observations.push(unknownWith(failures[index].code || "OBSERVATION_UNAVAILABLE", failures[index].message)); continue; }
+      if (duplicate.has(key)) { observations.push(unknownWith("DUPLICATE_ANSWER")); continue; }
+      const answered = answers.get(key);
+      if (!answered) { observations.push(unknownWith("ANSWER_MISSING")); continue; }
+      const observation = { ...base, status: answered.status, target: answered.target,
+        executors: Array.isArray(answered.executors) ? answered.executors : [], executorsChecked: answered.executorsChecked === true,
+        ...(answered.isolationStatus !== undefined ? { isolationStatus: answered.isolationStatus, isolationChecked: answered.isolationChecked === true }
+          : item.isolationRelativePath !== undefined ? { isolationStatus: "unknown", isolationChecked: false } : {}) };
+      if (answered.error) observation.error = answered.error;
+      if (item.row) observation.state = deriveState(item, answered, observation);
+      observations.push(observation);
+    }
+    return { ok: true, observationId, capabilities: { batchCleanupObservation: 1, maxTargets: 5000 },
+      ...(roundIdentity === undefined ? {} : { rootIdentity: roundIdentity }), observations };
   }
   async check(params) {
     const row = await this.read(params.token), index = params.index;
