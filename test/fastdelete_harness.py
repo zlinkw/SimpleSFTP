@@ -4,8 +4,9 @@ Behaviour-cloned from the green fastDeleteGuard.fixture.py inline harness and
 parameterised so the migrated confirmed*/chunked fixtures exercise the fast
 chain WITHOUT any real filesystem mutation: no real deletion approval exists
 in this phase, therefore every destructive scenario here runs against this
-in-memory tree only. fastDeleteGuard.fixture.py deliberately keeps its own
-inline copy (frozen green evidence; do not touch).
+in-memory tree only. fastDeleteGuard.fixture.py keeps its own inline copy;
+both copies share the posixpath virtual semantics enforced here (the v1.11
+win32 red proved the old host os.path pull leaked ntpath into slash keys).
 
 Options for build_engine:
   refuse_reads  - opening a regular file in binary read mode raises
@@ -13,7 +14,15 @@ Options for build_engine:
   unlink_limit  - after N successful unlinks the fake raises OSError(5),
                   emulating an interruption mid-walk
 """
-import io, json, os, runpy, stat, sys, types
+import io, json, posixpath, runpy, stat, sys, types
+
+# The fake tree models a REMOTE POSIX filesystem: every virtual path operation
+# must be slash-based regardless of the host running the fixture (the engine
+# under test always receives these paths from the POSIX transport). Pulling the
+# pure functions from the host os.path leaked Windows semantics on win32
+# (normpath('/srv/proj') -> '\\srv\\proj' while entries stay slashed), so the
+# virtual layer imports posixpath explicitly. Real repo/engine paths below keep
+# host semantics via runpy/open; nothing here touches the real filesystem.
 
 
 class St:
@@ -73,7 +82,7 @@ class Tree:
 
     def resolve(self, path):
         path = path if str(path).startswith("/") else self.cwd + "/" + str(path)
-        return os.path.normpath(path)
+        return posixpath.normpath(path)
 
     def identity(self, path):
         entry = self.entries[self.resolve(path)]
@@ -157,7 +166,7 @@ def build_engine(tree, engine_path, options=None):
         entry = tree.entries.get(tree.resolve(path))
         return entry is not None and entry[0] == kind
 
-    pure = {name: getattr(os.path, name) for name in
+    pure = {name: getattr(posixpath, name) for name in
             ("normcase", "normpath", "join", "split", "dirname", "basename", "isabs", "relpath", "commonpath")}
     pure.update({
         "lexists": lambda path: tree.resolve(path) in tree.entries,
@@ -166,17 +175,17 @@ def build_engine(tree, engine_path, options=None):
         "isfile": lambda path: entry_kind(path, "f"),
         "islink": lambda path: entry_kind(path, "l"),
         "ismount": lambda path: False,
-        "realpath": lambda path: os.path.normpath(path),
+        "realpath": lambda path: posixpath.normpath(path),
         "expanduser": lambda path: path if path != "~" else "/root",
-        "abspath": lambda path: os.path.normpath(path if os.path.isabs(path) else tree.cwd + "/" + path),
+        "abspath": lambda path: posixpath.normpath(path if posixpath.isabs(path) else tree.cwd + "/" + path),
         "getsize": lambda path: lstat(path).st_size,
-        "sep": os.sep,
+        "sep": "/",
     })
 
     class FakeDirEntry:
         def __init__(self, full):
             self.full = full
-            self.name = os.path.basename(full)
+            self.name = posixpath.basename(full)
 
         @property
         def path(self):
@@ -214,10 +223,10 @@ def build_engine(tree, engine_path, options=None):
                 (dirs if entry_kind(dirpath + "/" + name, "d") else files).append(name)
             yield dirpath, dirs, files
             for child in dirs:
-                yield from visit(os.path.join(dirpath, child))
+                yield from visit(posixpath.join(dirpath, child))
         yield from visit(top)
     fake_os = types.SimpleNamespace(
-        name="posix", sep=os.sep, path=types.SimpleNamespace(**pure),
+        name="posix", sep="/", path=types.SimpleNamespace(**pure),
         lstat=lstat, stat=lstat, listdir=listdir, scandir=scandir, walk=walk, chdir=chdir,
         getcwd=lambda: tree.stuck_cwd or tree.cwd, unlink=remove, remove=remove, rmdir=rmdir, environ={},
         getuid=lambda: 0, fsencode=lambda value: str(value).encode("utf-8"),

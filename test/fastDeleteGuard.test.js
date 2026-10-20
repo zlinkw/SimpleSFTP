@@ -43,6 +43,7 @@ test('v1.9 fast chain isolates directories by non-overwriting rename and only re
     'link-in-tree-refused', 'clean-dir-guard-refused', 'dev-crossing-refused', 'files-grouped-two-parents',
     'files-swap-zero-mutation', 'archived-registered-no-rename', 'archived-unregistered-refused',
     'deep-tree-refused', 'batch-inspect-entry-only', 'batch-verify-statuses',
-    'capability-probe', 'mutation-facts-reset-and-false', 'mutation-facts-partial', 'mutation-facts-after-rename'])
+    'capability-probe', 'mutation-facts-reset-and-false', 'mutation-facts-partial', 'mutation-facts-after-rename',
+    'virtual-paths-stay-posix-ntpath-control'])
     assert.match(result.stdout, new RegExp('^ok ' + name + '$', 'm'), 'fake-OS scenario ' + name + ' missing');
 });

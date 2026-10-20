@@ -35,7 +35,11 @@ engine code. Scenarios prove:
  14. batch-verify       - presence query distinguishes gone / present /
                           replaced.
 """
-import io, json, os, runpy, stat, sys, types
+import io, json, ntpath, posixpath, runpy, stat, sys, types
+
+# Virtual paths model the remote POSIX filesystem: the pure path layer is
+# posixpath-based on every host so Windows hosts cannot leak ntpath semantics
+# into slash-keyed entries. Real engine/repo file access keeps host paths.
 
 ROOT = "/srv/proj"
 JOB = "job-" + "a" * 48
@@ -45,7 +49,7 @@ OP = "cleanup-" + "b" * 32
 
 def engine_control_hash(rel):
     import hashlib
-    return hashlib.sha256(("isolation:" + os.path.normcase(rel)).encode("utf-8")).hexdigest()
+    return hashlib.sha256(("isolation:" + posixpath.normcase(rel)).encode("utf-8")).hexdigest()
 
 
 class St:
@@ -91,7 +95,7 @@ class Tree:
 
     def resolve(self, path):
         path = path if str(path).startswith("/") else self.cwd + "/" + str(path)
-        return os.path.normpath(path)
+        return posixpath.normpath(path)
 
     def identity(self, path):
         entry = self.entries[self.resolve(path)]
@@ -157,7 +161,7 @@ def build_engine(tree, engine_path):
         entry = tree.entries.get(tree.resolve(path))
         return entry is not None and entry[0] == kind
 
-    pure = {name: getattr(os.path, name) for name in
+    pure = {name: getattr(posixpath, name) for name in
             ("normcase", "normpath", "join", "split", "dirname", "basename", "isabs", "relpath", "commonpath")}
     pure.update({
         "lexists": lambda path: tree.resolve(path) in tree.entries,
@@ -166,13 +170,13 @@ def build_engine(tree, engine_path):
         "isfile": lambda path: entry_kind(path, "f"),
         "islink": lambda path: entry_kind(path, "l"),
         "ismount": lambda path: False,
-        "realpath": lambda path: os.path.normpath(path),
+        "realpath": lambda path: posixpath.normpath(path),
         "expanduser": lambda path: path if path != "~" else "/root",
-        "abspath": lambda path: os.path.normpath(path if os.path.isabs(path) else tree.cwd + "/" + path),
-        "sep": os.sep,
+        "abspath": lambda path: posixpath.normpath(path if posixpath.isabs(path) else tree.cwd + "/" + path),
+        "sep": "/",
     })
     fake_os = types.SimpleNamespace(
-        name="posix", sep=os.sep, path=types.SimpleNamespace(**pure),
+        name="posix", sep="/", path=types.SimpleNamespace(**pure),
         lstat=lstat, stat=lstat, listdir=listdir, chdir=chdir, getcwd=lambda: tree.cwd,
         unlink=remove, remove=remove, rmdir=rmdir, environ={}, getuid=lambda: 0,
         expanduser=lambda path: path if path != "~" else "/root")
@@ -493,3 +497,19 @@ check("mutation-facts-partial", engine["FAST_MUTATION_FACTS"]["started"] is True
 tree, engine = scenario_engine(seed_deep)
 refusal(engine, lambda: call_delete_fast(engine, tree, [entry_for(tree, "out/deep", "directory")]), "TREE_TOO_DEEP")
 check("mutation-facts-after-rename", engine["FAST_MUTATION_FACTS"]["started"] is True and len(tree.renamed) == 1)
+
+# 19. host-independent virtual semantics: the ntpath control records exactly
+# what host os.path leakage would produce on a Windows host (the v1.11 red),
+# while the installed fake layer must stay slash-based on every host. This is
+# a deterministic cross-platform model check, not a claimed real-Windows run.
+probe_tree, probe_engine = scenario_engine(seed_pair)
+fake = probe_engine["delete_fast"].__globals__["os"]
+check("virtual-paths-stay-posix-ntpath-control",
+      ntpath.normpath(ROOT) == ntpath.sep + "srv" + ntpath.sep + "proj" and ntpath.sep == "\\"
+      and fake.name == "posix" and fake.sep == "/"
+      and fake.path.normpath(ROOT) == ROOT
+      and fake.path.normcase(ROOT + "/Out") == ROOT + "/Out"
+      and fake.path.join("out", "p1.log") == "out/p1.log"
+      and fake.path.abspath("out/p1.log") == ROOT + "/out/p1.log"
+      and fake.path.realpath(ROOT + "/out/../out") == ROOT + "/out")
+

@@ -13,7 +13,12 @@ tree, so the trim runs against fake entries only. The scenarios prove:
   5. parent failure - when entering the direct parent fails, zero deletions;
   6. swap after cd  - an identity swap after chdir blocks that unlink only.
 """
-import hashlib, io, json, os, runpy, stat, sys, types
+import hashlib, io, json, ntpath, os, posixpath, runpy, stat, sys, types
+
+# Virtual paths model the remote POSIX filesystem: the pure path layer is
+# posixpath-based on every host so Windows hosts cannot leak ntpath semantics
+# into slash-keyed entries. Real engine/repo file access keeps host paths.
+
 
 ROOT = "/srv/proj"
 KEY = "k" * 64
@@ -63,7 +68,7 @@ class Tree:
 
     def resolve(self, path):
         path = path if path.startswith("/") else self.cwd + "/" + path
-        return os.path.normpath(path)
+        return posixpath.normpath(path)
 
 
 def build_engine(tree, engine_path):
@@ -120,7 +125,7 @@ def build_engine(tree, engine_path):
         entry = tree.entries.get(tree.resolve(path))
         return entry is not None and entry[0] == kind
 
-    pure = {name: getattr(os.path, name) for name in
+    pure = {name: getattr(posixpath, name) for name in
             ("normcase", "normpath", "join", "split", "dirname", "basename", "isabs", "relpath", "commonpath")}
     pure.update({
         "lexists": lambda path: tree.resolve(path) in tree.entries,
@@ -129,12 +134,12 @@ def build_engine(tree, engine_path):
         "isfile": lambda path: entry_kind(path, "f"),
         "islink": lambda path: entry_kind(path, "l"),
         "ismount": lambda path: False,
-        "realpath": lambda path: os.path.normpath(path),
-        "abspath": lambda path: os.path.normpath(path if os.path.isabs(path) else tree.cwd + "/" + path),
-        "sep": os.sep,
+        "realpath": lambda path: posixpath.normpath(path),
+        "abspath": lambda path: posixpath.normpath(path if posixpath.isabs(path) else tree.cwd + "/" + path),
+        "sep": "/",
     })
     fake_os = types.SimpleNamespace(
-        name="posix", sep=os.sep, path=types.SimpleNamespace(**pure),
+        name="posix", sep="/", path=types.SimpleNamespace(**pure),
         lstat=lstat, stat=lstat, listdir=listdir, chdir=chdir, getcwd=lambda: tree.cwd,
         unlink=remove, remove=remove, rmdir=rmdir,
         expanduser=lambda path: path if path != "~" else "/root")
