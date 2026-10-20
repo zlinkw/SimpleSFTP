@@ -5,19 +5,25 @@ const path = require('node:path');
 const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 const guard = path.resolve(__dirname, '../cleanup-files.py');
-function bootstrapRun(root, payload, expectOk) {
-  const { RUNTIME_PREPARE_BOOTSTRAP } = require('../cleanup-file-api');
-  fs.mkdirSync(path.join(root, 'installer-tmp'), { recursive: true });
-  const script = path.join(root, 'installer-tmp', 'bootstrap-' + process.pid + '-' + Math.random().toString(16).slice(2) + '.py');
-  fs.writeFileSync(script, RUNTIME_PREPARE_BOOTSTRAP, 'utf8');
-  // The SSH transport writes NUL-terminated stdin chunks; the installer must
-  // tolerate the exact production framing.
-  const result = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-B', '-X', 'utf8', script], {
-    input: JSON.stringify(payload) + '\0', encoding: 'utf8', timeout: 10000, windowsHide: true });
-  // The written bootstrap script is deliberately retained in the fixture root
-  // as an evidence artifact; the test never performs optional cleanup.
-  if (expectOk) assert.equal(result.status, 0, result.stderr || result.stdout);
-  else assert.notEqual(result.status, 0, 'invalid installer input must fail closed');
+// The pinned short installer is the remote POSIX contract (python3 -B -c with
+// O_NOFOLLOW/O_DIRECTORY/dir_fd per cleanup-file-api.js); Windows native python
+// lacks those flags and correctly reports RUNTIME_CAPABILITY_UNAVAILABLE. So
+// the installer scenario (install once / re-verify / tamper refuse / foreign
+// identity refuse) executes inside formalJobCleanupOwnerPosix.fixture.py on a
+// POSIX filesystem: native python3 on Linux, and the project's established
+// WSL convention (SIMPLE_TEST_WSL_DISTRO, default Ubuntu-Codex) on Windows.
+// The synthetic root, bootstrap script, pinned program and byte verification
+// all live in that same POSIX filesystem — no Windows path crosses to POSIX
+// python. No skip, no fabricated process.platform, no weakened safety flag.
+const toPosix = p => process.platform === 'win32' ? '/mnt/' + p[0].toLowerCase() + p.slice(2).replace(/\\/g, '/') : p;
+const posixFixture = path.resolve(__dirname, 'formalJobCleanupOwnerPosix.fixture.py');
+function posixInstallerProof(payload) {
+  const args = process.platform === 'win32'
+    ? ['--distribution', process.env.SIMPLE_TEST_WSL_DISTRO || 'Ubuntu-Codex', '--exec', 'python3', toPosix(posixFixture), toPosix(guard)]
+    : [posixFixture, guard];
+  const result = spawnSync(process.platform === 'win32' ? 'wsl.exe' : 'python3', args, {
+    input: JSON.stringify(payload), encoding: 'utf8', timeout: 10000, windowsHide: true });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
   return JSON.parse(result.stdout);
 }
 test('the pinned program area installs the exact engine once and only short path calls cross the wire', () => {
@@ -38,33 +44,21 @@ test('the pinned program area installs the exact engine once and only short path
   assert.match(prepareCommand, /^python3 -B -c /);
   assert.match(callCommand, /^python3 -B -X utf8 "\/srv\/project\/clean_dir\/\.operations\/managed\/runtime-[a-f0-9]{64}\.py"$/);
   assert.throws(() => api.remoteRuntimeCommand('clean_dir/relative', JSON.stringify), /UNSAFE_ROOT/);
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'simple-cleanup-pinned-')));
-  fs.mkdirSync(path.join(root, 'state'));
-  fs.writeFileSync(path.join(root, 'state/retained.txt'), 'retain 中文 bytes', 'utf8');
-  const payload = { action: 'runtime-prepare', root, runtimeSha256: runtime.sha256, runtimeSource: source };
-  const installed = bootstrapRun(root, payload, true);
-  assert.equal(installed.state, 'installed', JSON.stringify(installed));
-  const pinned = path.join(root, runtime.programRelativePath);
-  assert.equal(fs.readFileSync(pinned, 'utf8'), source);
-  const again = bootstrapRun(root, payload, true);
-  assert.equal(again.state, 'verified', JSON.stringify(again));
-  fs.appendFileSync(pinned, '# mutated after pinning\n');
-  const tampered = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-B', '-X', 'utf8', pinned], {
-    input: JSON.stringify({ root, action: 'inventory', target: { type: 'file', relativePath: 'state/retained.txt' } }),
-    encoding: 'utf8', timeout: 10000, windowsHide: true });
-  assert.equal(tampered.status, 0, tampered.stderr);
-  assert.equal(JSON.parse(tampered.stdout).error.code, 'RUNTIME_CODE_MISMATCH', 'a mutated pinned program must refuse to run');
-  fs.copyFileSync(guard, pinned);
-  const viaPinned = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-B', '-X', 'utf8', pinned], {
-    input: JSON.stringify({ root, action: 'inventory', target: { type: 'file', relativePath: 'state/retained.txt' } }) + '\0',
-    encoding: 'utf8', timeout: 10000, windowsHide: true });
-  assert.equal(viaPinned.status, 0, viaPinned.stderr);
-  assert.equal(JSON.parse(viaPinned.stdout).ok, true);
-  assert.equal(fs.readFileSync(path.join(root, 'state/retained.txt'), 'utf8'), 'retain 中文 bytes');
-  // A request whose claimed identity does not match its content refuses without touching the pinned program.
-  const foreign = bootstrapRun(root, { ...payload, runtimeSha256: '0'.repeat(64) }, false);
-  assert.match(foreign.error.code, /RUNTIME_CODE_MISMATCH|INVALID_REQUEST/);
-  assert.equal(fs.readFileSync(pinned, 'utf8'), source, 'refusal never touched the pinned program');
+  // Pure command construction is already proven above without a POSIX host.
+  // The executed installer scenario needs the same POSIX filesystem for the
+  // synthetic root, pinned program and byte checks; Windows routes it through
+  // the WSL convention instead of feeding Windows paths to POSIX python.
+  const proof = posixInstallerProof({ bootstrapSource: api.RUNTIME_PREPARE_BOOTSTRAP,
+    runtimeSha256: runtime.sha256, programRelativePath: runtime.programRelativePath, retainedText: 'retain 中文 bytes' });
+  assert.equal(proof.firstState, 'installed', JSON.stringify(proof));
+  assert.equal(proof.againState, 'verified', JSON.stringify(proof));
+  assert.equal(proof.pinnedBindsSha, true, 'the pinned program bytes must equal the exact engine bytes');
+  assert.equal(proof.tamperCode, 'RUNTIME_CODE_MISMATCH', 'a mutated pinned program must refuse to run');
+  assert.equal(proof.viaPinnedOk, true, 'the restored pinned program answers the framed inventory');
+  assert.equal(proof.retainedIntact, true, 'the retained 中文 bytes file is never touched');
+  assert.match(proof.foreignCode, /RUNTIME_CODE_MISMATCH|INVALID_REQUEST/);
+  assert.equal(proof.pinnedUntouchedAfterForeign, true, 'refusal never touched the pinned program');
+  assert.equal(proof.bootstrapScriptRetained, true, 'the bootstrap script stays in the fixture root as evidence');
 });
 function fixture() {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'simple-formal-owner-readonly-')));
