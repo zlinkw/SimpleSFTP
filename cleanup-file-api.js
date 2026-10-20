@@ -197,7 +197,12 @@ function fail(code, message = code, details = {}) { const error = new Error(mess
 
 // Discriminating identity fields of a CleanupNode; tokens bind to exactly one
 // node, so an observation request must agree on every field both sides carry.
-const sameNode = (a, b) => Boolean(a && b) && ["kind", "root", "host", "port", "user"].every(field => String(a[field] ?? "") === String(b[field] ?? ""));
+// When both sides carry a stable worker id it must match too: two tunnels can
+// share host/port/user yet terminate on different workers, and evidence frozen
+// under one worker id never answers for the other. An id-free side keeps the
+// older sync-scope field-only compatibility.
+const sameNode = (a, b) => Boolean(a && b) && ["kind", "root", "host", "port", "user"].every(field => String(a[field] ?? "") === String(b[field] ?? ""))
+  && (a.id === undefined || a.id === null || a.id === "" || b.id === undefined || b.id === null || b.id === "" || String(a.id) === String(b.id));
 
 /** A path capability authorizes one frozen batch, never a later or remembered path. */
 class CleanupFileApi {
@@ -206,12 +211,14 @@ class CleanupFileApi {
     this.previews = new Map(); this.busy = new Set(); this.localExecutions = new Map();
     this.observeInFlight = 0; this.observeWaiters = [];
   }
-  /** Shared read-only in-flight budget for one API instance: at most two
-   *  engine reads run at once, whatever the per-request readConcurrency is
-   *  (the caller splits the same global budget across observation groups). */
-  async observeSlot(limit, run) {
-    const cap = Math.min(2, Math.max(1, limit));
-    while (this.observeInFlight >= cap) await new Promise(resolve => this.observeWaiters.push(resolve));
+  /** Shared read-only in-flight budget for the whole API instance: exactly two
+   *  engine reads at once, independent of any request's readConcurrency. Each
+   *  request bounds only itself through its batch windows, so two concurrent
+   *  readConcurrency=1 rounds may legitimately hold both global slots together,
+   *  while readConcurrency=2 rounds can never stack past two. The finally path
+   *  releases the slot on failed reads so later rounds keep running. */
+  async observeSlot(run) {
+    while (this.observeInFlight >= 2) await new Promise(resolve => this.observeWaiters.push(resolve));
     this.observeInFlight += 1;
     try { return await run(); }
     finally { this.observeInFlight -= 1; const next = this.observeWaiters.shift(); if (next) next(); }
@@ -533,7 +540,7 @@ class CleanupFileApi {
           ...(item.inode === undefined ? {} : { inode: item.inode }),
           ...(item.isolationRelativePath === undefined ? {} : { isolationRelativePath: item.isolationRelativePath }) }));
         const rootIdentity = part.items[0].rootIdentity;
-        return this.observeSlot(params.readConcurrency, () => this.checked({ node, root: node.root,
+        return this.observeSlot(() => this.checked({ node, root: node.root,
           ...(rootIdentity === undefined ? {} : { rootIdentity }), action: "batch-observe", observationId, entries }));
       }));
       settled.forEach((outcome, k) => {

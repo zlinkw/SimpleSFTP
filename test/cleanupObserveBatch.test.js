@@ -15,7 +15,7 @@ const NODE={kind:'local',root:'/srv/proj'};
 const isoName=rel=>'iso_'+rel.slice('out/'.length);
 const expanded=entries=>entries.reduce((sum,e)=>sum+(e.isolationRelativePath?2:1),0);
 function harness(options={}){
-  const calls=[],stats={observeRpcs:[],active:0,peak:0};
+  const calls=[],stats={observeRpcs:[],active:0,peak:0,per:{},perPeak:{}};
   const transport=async request=>{
     calls.push(request);
     if(request.action==='batch-inspect'){
@@ -32,7 +32,9 @@ function harness(options={}){
       if(request.observationId===undefined)throw Object.assign(Error('INVALID_REQUEST'),{code:'INVALID_REQUEST'});
       stats.observeRpcs.push(expanded(request.entries));
       const n = stats.observeRpcs.length; // fixed at entry: delayed batches keep their own round number
+      const round=request.observationId;
       stats.active++;stats.peak=Math.max(stats.peak,stats.active);
+      stats.per[round]=(stats.per[round]||0)+1;stats.perPeak[round]=Math.max(stats.perPeak[round]||0,stats.per[round]);
       try{
         if(options.delay)await new Promise(resolve=>setTimeout(resolve,10));
         if(options.observeFails&&options.observeFails(request,n))
@@ -48,7 +50,7 @@ function harness(options={}){
         return {ok:true,observationId:options.wrongRound?'other-round':request.observationId,
           rootIdentity:options.wrongIdentity&&n>1?{...IDENTITY,inode:'666'}:IDENTITY,
           capabilities:{batchCleanupObservation:1,maxTargets:5000},observations:rows,metrics:{}};
-      } finally{ stats.active--; }
+      } finally{ stats.active--; stats.per[round] -= 1; }
     }
     throw Object.assign(Error('UNEXPECTED_ACTION'),{code:'UNEXPECTED_ACTION'});
   };
@@ -233,6 +235,71 @@ test('engine per-row refusals pass through as row errors with their own unknowns
   assert.equal(byKey.bad.error.code,'UNSAFE_PATH');assert.equal(byKey.bad.executorsChecked,false);
   assert.equal(byKey.good.status,'present');assert.equal(byKey.good.error,undefined);
 });
+test('a token frozen under a stable worker id never answers for another worker id on the same endpoint',async()=>{
+  // Reviewer probe P1/P1b (r19): host/port/user/root match but the transport
+  // terminates on a different worker; the frozen evidence must be refused as
+  // TOKEN_NODE_MISMATCH/unknown, never laundered into completed.
+  const {api,calls}=harness({observe:e=>({key:e.key,status:'gone',
+    target:{missing:true,type:e.type,absolutePath:'/srv/proj/'+e.relativePath},executors:[],executorsChecked:true,
+    ...(e.isolationRelativePath?{isolationStatus:'gone',isolationChecked:true}:{})})});
+  const W1={id:'w1',kind:'remote',root:'/srv/proj',host:'h',user:'u',port:22};
+  const row=await api.preview({node:W1,action:'delete',authorizationMode:'confirmed_paths',targets:[{relativePath:'out/d0',type:'directory'}]});
+  const exact=row.targets.filter(t=>!t.missing).map(t=>t.absolutePath);
+  await api.confirm({token:row.token,digest:row.digest,confirm:true,phase:1,exactTargets:exact});
+  await api.confirm({token:row.token,digest:row.digest,confirm:true,phase:2,exactTargets:exact});
+  const tokenTarget=[{key:'a',relativePath:'out/d0',type:'directory',backendToken:row.token,backendIndex:0}];
+  const before=calls.length;
+  const cross=await observe(api,tokenTarget,{node:{...W1,id:'w2'}});
+  assert.equal(cross.observations[0].error.code,'TOKEN_NODE_MISMATCH','same ssh endpoint fields but another worker id is not the frozen node');
+  assert.equal(cross.observations[0].state,'unknown','the wrong worker never receives a completed verdict');
+  assert.equal(calls.length,before,'the refused token never reaches the wire');
+  const same=await observe(api,tokenTarget,{node:W1});
+  assert.equal(same.observations[0].error,undefined);
+  assert.equal(same.observations[0].state,'completed','the same id is still the same node (P1b)');
+  // sync-scope compatibility: a side without any id keeps the field-only match.
+  const halfA=await observe(api,tokenTarget,{node:{kind:'remote',root:'/srv/proj',host:'h',user:'u',port:22}});
+  assert.equal(halfA.observations[0].error,undefined,'an id-free observer stays compatible with an id-frozen row');
+  const anon=await api.preview({node:{kind:'remote',root:'/srv/proj',host:'h2',user:'u',port:22},action:'delete',
+    authorizationMode:'confirmed_paths',targets:[{relativePath:'out/d1',type:'directory'}]});
+  const anonExact=anon.targets.filter(t=>!t.missing).map(t=>t.absolutePath);
+  await api.confirm({token:anon.token,digest:anon.digest,confirm:true,phase:1,exactTargets:anonExact});
+  await api.confirm({token:anon.token,digest:anon.digest,confirm:true,phase:2,exactTargets:anonExact});
+  const halfB=await observe(api,[{key:'b',relativePath:'out/d1',type:'directory',backendToken:anon.token,backendIndex:0}],
+    {node:{id:'w9',kind:'remote',root:'/srv/proj',host:'h2',user:'u',port:22}});
+  assert.equal(halfB.observations[0].error,undefined,'an id-free frozen row stays compatible with an id-carrying observer');
+});
+
+test('the instance read budget is two slots shared across requests, and failed reads release theirs',async()=>{
+  // Reviewer probe P2a/P2b (r19): per-request readConcurrency bounds only that
+  // request (via its batch windows); two concurrent readConcurrency=1 rounds
+  // must be able to occupy both global slots together, never queue at 1.
+  const {api,stats}=harness({delay:true,observeFails:(request,n)=>request.observationId==='rx'&&request.entries[0].key==='k0'});
+  const [first,second]=await Promise.all([
+    observe(api,residue(3000),{observationId:'rx',readConcurrency:1}),
+    observe(api,residue(3000),{observationId:'ry',readConcurrency:1}),
+  ]);
+  assert.equal(stats.peak,2,'two rc=1 rounds may hold both global slots together (P2a)');
+  assert.equal(stats.perPeak.rx,1,'round rx keeps its own in-flight ceiling at one');
+  assert.equal(stats.perPeak.ry,1,'round ry keeps its own in-flight ceiling at one');
+  assert.equal(stats.observeRpcs.reduce((a,b)=>a+b,0),12000,'both rounds read their whole residue');
+  assert.equal(Object.values(first.observations).filter(o=>o.error&&o.error.code==='OBSERVE_ROUND_FAILED').length,2500,
+    'only the failed batch of rx is unknown');
+  assert.equal(Object.values(second.observations).filter(o=>!o.error).length,3000,'ry is untouched by the sibling failure');
+  assert.equal(api.observeInFlight,0,'failed and completed reads all released their slots');
+  const later=await observe(api,residue(2),{observationId:'rz'});
+  assert.ok(Object.values(later.observations).every(o=>!o.error),'a later round runs right after failures freed the slots');
+  // P2b: two readConcurrency=2 rounds still stack to at most two global slots.
+  const shared=harness({delay:true});
+  const [p,q]=await Promise.all([
+    shared.api.observeBatch({node:NODE,observationId:'p',readConcurrency:2,targets:residue(3000).map(t=>({...t,key:'p'+t.key}))}),
+    shared.api.observeBatch({node:NODE,observationId:'q',readConcurrency:2,targets:residue(3000).map(t=>({...t,key:'q'+t.key}))}),
+  ]);
+  assert.equal(shared.stats.peak,2,'rc=2 rounds share exactly two slots');
+  assert.equal(stats.perPeak.p,undefined);
+  assert.equal(Object.keys(p.observations).length,3000);
+  assert.equal(Object.keys(q.observations).length,3000);
+});
+
 test('observeBatch performs zero local writes and never emits a mutating action',async()=>{
   const {api,calls,storageRoot}=harness();
   const row=await confirmed(api,dirs(2));
