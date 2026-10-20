@@ -339,32 +339,55 @@ test('one observeBatch call reads each backend token exactly once and re-reads a
   assert.equal(half.observations.find(o=>o.key==='dup').error.code,'TOKEN_TARGET_MISMATCH');
 });
 
-test('default-heap scale: 1200 and 5000 real-token rows stay linear, fresh, and byte-stable',async()=>{
+test('default-heap scale: 1200 and 5000 real-token rows stay linear, fresh, and byte-stable',async t=>{
   // Same public API and production read (counted through a pass-through
-  // wrapper), real rows on disk, default V8 heap, no timeout widening. The
-  // before-fix path re-read the whole row per target (quadratic CPU and live
-  // allocation); after-fix each call reads each token once.
+  // wrapper), real rows on disk, default V8 heap, no timeout widening. Warm
+  // rounds measure the in-call snapshot win straight after preview/confirm
+  // (read() legitimately answers from its memory previews); COLD rounds clear
+  // ONLY this test api's memory previews first, so every read must hit the
+  // row file on disk - the path an independent A-side status round takes.
+  // Deterministic assertions stay about unique-token reads; timings ship as
+  // t.diagnostic JSON captured by the investigating script, never hard pins.
   const {api,stats}=harness({observe:e=>({key:e.key,status:'gone',
     target:{missing:true,type:e.type,absolutePath:'/srv/proj/'+e.relativePath},executors:[],executorsChecked:true})});
-  const reads={n:0};
+  const reads={n:0,hitsDisk:false};
   const realRead=api.read.bind(api);
-  api.read=async token=>{ reads.n+=1; return realRead(token); };
+  api.read=async token=>{ reads.n+=1;
+    // prove the cold round really goes to disk: preview cache cleared means
+    // read() takes its fs branch (production behaviour, observed only)
+    if(!api.previews.has(token))reads.hitsDisk=true;
+    return realRead(token); };
   const rels=n=>Array.from({length:n},(_,i)=>'out/f'+String(i).padStart(5,'0'));
+  const clock=()=>Number(process.hrtime.bigint())/1e6;
   const report={};
   for(const n of [1200,5000]){
     const row=await tokenRow(api,rels(n));
     const file=path.join(api.storageRoot,row.token+'.json');
     const bytesBefore=fs.readFileSync(file);
     const targets=rels(n).map((rel,i)=>({key:'k'+i,relativePath:rel,type:'file',backendToken:row.token,backendIndex:i}));
-    reads.n=0;
-    const mem0=process.memoryUsage(), t0=process.hrtime.bigint();
+    reads.n=0;reads.hitsDisk=false;
+    const mem0=process.memoryUsage(), t0=clock();
     const r1=await observe(api,targets);
-    const ms=Number(process.hrtime.bigint()-t0)/1e6, mem1=process.memoryUsage();
-    report[n]={firstReads:reads.n,ms:Math.round(ms),heapUsedMB:Math.round(mem1.heapUsed/1048576),
-      heapDeltaMB:Math.round((mem1.heapUsed-mem0.heapUsed)/1048576),rssMB:Math.round(mem1.rss/1048576)};
+    const ms=clock()-t0, mem1=process.memoryUsage();
     assert.equal(reads.n,1,'one token costs exactly one read at n='+n);
+    assert.equal(reads.hitsDisk,false,'warm round answers from the preview memory cache (documented, not disk)');
     assert.equal(Object.values(r1.observations).filter(o=>o.state==='completed').length,n);
     assert.deepEqual(fs.readFileSync(file),bytesBefore,'observation never rewrites the frozen row');
+    // COLD round: identical inputs, but this test api's preview cache entry is
+    // cleared FIRST, so the single read must hit the existing row file.
+    api.previews.delete(row.token);
+    reads.n=0;reads.hitsDisk=false;
+    const cMem0=process.memoryUsage(), cT0=clock();
+    const r1c=await observe(api,targets);
+    const cMs=clock()-cT0, cMem1=process.memoryUsage();
+    assert.equal(reads.n,1,'the cold round still reads each token exactly once at n='+n);
+    assert.equal(reads.hitsDisk,true,'the cold round genuinely goes through the on-disk row read');
+    assert.equal(Object.values(r1c.observations).filter(o=>o.state==='completed').length,n);
+    assert.deepEqual(fs.readFileSync(file),bytesBefore,'the cold observation never rewrites the row either');
+    report[n]={warm:{reads:reads.n,ms:Math.round(ms*10)/10,heapUsedMB:Math.round(mem1.heapUsed/1048576),
+      heapDeltaMB:Math.round((mem1.heapUsed-mem0.heapUsed)/1048576),rssMB:Math.round(mem1.rss/1048576)},
+      cold:{reads:reads.n,diskRead:true,ms:Math.round(cMs*10)/10,heapUsedMB:Math.round(cMem1.heapUsed/1048576),
+      heapDeltaMB:Math.round((cMem1.heapUsed-cMem0.heapUsed)/1048576),rssMB:Math.round(cMem1.rss/1048576)}};
     // Fresh round with a rewritten token row re-reads across calls: the frozen
     // facts of round one must not survive into round two's snapshot.
     const stale=JSON.parse(bytesBefore.toString());
@@ -387,7 +410,9 @@ test('default-heap scale: 1200 and 5000 real-token rows stay linear, fresh, and 
   assert.equal(reads.n,3,'per-token accounting: two live tokens plus one dead token, one read each');
   assert.equal(Object.values(mixedRound.observations).filter(o=>o.state==='completed').length,1200,'the dead token never contaminates live groups');
   assert.equal(Object.values(mixedRound.observations).filter(o=>o.error&&o.error.code==='TOKEN_UNAVAILABLE').length,400);
-  fs.appendFileSync(path.join('/tmp/opencode','v110-readfix','scale-report.json'),JSON.stringify(report)+'\n');
+  // Measurement ships as test diagnostics (captured by the investigation
+  // script into scratch); the suite never depends on a fixed report path.
+  t.diagnostic('SCALE-MEASUREMENT '+JSON.stringify(report));
 });
 
 test('observeBatch performs zero local writes and never emits a mutating action',async()=>{
