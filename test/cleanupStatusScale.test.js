@@ -28,7 +28,7 @@ function harness(options={}){
             :t.type==='directory'?{isolationName:isoName(t.relativePath)}:{})}))};
     }
     if(request.action==='batch-verify'){
-      if(JSON.stringify(request.rootIdentity)!==JSON.stringify(IDENTITY))
+      if(options.identityDrift||JSON.stringify(request.rootIdentity)!==JSON.stringify(IDENTITY))
         return {ok:false,error:{code:'ROOT_IDENTITY_CHANGED'}}; // engine-side identity refusal
       if(request.entries.length>5000)throw Object.assign(Error('FAST_BATCH_INVALID'),{code:'FAST_BATCH_INVALID'});
       // invariant: every isolation twin shares the RPC with its frozen original
@@ -178,6 +178,45 @@ test('a short answer that drops only the isolation twin row never demotes accoun
   options.verify=()=>'gone'; // evidence returns: re-accounted
   const again=await api.status({token:row.token});
   assert.deepEqual(again.states,['completed']);
+});
+test('counter-evidence outranks unrelated missing rows: dropped original row with the twin actually present demotes to unknown and recovers',async()=>{
+  const options={verify:()=>'gone'};
+  const {api}=harness(options);
+  const row=await confirmed(api,[{relativePath:'out/d0',type:'directory'}]);
+  await api.execute({token:row.token,digest:row.digest,index:0});
+  const done=await api.status({token:row.token});
+  assert.deepEqual(done.states,['completed']);
+  // ONE round: the original row is dropped AND the received twin row says present
+  options.verify=()=>'present';
+  options.dropRow=r=>r.relativePath==='out/d0';
+  const countered=await api.status({token:row.token});
+  assert.deepEqual(countered.states,['unknown'],'a received isolation tree is counter-evidence, the missing original row must not mask it');
+  assert.equal(countered.observations[0].isolationStatus,'present','the round that countered is recorded, not the old observation');
+  assert.equal(countered.statusQueryError,undefined);
+  delete options.verify;delete options.dropRow;options.verify=()=>'gone';
+  const back=await api.status({token:row.token});
+  assert.deepEqual(back.states,['completed'],'the demotion stays recoverable by a full clean round');
+});
+test('an explicit ROOT_IDENTITY_CHANGED demotes completed to unknown, while an ordinary batch failure without new evidence still preserves it',async()=>{
+  const options={verify:()=>'gone'};
+  const {api}=harness(options);
+  const row=await confirmed(api,[{relativePath:'out/d0',type:'directory'}]);
+  await api.execute({token:row.token,digest:row.digest,index:0});
+  const done=await api.status({token:row.token});
+  assert.deepEqual(done.states,['completed']);
+  const kept=done.observations[0];
+  options.verifyFails=()=>true; // ordinary connectivity-style batch failure: no new evidence at all
+  const lost=await api.status({token:row.token});
+  assert.deepEqual(lost.states,['completed'],'ordinary failure keeps the accounted completion');
+  assert.deepEqual(lost.observations[0],kept);
+  delete options.verifyFails;
+  options.identityDrift=true; // the engine now REFUSES the frozen root identity: received counter-evidence
+  const moved=await api.status({token:row.token});
+  assert.deepEqual(moved.states,['unknown'],'an identity refusal after completion is never masked as a mere missed round');
+  assert.equal(moved.statusQueryError,'ROOT_IDENTITY_CHANGED','the refusal is reported distinctly, not conflated with transport noise');
+  options.identityDrift=false;
+  const settled=await api.status({token:row.token});
+  assert.deepEqual(settled.states,['completed'],'once the root re-settles, clean evidence re-accounts');
 });
 test('a root identity change mid-round yields safe unknown everywhere, never completion',async()=>{
   // engine refuses every verify with ROOT_IDENTITY_CHANGED (identity drift surfaces as an error envelope)

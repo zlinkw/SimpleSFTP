@@ -591,14 +591,19 @@ class CleanupFileApi {
         for (const i of indexes) {
           const proof = proofs[i];
           if (proof.ok === false) queryError ||= proof.queryError;
-          // Absence of evidence never erases accounted truth: a failed batch,
-          // a dropped original row, or a short answer that dropped ONLY the
-          // isolation twin row keeps the entry completed and its earlier
-          // observation intact. This is narrowly about missing answers -
-          // fresh counter-evidence (the isolation twin actually present, a
-          // failed/unknown proof under an active round, an identity refusal)
-          // still resolves to unknown honestly and is never suppressed.
-          if (row.states[i] === "completed" && (proof.ok === false || proof.status === "missing" || proof.isolationStatus === "missing")) continue;
+          // Absence of evidence never erases accounted truth: an ordinary
+          // batch failure, a dropped original row, or a short answer that
+          // dropped ONLY the isolation twin row keeps the entry completed and
+          // its earlier observation intact. Received counter-evidence always
+          // outranks unrelated missing rows: a twin row that answers present
+          // demotes even when the original row went unanswered in the same
+          // round, and an explicit ROOT_IDENTITY_CHANGED refusal (the engine
+          // rejecting the frozen root identity, distinguishable by code from
+          // transport noise, which never carries engine error codes) demotes
+          // too - completion is never masked against fresh contradiction.
+          const identityCountered = proof.ok === false && proof.queryError === "ROOT_IDENTITY_CHANGED";
+          if (row.states[i] === "completed" && !identityCountered && proof.isolationStatus !== "present" &&
+              (proof.ok === false || proof.status === "missing" || proof.isolationStatus === "missing")) continue;
           row.observations[i] = proof;
           row.states[i] = proof.state === "completed" ? "completed" : proof.state === "pending" && row.states[i] === "pending" ? "pending" : "unknown";
         }
