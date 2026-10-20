@@ -17,6 +17,7 @@ const copy = value => JSON.parse(JSON.stringify(value));
 // sufficient: retry additionally requires the engine's explicit
 // mutationStarted=false fact, because the same codes can also surface after
 // earlier unlinks (mid-walk or file-group recheck) of a partially mutated batch.
+const FAST_VERIFY_BATCH_LIMIT = 5000; // engine FAST_BATCH_LIMIT parity, counted in EXPANDED verify entries
 const FAST_ZERO_MUTATION_CODES = new Set(["ENTRY_IDENTITY_CHANGED", "MISSING_TARGET", "TYPE_CHANGED", "UNCERTAIN_TYPE",
   "UNSAFE_PATH", "UNSAFE_PARENT", "FAST_BATCH_INVALID", "INVALID_AUTHORIZATION_MODE", "ROOT_IDENTITY_CHANGED",
   "NOT_REGISTERED_ISOLATION", "PROTECTED_PATH", "UNSAFE_ARCHIVE_BATCH"]);
@@ -345,46 +346,93 @@ class CleanupFileApi {
       return !row.targets[i].missing;
     });
     if (live.length) {
-      const entries = live.map(i => ({ relativePath: row.targets[i].relativePath, type: row.targets[i].type,
-        device: row.targets[i].device, inode: row.targets[i].inode }));
-      // Mode-A directories are isolate-then-delete: the deterministic entry-
-      // bound isolation name rides in the SAME active query, bound to the
-      // frozen original dev/inode. Its disappearance - not the original path,
-      // which a fresh result may legitimately reuse - marks completion.
-      const isoSlot = new Map();
-      live.forEach((i, position) => {
+      // Expansion is grouped per target: the deterministic entry-bound
+      // isolation twin of a mode-A directory rides in the SAME group (bound to
+      // the frozen original dev/inode), and groups are packed into read-only
+      // batch-verify RPCs of at most FAST_VERIFY_BATCH_LIMIT EXPANDED entries
+      // (engine FAST_BATCH_LIMIT parity). Public status/check/verify/settle
+      // all share this entry point, so 2501+ directories no longer overflow a
+      // single RPC; independent batches run at most two at a time and pairing
+      // is resolved by relativePath+type, never by response position.
+      const entries = [];
+      const slots = []; // per live position: { orig, iso|null } slot indices into entries
+      for (const i of live) {
         const target = row.targets[i];
+        const orig = entries.length;
+        entries.push({ relativePath: target.relativePath, type: target.type, device: target.device, inode: target.inode });
+        let iso = null;
         if (target.type === "directory" && !target.archived && target.isolationName) {
+          // Mode-A directories are isolate-then-delete: the disappearance of
+          // the isolation tree - not the original path, which a fresh result
+          // may legitimately reuse - marks completion.
           const parent = target.relativePath.slice(0, target.relativePath.lastIndexOf("/") + 1);
-          isoSlot.set(i, entries.length);
-          entries.push({ relativePath: parent + target.isolationName, type: "directory",
-            device: target.device, inode: target.inode });
+          iso = entries.length;
+          entries.push({ relativePath: parent + target.isolationName, type: "directory", device: target.device, inode: target.inode });
         }
+        slots.push({ orig, iso });
+      }
+      const chunks = [];
+      const slotChunk = new Array(slots.length);
+      let chunk = { start: 0, end: 0 };
+      slots.forEach((slot, position) => {
+        const size = slot.iso === null ? 1 : 2;
+        if (chunk.end > chunk.start && chunk.end - chunk.start + size > FAST_VERIFY_BATCH_LIMIT) { chunks.push(chunk); chunk = { start: chunk.end, end: chunk.end }; }
+        slotChunk[position] = chunks.length; // this slot lands in the chunk being filled
+        chunk.end += size;
       });
-      const result = await this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
-        action: "batch-verify", authorizationMode: "confirmed_paths", entries });
+      if (chunk.end > chunk.start) { chunks.push(chunk); slotChunk[slotChunk.length - 1] = chunks.length - 1; }
+      const responses = new Array(chunks.length);
+      const failures = new Array(chunks.length);
+      for (let s = 0; s < chunks.length; s += 2) { // read-only batches: at most two in flight
+        const settled = await Promise.allSettled(chunks.slice(s, s + 2).map(part => this.checked({
+          node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
+          action: "batch-verify", authorizationMode: "confirmed_paths", entries: entries.slice(part.start, part.end) })));
+        settled.forEach((outcome, k) => {
+          if (outcome.status === "fulfilled") responses[s + k] = outcome.value;
+          else failures[s + k] = outcome.reason;
+        });
+      }
+      const rowsByKey = new Map();
+      responses.forEach((result, ci) => {
+        if (result) for (const answered of result.targets || [])
+          rowsByKey.set(ci + "\u0000" + answered.relativePath + "\u0000" + answered.type, answered);
+      });
+      let batchFailure;
       live.forEach((i, position) => {
         const target = row.targets[i];
-        const entry = (result.targets || [])[position] || { status: "present" };
+        const { orig, iso } = slots[position];
+        const ci = slotChunk[position]; // original and isolation twin share the chunk
+        if (failures[ci]) {
+          // A failed batch answers for NOTHING it carried: those entries are
+          // safely unknown (never "gone"), while other batches' resolved
+          // evidence stands untouched and batchExecuting is left alone.
+          batchFailure ||= failures[ci];
+          proofs[i] = { ok: false, state: "unknown", queryError: failures[ci].code || failures[ci].message, target };
+          return;
+        }
+        const entry = rowsByKey.get(ci + "\u0000" + entries[orig].relativePath + "\u0000" + entries[orig].type) || { status: "missing" };
         const archived = Boolean(target.archived);
         let state;
-        if (isoSlot.has(i)) {
-          const iso = (result.targets || [])[isoSlot.get(i)] || { status: "present" };
-          // The non-overwriting rename is the first mutation of the chain:
-          // while the entry-bound isolation tree still stands the deletion is
-          // unfinished regardless of what the original path shows. A same-name
-          // object recreated there is new data, never counted and never
-          // demanded for deletion.
-          state = iso.status === "present" ? "unknown"
+        const proofExtra = {};
+        if (iso !== null) {
+          const isoRow = rowsByKey.get(ci + "\u0000" + entries[iso].relativePath + "\u0000" + "directory") || { status: "missing" };
+          proofExtra.isolationStatus = isoRow.status;
+          // While the entry-bound isolation tree still stands (or went
+          // unanswered) the deletion is unfinished regardless of the original
+          // path; a same-name recreation there is new data, never counted.
+          if (isoRow.status === "missing") state = "unknown";
+          else state = isoRow.status === "present" ? "unknown"
             : entry.status === "gone" || entry.status === "replaced" ? "completed"
-              : row.batchExecuting || row.states[i] === "executing" || row.states[i] === "completed" ? "unknown" : "pending";
+              : entry.status === "missing" ? "unknown"
+                : row.batchExecuting || row.states[i] === "executing" || row.states[i] === "completed" ? "unknown" : "pending";
         } else {
           state = entry.status === "gone" ? "completed"
-            : entry.status === "replaced" ? (archived ? "unknown" : "completed") : "pending";
+            : entry.status === "replaced" ? (archived ? "unknown" : "completed")
+              : entry.status === "missing" ? "unknown" : "pending";
         }
-        proofs[i] = { ok: true, state, status: entry.status, target: entry,
-          ...(isoSlot.has(i) ? { isolationStatus: ((result.targets || [])[isoSlot.get(i)] || {}).status } : {}) };
+        proofs[i] = { ok: true, state, status: entry.status, target: entry, ...proofExtra };
       });
+      if (single && batchFailure) throw batchFailure; // single-index callers keep their own error handling
     }
     return single ? proofs[list[0]] : proofs;
   }
@@ -532,16 +580,28 @@ class CleanupFileApi {
   async status(params) {
     const row = await this.read(params.token);
     if (isFastDeleteRow(row)) {
-      // One batched active query refreshes the whole selection, never one RPC per file.
+      // Batched active queries refresh the whole selection in bounded
+      // read-only RPCs (fastVerify chunks by expanded entries), never per file.
       const indexes = row.targets.map((_, i) => i).filter(i => !row.targets[i].missing && row.states[i] !== "absent");
+      delete row.statusQueryError; // a stale round's error must not outlive a fresh successful round
       try {
         const proofs = await this.fastVerify(row, indexes);
         row.observations = row.observations || [];
+        let queryError;
         for (const i of indexes) {
           const proof = proofs[i];
+          if (proof.ok === false) {
+            queryError ||= proof.queryError;
+            // A failed batch erases nothing: keep any previously accounted
+            // evidence (completed stays completed) and never clear
+            // batchExecuting on the strength of an unanswered round.
+            if (row.states[i] === "completed") continue;
+          }
+          if (proof.status === "missing" && row.states[i] === "completed") continue;
           row.observations[i] = proof;
           row.states[i] = proof.state === "completed" ? "completed" : proof.state === "pending" && row.states[i] === "pending" ? "pending" : "unknown";
         }
+        if (queryError) row.statusQueryError = queryError;
         // An active query that accounts for every entry resolves a lost receipt;
         // the resolved truth is persisted so a later rerun sees alreadyCompleted.
         if (row.batchExecuting && row.targets.every((target, i) => target.missing || row.states[i] === "completed")) row.batchExecuting = false;
