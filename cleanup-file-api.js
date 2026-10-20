@@ -590,14 +590,15 @@ class CleanupFileApi {
         let queryError;
         for (const i of indexes) {
           const proof = proofs[i];
-          if (proof.ok === false) {
-            queryError ||= proof.queryError;
-            // A failed batch erases nothing: keep any previously accounted
-            // evidence (completed stays completed) and never clear
-            // batchExecuting on the strength of an unanswered round.
-            if (row.states[i] === "completed") continue;
-          }
-          if (proof.status === "missing" && row.states[i] === "completed") continue;
+          if (proof.ok === false) queryError ||= proof.queryError;
+          // Absence of evidence never erases accounted truth: a failed batch,
+          // a dropped original row, or a short answer that dropped ONLY the
+          // isolation twin row keeps the entry completed and its earlier
+          // observation intact. This is narrowly about missing answers -
+          // fresh counter-evidence (the isolation twin actually present, a
+          // failed/unknown proof under an active round, an identity refusal)
+          // still resolves to unknown honestly and is never suppressed.
+          if (row.states[i] === "completed" && (proof.ok === false || proof.status === "missing" || proof.isolationStatus === "missing")) continue;
           row.observations[i] = proof;
           row.states[i] = proof.state === "completed" ? "completed" : proof.state === "pending" && row.states[i] === "pending" ? "pending" : "unknown";
         }

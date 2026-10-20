@@ -41,6 +41,7 @@ function harness(options={}){
         if(options.verifyDelay)await new Promise(resolve=>setTimeout(resolve,10));
         if(options.verifyFails&&options.verifyFails(request))throw Object.assign(Error('VERIFY_ROUND_FAILED'),{code:'VERIFY_ROUND_FAILED'});
         const rows=request.entries.map(e=>({relativePath:e.relativePath,type:e.type,status:options.verify(e)}));
+        if(options.dropRow)for(let k=rows.length-1;k>=0;k--)if(options.dropRow(rows[k]))rows.splice(k,1);
         if(options.dropLastRow)rows.pop();
         if(options.shuffleRows)rows.reverse(); // answers arrive unordered; pairing is by identity
         return {ok:true,rootIdentity:IDENTITY,targets:rows};
@@ -148,6 +149,35 @@ test('sticky accounted evidence: a completed entry is not downgraded by a later 
   await assert.rejects(api.verify({token:row.token,index:0}),/VERIFY_ROUND_FAILED/,'single-index verify keeps its own error handling');
   await assert.rejects(api.check({token:row.token,index:0}),/VERIFY_ROUND_FAILED/);
   await assert.rejects(api.settle({token:row.token,digest:row.digest,index:0}),/VERIFY_ROUND_FAILED/);
+});
+test('a short answer that drops only the isolation twin row never demotes accounted completed (defect 8)',async()=>{
+  const options={verify:()=>'gone'};
+  const {api}=harness(options);
+  const row=await confirmed(api,[{relativePath:'out/d0',type:'directory'}]);
+  await api.execute({token:row.token,digest:row.digest,index:0});
+  const done=await api.status({token:row.token}); // full gone answers -> accounted completed
+  assert.deepEqual(done.states,['completed']);
+  const kept=done.observations[0];
+  options.dropRow=r=>r.relativePath==='out/iso_d0'; // anomalous short round: original gone, twin row dropped
+  const short1=await api.status({token:row.token});
+  assert.deepEqual(short1.states,['completed'],'a missing twin row is absence of evidence, not counter-evidence');
+  assert.deepEqual(short1.observations[0],kept,'the accounted observation stays intact');
+  assert.equal(short1.statusQueryError,undefined);
+  delete options.dropRow;
+  const good=await api.status({token:row.token}); // good round: nothing to repair
+  assert.deepEqual(good.states,['completed']);
+  options.dropRow=r=>r.relativePath==='out/d0'; // dropped ORIGINAL row (twin answered gone) is equally absent evidence
+  const short2=await api.status({token:row.token});
+  assert.deepEqual(short2.states,['completed']);
+  assert.deepEqual(short2.observations[0],kept);
+  delete options.dropRow;
+  options.verify=e=>e.relativePath==='out/iso_d0'?'present':'gone'; // REAL counter-evidence: twin tree actually exists
+  const contra=await api.status({token:row.token});
+  assert.deepEqual(contra.states,['unknown'],'fresh counter-evidence still resolves honestly - never permanently ignored');
+  assert.equal(contra.observations[0].isolationStatus,'present');
+  options.verify=()=>'gone'; // evidence returns: re-accounted
+  const again=await api.status({token:row.token});
+  assert.deepEqual(again.states,['completed']);
 });
 test('a root identity change mid-round yields safe unknown everywhere, never completion',async()=>{
   // engine refuses every verify with ROOT_IDENTITY_CHANGED (identity drift surfaces as an error envelope)
