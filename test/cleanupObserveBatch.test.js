@@ -300,6 +300,96 @@ test('the instance read budget is two slots shared across requests, and failed r
   assert.equal(Object.keys(q.observations).length,3000);
 });
 
+async function tokenRow(api,rels,node=NODE){
+  const row=await api.preview({node,action:'delete',authorizationMode:'confirmed_paths',
+    targets:rels.map(rel=>({relativePath:rel,type:'file'}))});
+  const exact=row.targets.filter(t=>!t.missing).map(t=>t.absolutePath);
+  await api.confirm({token:row.token,digest:row.digest,confirm:true,phase:1,exactTargets:exact});
+  await api.confirm({token:row.token,digest:row.digest,confirm:true,phase:2,exactTargets:exact});
+  return row;
+}
+const DEATH='f'.repeat(48);
+test('one observeBatch call reads each backend token exactly once and re-reads across calls',async()=>{
+  // Real rows on disk through the public API; read is the untouched production
+  // read, wrapped only with a pass-through counter. One token carried by many
+  // targets costs ONE read per call (JSON.parse of the full frozen row was
+  // quadratic: 5000 targets x full row = blocked delivery); a broken token is
+  // deduplicated in the same round, and the next public call reads fresh.
+  const {api}=harness({observe:e=>({key:e.key,status:'gone',
+    target:{missing:true,type:e.type,absolutePath:'/srv/proj/'+e.relativePath},executors:[],executorsChecked:true})});
+  const reads={n:0};
+  const realRead=api.read.bind(api);
+  api.read=async token=>{ reads.n+=1; return realRead(token); };
+  const one=await tokenRow(api,['out/a0','out/a1','out/a2']);
+  const three=await tokenRow(api,['out/b0','out/b1','out/b2','out/b3']);
+  const mine=(row,rels,from=0)=>rels.map((rel,i)=>({key:'k'+from+i,relativePath:rel,type:'file',backendToken:row.token,backendIndex:i}));
+  reads.n=0;
+  const first=await observe(api,[...mine(one,['out/a0','out/a1','out/a2']),...mine(three,['out/b0','out/b1','out/b2','out/b3'],100)]);
+  assert.equal(reads.n,2,'two distinct tokens this round cost exactly two reads');
+  assert.equal(Object.values(first.observations).filter(o=>o.state==='completed').length,7);
+  const dead=mine({token:DEATH},['out/x0','out/x1','out/x2'],200);
+  reads.n=0;
+  const second=await observe(api,[...mine(one,['out/a0','out/a1','out/a2']),...dead]);
+  assert.equal(reads.n,2,'the same token is re-read next call, and the dead token costs one deduplicated read');
+  assert.equal(Object.values(second.observations).filter(o=>o.error&&o.error.code==='TOKEN_UNAVAILABLE').length,3);
+  assert.ok(second.observations.find(o=>o.key==='k00').state==='completed','the dead token never contaminates live rows');
+  reads.n=0;
+  const half=await observe(api,[...mine(one,['out/a0','out/a1','out/a2'],0).slice(0,2),{key:'dup',relativePath:'out/zz',type:'file',backendToken:one.token,backendIndex:9}]);
+  assert.equal(reads.n,1,'duplicate and out-of-range rows share the single snapshot read');
+  assert.equal(half.observations.find(o=>o.key==='dup').error.code,'TOKEN_TARGET_MISMATCH');
+});
+
+test('default-heap scale: 1200 and 5000 real-token rows stay linear, fresh, and byte-stable',async()=>{
+  // Same public API and production read (counted through a pass-through
+  // wrapper), real rows on disk, default V8 heap, no timeout widening. The
+  // before-fix path re-read the whole row per target (quadratic CPU and live
+  // allocation); after-fix each call reads each token once.
+  const {api,stats}=harness({observe:e=>({key:e.key,status:'gone',
+    target:{missing:true,type:e.type,absolutePath:'/srv/proj/'+e.relativePath},executors:[],executorsChecked:true})});
+  const reads={n:0};
+  const realRead=api.read.bind(api);
+  api.read=async token=>{ reads.n+=1; return realRead(token); };
+  const rels=n=>Array.from({length:n},(_,i)=>'out/f'+String(i).padStart(5,'0'));
+  const report={};
+  for(const n of [1200,5000]){
+    const row=await tokenRow(api,rels(n));
+    const file=path.join(api.storageRoot,row.token+'.json');
+    const bytesBefore=fs.readFileSync(file);
+    const targets=rels(n).map((rel,i)=>({key:'k'+i,relativePath:rel,type:'file',backendToken:row.token,backendIndex:i}));
+    reads.n=0;
+    const mem0=process.memoryUsage(), t0=process.hrtime.bigint();
+    const r1=await observe(api,targets);
+    const ms=Number(process.hrtime.bigint()-t0)/1e6, mem1=process.memoryUsage();
+    report[n]={firstReads:reads.n,ms:Math.round(ms),heapUsedMB:Math.round(mem1.heapUsed/1048576),
+      heapDeltaMB:Math.round((mem1.heapUsed-mem0.heapUsed)/1048576),rssMB:Math.round(mem1.rss/1048576)};
+    assert.equal(reads.n,1,'one token costs exactly one read at n='+n);
+    assert.equal(Object.values(r1.observations).filter(o=>o.state==='completed').length,n);
+    assert.deepEqual(fs.readFileSync(file),bytesBefore,'observation never rewrites the frozen row');
+    // Fresh round with a rewritten token row re-reads across calls: the frozen
+    // facts of round one must not survive into round two's snapshot.
+    const stale=JSON.parse(bytesBefore.toString());
+    stale.targets[0].relativePath='out/elsewhere';
+    fs.writeFileSync(file,JSON.stringify(stale));
+    api.previews.delete(row.token);
+    reads.n=0;
+    const r2=await observe(api,targets.slice(0,5));
+    assert.equal(reads.n,1,'the next public call reads the token again');
+    assert.equal(r2.observations.find(o=>o.key==='k0').error.code,'TOKEN_TARGET_MISMATCH','round two answers from the rewritten row, not a cached snapshot');
+  }
+  // Multi-token accounting and dead-token isolation at 600+600 in one call.
+  const a=await tokenRow(api,rels(600).map(r=>'a/'+r));
+  const b=await tokenRow(api,rels(600).map(r=>'b/'+r));
+  const mixed=[...rels(600).map((r,i)=>({key:'a'+i,relativePath:'a/'+r,type:'file',backendToken:a.token,backendIndex:i})),
+    ...rels(600).map((r,i)=>({key:'b'+i,relativePath:'b/'+r,type:'file',backendToken:b.token,backendIndex:i})),
+    ...Array.from({length:400},(_,i)=>({key:'x'+i,relativePath:'x/'+i,type:'file',backendToken:DEATH,backendIndex:0}))];
+  reads.n=0;
+  const mixedRound=await observe(api,mixed,{readConcurrency:1});
+  assert.equal(reads.n,3,'per-token accounting: two live tokens plus one dead token, one read each');
+  assert.equal(Object.values(mixedRound.observations).filter(o=>o.state==='completed').length,1200,'the dead token never contaminates live groups');
+  assert.equal(Object.values(mixedRound.observations).filter(o=>o.error&&o.error.code==='TOKEN_UNAVAILABLE').length,400);
+  fs.appendFileSync(path.join('/tmp/opencode','v110-readfix','scale-report.json'),JSON.stringify(report)+'\n');
+});
+
 test('observeBatch performs zero local writes and never emits a mutating action',async()=>{
   const {api,calls,storageRoot}=harness();
   const row=await confirmed(api,dirs(2));

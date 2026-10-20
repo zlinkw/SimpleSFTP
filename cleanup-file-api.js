@@ -477,6 +477,13 @@ class CleanupFileApi {
     const observedPath = value => typeof value === "string" && value && value.length <= 4096 && !value.startsWith("/")
       && !/[\\\x00\r\n\x00-\x1f:*?[\]{}]/.test(value) && !value.split("/").some(part => !part || part === "." || part === "..");
     const seen = new Set(), planned = [], plannedByKey = new Map(), early = new Map();
+    // One frozen backend row is READ at most once per observeBatch call; every
+    // target pinned to the same token shares that immutable snapshot (rows
+    // are never mutated here), and a token that failed to read is remembered
+    // as failed for the rest of the round instead of being retried per target.
+    // The next public call reads again: no cross-round cache, read()'s own
+    // semantics for other callers stay exactly as they were.
+    const rowSnapshots = new Map(), ROW_READ_FAILED = Symbol("row-read-failed");
     for (const target of targets) {
       const key = target?.key, rel = target?.relativePath, type = target?.type;
       if (typeof key !== "string" || !key || seen.has(key) || !["file", "directory"].includes(type)) fail("INVALID_REQUEST");
@@ -491,7 +498,11 @@ class CleanupFileApi {
             || isolationRelativePath !== undefined && typeof isolationRelativePath !== "string") fail("INVALID_REQUEST");
         const unknown = code => { early.set(key, { key, relativePath: rel, type, state: "unknown", executors: [], executorsChecked: false,
           ...(isolationRelativePath !== undefined ? { isolationChecked: false } : {}), error: { code, message: code } }); };
-        try { row = await this.read(target.backendToken); } catch { unknown("TOKEN_UNAVAILABLE"); continue; }
+        const snapshot = rowSnapshots.get(target.backendToken);
+        if (snapshot === ROW_READ_FAILED) { unknown("TOKEN_UNAVAILABLE"); continue; }
+        if (snapshot !== undefined) row = snapshot;
+        else try { row = await this.read(target.backendToken); rowSnapshots.set(target.backendToken, row); }
+        catch { rowSnapshots.set(target.backendToken, ROW_READ_FAILED); unknown("TOKEN_UNAVAILABLE"); continue; }
         // Cross-node or cross-root token reuse is refused per target, never
         // answered with the wrong root's facts.
         if (!sameNode(row.node, node) || rootIdentity !== undefined && hash(row.rootIdentity) !== hash(rootIdentity)) { unknown("TOKEN_NODE_MISMATCH"); continue; }
