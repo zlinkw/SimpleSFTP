@@ -22,7 +22,7 @@ test('root-file API inspection and preview use the real engine and keep two exac
  fs.writeFileSync(path.join(root,relativePath),'fixture only','utf8');
  const node={kind:'local',root},target={relativePath,type:'file',destination:'clean_dir/'+relativePath};
  const api=new CleanupFileApi({storageRoot:path.join(root,'state'),transport:async request=>{
-  assert.ok(['inventory','inspect'].includes(request.action),'fixture must never execute a real deletion');
+  assert.ok(['inventory', 'inspect', 'batch-inspect', 'batch-verify'].includes(request.action), 'fixture must never execute a real deletion');
   const child=spawnSync(process.platform==='win32'?'python':'python3',['-B','-X','utf8',engine],{input:JSON.stringify(request),encoding:'utf8',timeout:10000,windowsHide:true});
   assert.equal(child.status,0,child.stderr||child.error?.message);return JSON.parse(child.stdout);
  }});

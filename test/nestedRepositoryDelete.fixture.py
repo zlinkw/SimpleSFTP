@@ -1,86 +1,99 @@
-import json, os, pathlib, runpy, stat, sys, tempfile
+"""v1.9 FakeOS migration of the nested-repository deletion contract.
 
-engine = runpy.run_path(sys.argv[1])
-env = engine['inspect'].__globals__
-root = pathlib.Path(tempfile.mkdtemp(prefix='nested-repository-')).resolve()
-archive = root / 'clean_dir' / 'fixture-only'
-archive.mkdir(parents=True)
-main_git = root / '.git' / 'config'
-main_git.parent.mkdir()
-main_git.write_text('main repository must survive', encoding='utf-8')
-child = root / 'comparison_methods' / '_repos' / 'cpsc'
-(child / '.git' / 'objects').mkdir(parents=True)
-(child / '.git' / 'config').write_text('fixture subrepository', encoding='utf-8')
-(child / '.git' / 'objects' / 'pack').write_bytes(b'fixture only')
-(child / 'model.py').write_text('fixture code', encoding='utf-8')
-target = {'relativePath':'comparison_methods/_repos/cpsc', 'destination':'clean_dir/comparison_methods/_repos/cpsc',
-          'type':'directory', 'authorizationMode':'confirmed_paths'}
+A double-confirmed whole subtree may carry nested .git metadata out with it
+(the repository marker inside the confirmed scope is an ordinary file), while
+the project's own .git outside the confirmed entry is never touched. Path
+guards (direct .git nomination, unsafe paths), the retirement of the legacy
+confirmed delete route, and clean_dir descendant protection all stay armed:
+an interrupted isolation refuses to consume the protected child and reports
+honest mutation facts. No real deletion approval exists in this round; every
+mutation runs on the shared fake tree.
+"""
+import json, os, sys
 
-def denied(call, code):
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fastdelete_harness as H
+
+ROOT = "/srv/proj"
+tree = H.Tree(ROOT)
+tree.seed_base()
+tree.add_dir(ROOT + "/.git")
+tree.add_file(ROOT + "/.git/config", b"main repository must survive")
+tree.add_dir(ROOT + "/repos")
+tree.add_dir(ROOT + "/repos/cpsc")
+tree.add_dir(ROOT + "/repos/cpsc/.git")
+tree.add_file(ROOT + "/repos/cpsc/.git/config", b"nested repository metadata")
+tree.add_file(ROOT + "/repos/cpsc/train.py", b"nested source")
+tree.add_dir(ROOT + "/repos/cpsc/work_dirs")
+tree.add_file(ROOT + "/repos/cpsc/work_dirs/latest.bin", b"nested result")
+tree.add_dir(ROOT + "/jobs")
+tree.add_dir(ROOT + "/jobs/run")
+tree.add_file(ROOT + "/jobs/run/result.bin", b"job result")
+tree.add_dir(ROOT + "/jobs/run/clean_dir")
+tree.add_file(ROOT + "/jobs/run/clean_dir/keep.txt", b"protected archive child")
+tree.add_dir(ROOT + "/clean_dir")
+engine = H.build_engine(tree, sys.argv[1])
+
+
+def refusal(call, code):
     try:
         call()
-    except engine['GuardError'] as error:
+    except engine["GuardError"] as error:
         assert error.code == code, (error.code, code)
         return error
-    raise AssertionError('unsafe target accepted: ' + code)
+    raise AssertionError("expected GuardError " + code)
 
-denied(lambda: engine['contents'](str(root), str(child), 'directory'), 'PROTECTED_DESCENDANT')
-value = engine['inspect'](str(root), target)
-assert any(row['path'] == '.git/objects/pack' for row in value['inventory'])
-assert value['fingerprintMode'] == 'metadata'
-for rel in ('.git', '.git/config', 'comparison_methods/_repos/cpsc/.git'):
-    denied(lambda rel=rel: engine['inspect'](str(root), {**target,'relativePath':rel}), 'PROTECTED_PATH')
-for rel in ('.', '..', ''):
-    denied(lambda rel=rel: engine['inspect'](str(root), {**target,'relativePath':rel}), 'UNSAFE_PATH')
 
-protected = child / 'clean_dir'
-protected.mkdir()
-error = denied(lambda: engine['inspect'](str(root), target), 'PROTECTED_DESCENDANT')
-assert error.blocking_path == str(protected), str(error)
-os.rename(protected, archive / 'protected-fixture')
+root, identity = engine["root_guard"](ROOT)
 
-# A .git pointer remains an ordinary approved file. Its external reference is never followed.
-worktree = child / 'nested_worktree'
-worktree.mkdir()
-(worktree / '.git').write_text('gitdir: ' + str(main_git.parent), encoding='utf-8')
-value = engine['inspect'](str(root), target)
-original_lstat = os.lstat
-def linked(value, *args, **kwargs):
-    if os.path.abspath(value) == str(child / '.git'):
-        from types import SimpleNamespace
-        return SimpleNamespace(st_mode=stat.S_IFLNK, st_file_attributes=0)
-    return original_lstat(value, *args, **kwargs)
-os.lstat = linked
-denied(lambda: engine['inspect'](str(root), target), 'LINK_OR_REPARSE_POINT')
-os.lstat = original_lstat
-original_mounts = env['mount_points']
-env['mount_points'] = lambda: {str(child / '.git')}
-denied(lambda: engine['inspect'](str(root), target), 'MOUNT_ESCAPE')
-env['mount_points'] = original_mounts
 
-# Exercise real deletion executors without permanently deleting even fixture files.
-calls = []
-original_chdir = os.chdir
-def record_delete(name, *args, **kwargs):
-    assert name.startswith('./') and '/' not in name[2:] and name[2:] not in ('', '.', '..'), name
-    parent = pathlib.Path(os.getcwd()).resolve()
-    assert engine['below'](str(root), str(parent)), str(parent)
-    full = parent / name[2:]
-    assert engine['below'](str(child), str(full)) or full == child
-    calls.append(str(full))
-    os.rename(name, archive / ('entry-' + str(len(calls))))
-os.unlink = record_delete
-os.rmdir = record_delete
-_, identity = engine['root_guard'](str(root))
-request = {'root':str(root), 'rootIdentity':identity, 'operationId':'fixture-subtree', 'action':'delete',
-           'target':{**target, **value, 'destination':target['destination']}}
-(child / '.git' / 'new-after-preview').write_text('unapproved change', encoding='utf-8')
-denied(lambda: engine['main'](request), 'PREVIEW_CHANGED')
-assert not calls
-request['target'] = {**target, **engine['inspect'](str(root), target), 'destination':target['destination']}
-assert engine['main'](request)['ok']
-assert not child.exists()
-assert any('/.git/' in name.replace('\\','/') for name in calls)
-assert main_git.read_text(encoding='utf-8') == 'main repository must survive'
-original_chdir(str(root))
-print(json.dumps({'ok':True,'nestedGitRemoved':True,'mainGitProtected':True,'guardsRetained':True,'mockedDeletion':True}))
+def fast(rel, expected_type, operation="fixture-subtree"):
+    insp = engine["batch_inspect"](root, identity, {"authorizationMode": "confirmed_paths",
+                                                    "operationId": operation,
+                                                    "targets": [{"relativePath": rel, "type": expected_type}]})
+    row = insp["targets"][0]
+    entry = {key: row[key] for key in ("relativePath", "type", "absolutePath", "device", "inode") if key in row}
+    if row.get("isolationName"):
+        entry["isolationName"] = row["isolationName"]
+    return entry
+
+
+def execute(entries, operation="fixture-subtree"):
+    return engine["delete_fast"](root, identity, {"rootIdentity": identity, "operationId": operation,
+                                                  "authorizationMode": "confirmed_paths", "entries": entries})
+
+
+guards = True
+# Directly nominating the main repository or unsafe paths stays refused.
+guards &= refusal(lambda: fast(".git", "directory"), "PROTECTED_PATH").code == "PROTECTED_PATH"
+unsafe = {"relativePath": "../outside", "type": "directory", "device": "7", "inode": "1"}
+guards &= refusal(lambda: execute([unsafe]), "UNSAFE_PATH").code == "UNSAFE_PATH"
+# The legacy confirmed delete route is retired, never a silent fallback.
+guards &= refusal(lambda: engine["main"]({"root": ROOT, "action": "delete",
+                                          "target": {"relativePath": "repos/cpsc", "type": "directory",
+                                                     "authorizationMode": "confirmed_paths"}}),
+                  "UPDATE_REQUIRED").code == "UPDATE_REQUIRED"
+
+# The confirmed whole subtree (nested .git included) leaves through the fast
+# chain; the main repository outside the entry keeps its bytes.
+entry = fast("repos/cpsc", "directory")
+assert execute([entry])["ok"]
+nested_git_removed = not any(path.startswith(ROOT + "/repos/cpsc") for path in tree.entries)
+main_git_protected = tree.entries[ROOT + "/.git/config"][2] == b"main repository must survive"
+
+# A clean_dir descendant inside another confirmed tree is never consumed:
+# isolation may have started, but the protected child and its bytes survive
+# and the mutation fact honestly reports the partial isolation.
+entry = fast("jobs/run", "directory", operation="fixture-protected")
+removed_before = len(tree.removed)
+refusal(lambda: execute([entry], operation="fixture-protected"), "PROTECTED_DESCENDANT")
+guards &= engine["FAST_MUTATION_FACTS"]["started"] is True
+survivors = [path for path in tree.entries
+             if path.startswith(ROOT + "/jobs/") and path.endswith("/clean_dir/keep.txt")]
+guards &= len(survivors) == 1 and tree.entries[survivors[0]][2] == b"protected archive child"
+guards &= ROOT + "/jobs/run" not in tree.entries  # isolated but NOT deleted
+guards &= len(tree.removed) == removed_before  # walk refused before consuming anything
+
+print(json.dumps({"ok": True, "nestedGitRemoved": bool(nested_git_removed),
+                  "mainGitProtected": bool(main_git_protected), "guardsRetained": bool(guards),
+                  "mockedDeletion": True}))

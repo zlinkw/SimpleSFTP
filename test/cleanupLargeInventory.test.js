@@ -19,7 +19,7 @@ test('large frozen inventory stays out of post-start checks, including a lost st
   }
   assert.fail(request.action);
  }});
- const preview=await api.preview({node:{kind:'remote',root:'/project'},action:'delete',authorizationMode:'confirmed_paths',targets:[{relativePath:'output/job',destination:'clean_dir/output/job',type:'directory'}]});
+ const preview=await api.preview({node:{kind:'remote',root:'/project'},action:'delete',observationMode:'managed_tmux',targets:[{relativePath:'output/job',destination:'clean_dir/output/job',type:'directory'}]});
  const request={token:preview.token,digest:preview.digest,index:0};
  for(const phase of [1,2]){await assert.rejects(api.execute(request),/CONFIRM_REQUIRED/);await api.confirm({...request,phase,confirm:true,exactTargets:['/project/output/job']});}
  assert.equal((await api.execute(request)).state,'waiting');assert.equal((await api.check(request)).state,'pending');
@@ -30,8 +30,8 @@ test('large frozen inventory stays out of post-start checks, including a lost st
 });
 
 test('real Python stdin and frozen-target observations support multi-MiB inventories with bounded input and no deletion',async()=>{
- const api=new CleanupFileApi({transport:async()=>({ok:true,rootIdentity:{path:'/project'},target:{absolutePath:'/project/目录/📁',fingerprint:'fp',identityProbe:{'10':'十','2':'二','\ue000':'字','😀':'图',numbers:[0,-0,1,0.000001,1e-7,1e21,0.123456789]}}})});
- const preview=await api.preview({node:{kind:'remote',root:'/project'},action:'delete',authorizationMode:'confirmed_paths',targets:[{relativePath:'目录/📁',destination:'clean_dir/目录/📁',type:'directory'}]});
+ const api=new CleanupFileApi({activity:async()=>{},transport:async()=>({ok:true,rootIdentity:{path:'/project'},target:{absolutePath:'/project/目录/📁',fingerprint:'fp',identityProbe:{'10':'十','2':'二','\ue000':'字','😀':'图',numbers:[0,-0,1,0.000001,1e-7,1e21,0.123456789]}}})});
+ const preview=await api.preview({node:{kind:'remote',root:'/project'},action:'delete',observationMode:'managed_tmux',targets:[{relativePath:'目录/📁',destination:'clean_dir/目录/📁',type:'directory'}]});
  const fixture=path.resolve(__dirname,'cleanupLargeInventory.fixture.py'),engine=path.resolve(__dirname,'../cleanup-files.py');
  const child=spawnSync(process.platform==='win32'?'python':'python3',['-B','-X','utf8',fixture,engine],{input:JSON.stringify({target:preview.targets[0],digest:preview.targetDigests[0]}),encoding:'utf8',timeout:10000,windowsHide:true});
  assert.equal(child.status,0,child.stderr||child.error?.message||child.stdout);

@@ -432,7 +432,7 @@ result = engine["batch_inspect"](root, identity, {"authorizationMode": "confirme
                                                               {"relativePath": "out/sib.log", "type": "file"},
                                                               {"relativePath": "out/none.log", "type": "file"}]})
 rows = {row["relativePath"]: row for row in result["targets"]}
-check("batch-inspect-entry-only", result["metrics"]["metadataReads"] == 3 and len(result["targets"]) == 3
+check("batch-inspect-entry-only", result["metrics"]["entryReads"] == 3 and len(result["targets"]) == 3
       and rows["out/run1"]["isolationName"] == engine["isolation_name"](OP, "out/run1", "run1")
       and "inventory" not in rows["out/run1"] and rows["out/run1"]["device"] == tree.identity(ROOT + "/out/run1")["device"]
       and rows["out/sib.log"]["type"] == "file" and rows["out/none.log"].get("missing") is True)
@@ -451,3 +451,45 @@ result = engine["batch_verify"](root, identity, {"authorizationMode": "confirmed
                                                              {"relativePath": "logs", "type": "directory"}]})
 status = {row["relativePath"]: row["status"] for row in result["targets"]}
 check("batch-verify-statuses", status == {"out/sib.log": "gone", "out/run1": "replaced", "logs": "present"})
+
+# 15. capability probe: an empty target list is a read-only ABI handshake,
+# so a paired integration can detect the fast chain without guessing versions.
+tree, engine = scenario_engine()
+root, identity = engine["root_guard"](ROOT)
+probe = engine["batch_inspect"](root, identity, {"authorizationMode": "confirmed_paths", "operationId": OP, "targets": []})
+check("capability-probe", probe["capabilities"] == {"confirmedPathFastDelete": 1, "batchEntryInspect": 1}
+      and probe["targets"] == [] and probe["metrics"]["entryReads"] == 0 and tree.removed == [])
+
+# 16. mutation facts: a pre-mutation refusal proves started=False, the batch
+# resets the fact, a completed mutation sets it.
+def seed_pair(tree):
+    tree.add_file(ROOT + "/out/p1.log", b"1")
+    tree.add_file(ROOT + "/out/p2.log", b"2")
+
+tree, engine = scenario_engine(seed_pair)
+refusal(engine, lambda: call_delete_fast(engine, tree, [entry_for(tree, "out/p1.log", "file", inode="999999")]),
+        "ENTRY_IDENTITY_CHANGED")
+refused_zero = engine["FAST_MUTATION_FACTS"]["started"] is False and tree.removed == []
+call_delete_fast(engine, tree, [entry_for(tree, "out/p1.log", "file")])
+mutated_true = engine["FAST_MUTATION_FACTS"]["started"] is True
+late = entry_for(tree, "out/p2.log", "file")
+late["device"] = "999"
+refusal(engine, lambda: call_delete_fast(engine, tree, [late]), "ENTRY_IDENTITY_CHANGED")
+check("mutation-facts-reset-and-false", refused_zero and mutated_true
+      and engine["FAST_MUTATION_FACTS"]["started"] is False and ROOT + "/out/p2.log" in tree.entries)
+
+# 17. partial mutation: the file-group recheck catches a swapped leaf AFTER an
+# earlier unlink of the same batch; the fact must report the partial change so
+# the API never reruns the batch blindly.
+tree, engine = scenario_engine(seed_pair)
+tree.swap.add(ROOT + "/out/p2.log")
+rows = [entry_for(tree, rel, "file") for rel in ("out/p1.log", "out/p2.log")]
+refusal(engine, lambda: call_delete_fast(engine, tree, rows), "ENTRY_IDENTITY_CHANGED")
+check("mutation-facts-partial", engine["FAST_MUTATION_FACTS"]["started"] is True
+      and ROOT + "/out/p1.log" not in tree.entries and ROOT + "/out/p2.log" in tree.entries)
+
+# 18. isolate-then-refuse: the rename itself is a mutation; a walk refusal
+# afterwards must still report started=True (the tree stands under its iso name).
+tree, engine = scenario_engine(seed_deep)
+refusal(engine, lambda: call_delete_fast(engine, tree, [entry_for(tree, "out/deep", "directory")]), "TREE_TOO_DEEP")
+check("mutation-facts-after-rename", engine["FAST_MUTATION_FACTS"]["started"] is True and len(tree.renamed) == 1)

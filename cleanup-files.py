@@ -1072,6 +1072,13 @@ def register_isolation(root, destination_rel, source_rel, operation_id, value, m
 FAST_BATCH_LIMIT = 5000
 FAST_TREE_MAX_DEPTH = 256
 ISOLATION_SUFFIX = "__iso_"
+FAST_CAPABILITIES = {"confirmedPathFastDelete": 1, "batchEntryInspect": 1}
+# Explicit batch-phase fact: the fast chain sets "started" immediately before
+# the first mutation syscall, so a failed delete-fast batch can prove whether
+# partial changes were made. Retry safety reads this fact - never the error
+# code alone, because TYPE_CHANGED or ENTRY_IDENTITY_CHANGED can also raise
+# mid-walk or during the file-group recheck after earlier unlinks.
+FAST_MUTATION_FACTS = {"started": False}
 
 
 def isolation_name(operation_id, rel, leaf):
@@ -1113,18 +1120,25 @@ def fast_entry_check(root, item, operation_id):
 
 
 def batch_inspect(root, identity, request):
-    """One read-only metadata transfer for the whole confirmed selection."""
+    """One read-only metadata transfer for the whole confirmed selection.
+
+    An empty target list is a pure capability probe: it returns the ABI
+    versions without touching any entry, so a paired integration can detect
+    the fast chain instead of guessing from released version numbers.
+    """
     if request.get("authorizationMode") != "confirmed_paths":
         deny("INVALID_AUTHORIZATION_MODE")
     targets = request.get("targets")
-    if not isinstance(targets, list) or not 1 <= len(targets) <= FAST_BATCH_LIMIT:
+    if not isinstance(targets, list) or len(targets) > FAST_BATCH_LIMIT:
         deny("FAST_BATCH_INVALID")
     operation_id = str(request.get("operationId") or "")
     mount_reads = _MOUNT_CACHE["reads"]
     started = time.monotonic()
     rows = [fast_entry_check(root, item, operation_id) for item in targets]
-    return {"ok": True, "rootIdentity": identity, "targets": rows,
-            "metrics": {"selected": len(rows), "metadataReads": len(rows),
+    return {"ok": True, "rootIdentity": identity, "capabilities": dict(FAST_CAPABILITIES), "targets": rows,
+            # entryReads counts one entry-level metadata read per target; it
+            # is deliberately not presented as a raw syscall total.
+            "metrics": {"selected": len(rows), "entryReads": len(rows),
                         "mountReads": _MOUNT_CACHE["reads"] - mount_reads,
                         "entryCheckMs": round((time.monotonic() - started) * 1000, 1)}}
 
@@ -1191,6 +1205,7 @@ def fast_tree_remove(root, entry_abs, allow_clean, stats):
                     deny("MOUNT_ESCAPE", leaf_full)
                 stats["entries"] += 1
                 if stat.S_ISREG(leaf_info.st_mode):
+                    FAST_MUTATION_FACTS["started"] = True
                     os.unlink("./" + leaf)
                     stats["files"] += 1
                     progress_heartbeat()
@@ -1200,6 +1215,7 @@ def fast_tree_remove(root, entry_abs, allow_clean, stats):
                     deny("UNCERTAIN_TYPE", leaf_full)
         finally:
             os.chdir("..")
+        FAST_MUTATION_FACTS["started"] = True
         os.rmdir("./" + rel_name)
         stats["rmdirs"] += 1
 
@@ -1218,6 +1234,7 @@ def delete_fast(root, identity, request):
     if not isinstance(entries, list) or not 1 <= len(entries) <= FAST_BATCH_LIMIT \
             or not isinstance(operation_id, str) or not operation_id:
         deny("FAST_BATCH_INVALID")
+    FAST_MUTATION_FACTS["started"] = False
     mount_reads = _MOUNT_CACHE["reads"]
     stage = {"check": 0.0, "mutate": 0.0, "confirm": 0.0}
     started = time.monotonic()
@@ -1267,6 +1284,7 @@ def delete_fast(root, identity, request):
         iso_relative = row["relativePath"][:len(row["relativePath"]) - len(leaf)] + iso
         if os.path.lexists("./" + iso):
             deny("ISOLATION_NAME_TAKEN", os.path.join(os.path.dirname(full), iso))
+        FAST_MUTATION_FACTS["started"] = True
         no_replace(child, "./" + iso)
         stats["renames"] += 1
         after = os.lstat("./" + iso)
@@ -1290,6 +1308,7 @@ def delete_fast(root, identity, request):
                 deny("TYPE_CHANGED", row["absolutePath"])
             if str(info.st_ino) != row["inode"] or str(info.st_dev) != row["device"]:
                 deny("ENTRY_IDENTITY_CHANGED", row["absolutePath"], "所选文件在确认后被替换，请重新确认")
+            FAST_MUTATION_FACTS["started"] = True
             os.unlink("./" + leaf)
             stats["files"] += 1
             progress_heartbeat()
@@ -2144,6 +2163,12 @@ if __name__ == "__main__":
             stream.close()
         if lock is not None:
             lock.close()
+    if request.get("action") == "delete-fast" and not result.get("ok"):
+        # Explicit transport fact for every failure envelope of a fast batch:
+        # whether any mutation syscall of this process had already begun. It is
+        # set immediately before each rename/unlink/rmdir, so false proves a
+        # zero-mutation refusal while true marks a partial or unknown state.
+        result["error"].setdefault("mutationStarted", FAST_MUTATION_FACTS["started"])
     sys.stdout.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     if request.get("managedInner") and not result.get("ok"):
         sys.exit(1)

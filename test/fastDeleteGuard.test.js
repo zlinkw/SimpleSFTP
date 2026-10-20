@@ -34,9 +34,15 @@ test('v1.9 fast chain isolates directories by non-overwriting rename and only re
   const result = spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-B', '-X', 'utf8', fixture, guard],
     { encoding: 'utf8', timeout: 10000, windowsHide: true });
   assert.equal(result.status, 0, result.stderr || result.stdout);
+  // Retry safety is fact-based: the engine records started at every mutation
+  // syscall site and every delete-fast failure envelope carries the fact.
+  assert.match(source, /FAST_MUTATION_FACTS\["started"\] = True/, 'mutation syscall sites must record the fact');
+  assert.match(source, /result\["error"\]\.setdefault\("mutationStarted", FAST_MUTATION_FACTS\["started"\]\)/,
+    'delete-fast failure envelopes must carry the mutationStarted fact');
   for (const name of ['dir-isolate', 'original-recreated', 'identity-refused-zero-mutation', 'isolation-name-taken',
     'link-in-tree-refused', 'clean-dir-guard-refused', 'dev-crossing-refused', 'files-grouped-two-parents',
     'files-swap-zero-mutation', 'archived-registered-no-rename', 'archived-unregistered-refused',
-    'deep-tree-refused', 'batch-inspect-entry-only', 'batch-verify-statuses'])
+    'deep-tree-refused', 'batch-inspect-entry-only', 'batch-verify-statuses',
+    'capability-probe', 'mutation-facts-reset-and-false', 'mutation-facts-partial', 'mutation-facts-after-rename'])
     assert.match(result.stdout, new RegExp('^ok ' + name + '$', 'm'), 'fake-OS scenario ' + name + ' missing');
 });

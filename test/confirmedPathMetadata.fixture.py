@@ -1,34 +1,65 @@
-import builtins, json, os, pathlib, runpy, sys, tempfile, time
-module = runpy.run_path(sys.argv[1])
-root = pathlib.Path(tempfile.mkdtemp(prefix='confirmed-metadata-'))
-job = root / 'output' / 'job'
-job.mkdir(parents=True)
-weight = job / 'weights.pth'
-with weight.open('wb') as stream:
-    stream.truncate(64 * 1024 * 1024 * 1024)  # sparse fixture; must never be read or hashed
-target = {'relativePath':'output/job','destination':'clean_dir/output/job','type':'directory','authorizationMode':'confirmed_paths'}
-original = builtins.open
-def metadata_only(file, mode='r', *args, **kwargs):
-    if 'r' in mode and 'b' in mode and str(file).startswith(str(job)):
-        raise AssertionError('confirmed-path deletion must not read weight contents')
-    return original(file, mode, *args, **kwargs)
-builtins.open = metadata_only
-value = module['inspect'](str(root), target)
-assert value['fingerprintMode'] == 'metadata'
-assert all('sha256' not in row for row in value['inventory'])
-_, identity = module['root_guard'](str(root))
-request = {'root':str(root),'rootIdentity':identity,'operationId':'fixture','action':'delete','target':{**target,**value,'destination':target['destination']}}
-with original(weight,'r+b') as stream:
-    stream.write(b'changed')
-stamp = os.stat(weight)
-os.utime(weight, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1_000_000_000))
-try:
-    module['main'](request)
-    raise AssertionError('changed target was accepted')
-except module['GuardError'] as error:
-    assert error.code == 'PREVIEW_CHANGED', error.code
-value = module['inspect'](str(root), target)
-request['target'] = {**target,**value,'destination':target['destination']}
-assert module['main'](request)['ok']
-assert not job.exists()
-print(json.dumps({'ok':True,'weightBytesRead':0,'metadataChangeRejected':True}))
+"""v1.9 FakeOS migration of the metadata-only weight contract.
+
+The confirmed fast chain reads entry metadata only: the fake open raises if
+the engine ever opens file contents in binary mode, so weightBytesRead stays
+provably zero even for a declared 64-GiB weight file. An entry replaced
+between inspection and deletion (identity change) is refused with the
+zero-mutation fact; re-inspecting the current identity then deletes cleanly.
+Real-fs weight e2e remains a real-fixture phase item (no real deletion
+approval exists in this round).
+"""
+import json, os, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fastdelete_harness as H
+
+ROOT = "/srv/proj"
+engine_path = sys.argv[1]
+tree = H.Tree(ROOT)
+tree.seed_base()
+tree.add_dir(ROOT + "/output")
+tree.add_dir(ROOT + "/output/job")
+tree.add_file(ROOT + "/output/job/weights.pth", b"header")
+tree.entries[ROOT + "/output/job/weights.pth"][1].st_size = 64 * 1024 * 1024 * 1024  # sparse giant
+engine = H.build_engine(tree, engine_path, {"refuse_reads": True})
+refusal = H.make_refusal(engine)
+root, identity = engine["root_guard"](ROOT)
+
+
+def inspect_row(rel, expected_type):
+    result = engine["batch_inspect"](root, identity, {"authorizationMode": "confirmed_paths",
+                                                      "operationId": "fixture-metadata",
+                                                      "targets": [{"relativePath": rel, "type": expected_type}]})
+    assert result["ok"] and result["metrics"]["entryReads"] == 1
+    row = result["targets"][0]
+    assert not row.get("missing") and "sha256" not in row and "contentFingerprint" not in row, \
+        "fast-chain rows must stay metadata-only with no content digest"
+    return row
+
+
+def entry_of(row):
+    value = {key: row[key] for key in ("relativePath", "type", "absolutePath", "device", "inode") if key in row}
+    if row.get("isolationName"):
+        value["isolationName"] = row["isolationName"]
+    return value
+
+
+inspect_row("output/job/weights.pth", "file")
+
+# Entry replaced after inspection: identity refusal with zero mutation.
+row = inspect_row("output/job/weights.pth", "file")
+del tree.entries[ROOT + "/output/job/weights.pth"]
+tree.add_file(ROOT + "/output/job/weights.pth", b"weights v2")
+refusal(lambda: engine["delete_fast"](root, identity, {"rootIdentity": identity, "operationId": "fixture-metadata",
+                                                       "authorizationMode": "confirmed_paths",
+                                                       "entries": [entry_of(row)]}), "ENTRY_IDENTITY_CHANGED")
+metadata_change_rejected = engine["FAST_MUTATION_FACTS"]["started"] is False and tree.removed == []
+
+# Current identity confirms clean: directory deletion streams the giant file
+# away through ./<leaf> unlinks without a single content read.
+row = inspect_row("output/job", "directory")
+receipt = engine["delete_fast"](root, identity, {"rootIdentity": identity, "operationId": "fixture-metadata",
+                                                 "authorizationMode": "confirmed_paths", "entries": [entry_of(row)]})
+assert receipt["ok"] and ROOT + "/output/job" not in tree.entries
+
+print(json.dumps({"ok": True, "weightBytesRead": len(tree.reads), "metadataChangeRejected": metadata_change_rejected}))

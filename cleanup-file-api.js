@@ -13,8 +13,10 @@ const canonical = value => typeof value === "number" ? "n" + (() => {
     .map(key => JSON.stringify(key) + ":" + canonical(value[key])).join(",") + "}" : JSON.stringify(value);
 const targetHash = value => crypto.createHash("sha256").update(canonical(value)).digest("hex");
 const copy = value => JSON.parse(JSON.stringify(value));
-// Refusals the engine can only raise in its pre-mutation entry-check pass;
-// they keep a fast batch retryable instead of poisoning it as uncertain.
+// Codes that MAY accompany a zero-mutation refusal. The code alone is never
+// sufficient: retry additionally requires the engine's explicit
+// mutationStarted=false fact, because the same codes can also surface after
+// earlier unlinks (mid-walk or file-group recheck) of a partially mutated batch.
 const FAST_ZERO_MUTATION_CODES = new Set(["ENTRY_IDENTITY_CHANGED", "MISSING_TARGET", "TYPE_CHANGED", "UNCERTAIN_TYPE",
   "UNSAFE_PATH", "UNSAFE_PARENT", "FAST_BATCH_INVALID", "INVALID_AUTHORIZATION_MODE", "ROOT_IDENTITY_CHANGED",
   "NOT_REGISTERED_ISOLATION", "PROTECTED_PATH", "UNSAFE_ARCHIVE_BATCH"]);
@@ -187,6 +189,9 @@ function remoteRuntimeCommand(programPath, shellQuote) {
 }
 function fail(code, message = code, details = {}) { const error = new Error(message); error.code = code; error.apiCode = code === "CONFIRM_REQUIRED" ? 2001 : 2010; error.apiData = { code };
   for (const key of ["blockingPath", "reason"]) if (typeof details[key] === "string" && details[key]) error.apiData[key] = details[key].slice(0, 4096);
+  // The engine's explicit batch-phase fact travels with the error: a retry is
+  // only admissible when it proves the refused batch mutated nothing.
+  if (typeof details.mutationStarted === "boolean") error.mutationStarted = details.mutationStarted;
   throw error; }
 
 /** A path capability authorizes one frozen batch, never a later or remembered path. */
@@ -219,7 +224,10 @@ class CleanupFileApi {
     // Confirmed paths only ever authorize permanent deletion; a move/restore
     if (pathOnly && action !== "delete") fail("INVALID_ACTION");
     const observationMode = params.observationMode === "managed_tmux" || pathOnly ? node?.kind === "local" ? "filesystem" : "tmux" : undefined;
-    if (!node?.root || !["move", "delete", "restore", "isolate"].includes(action) || !Array.isArray(targets) || !targets.length || targets.length > 500) fail("INVALID_REQUEST");
+    // Public batch entry: pathOnly (confirmed permanent deletion) rides the
+    // batched fast chain and accepts the full engine FAST_BATCH_LIMIT of 5000
+    // targets; move/restore/isolate keep their own per-target 500 limit.
+    if (!node?.root || !["move", "delete", "restore", "isolate"].includes(action) || !Array.isArray(targets) || !targets.length || targets.length > (pathOnly ? 5000 : 500)) fail("INVALID_REQUEST");
     if (pathOnly) return await this.previewFast(node, targets, tmuxSessionPrefix);
     if (!pathOnly) await this.activity(node);
     const rows = []; let identity;
@@ -286,7 +294,13 @@ class CleanupFileApi {
     for (const result of inspected) {
       if (identity && hash(identity) !== hash(result.rootIdentity)) fail("ROOT_IDENTITY_CHANGED");
       identity = result.rootIdentity;
-      for (const entry of result.targets) rows.push({ ...entry, ...(entry.archived ? { destination: entry.relativePath } : {}) });
+      for (const entry of result.targets) {
+        // The confirmation page must show the absolute isolation target before
+        // execution: original -> isolation, both fully resolved.
+        const leaf = entry.relativePath.slice(entry.relativePath.lastIndexOf("/") + 1);
+        rows.push({ ...entry, ...(entry.archived ? { destination: entry.relativePath } : {}),
+          ...(entry.isolationName ? { isolationAbsolutePath: entry.absolutePath.slice(0, entry.absolutePath.length - leaf.length) + entry.isolationName } : {}) });
+      }
     }
     const row = { token: crypto.randomBytes(24).toString("hex"), operationId, node: copy(node), rootIdentity: identity,
       action: "delete", authorizationMode: "confirmed_paths", targets: rows,
@@ -294,7 +308,7 @@ class CleanupFileApi {
         directoryTreeIsolateDelete: 1, isolationRenameNoReplace: 1, registeredIsolationDeletion: 1, subtreeSingleWriter: 1,
         pinnedRuntimeProgram: 1, fastDeleteBatchLimit: 5000, contentHash: 0, descendantFingerprint: 0, handleScan: "entry_only" },
       metrics: { inspectRpcCalls: inspected.length,
-        metadataReads: inspected.reduce((sum, result) => sum + (result.metrics?.metadataReads || 0), 0),
+        entryReads: inspected.reduce((sum, result) => sum + (result.metrics?.entryReads || 0), 0),
         mountReads: inspected.reduce((sum, result) => sum + (result.metrics?.mountReads || 0), 0),
         entryCheckMs: inspected.reduce((sum, result) => sum + (result.metrics?.entryCheckMs || 0), 0) },
       expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(entry => entry.missing ? "absent" : "pending") };
@@ -333,14 +347,43 @@ class CleanupFileApi {
     if (live.length) {
       const entries = live.map(i => ({ relativePath: row.targets[i].relativePath, type: row.targets[i].type,
         device: row.targets[i].device, inode: row.targets[i].inode }));
+      // Mode-A directories are isolate-then-delete: the deterministic entry-
+      // bound isolation name rides in the SAME active query, bound to the
+      // frozen original dev/inode. Its disappearance - not the original path,
+      // which a fresh result may legitimately reuse - marks completion.
+      const isoSlot = new Map();
+      live.forEach((i, position) => {
+        const target = row.targets[i];
+        if (target.type === "directory" && !target.archived && target.isolationName) {
+          const parent = target.relativePath.slice(0, target.relativePath.lastIndexOf("/") + 1);
+          isoSlot.set(i, entries.length);
+          entries.push({ relativePath: parent + target.isolationName, type: "directory",
+            device: target.device, inode: target.inode });
+        }
+      });
       const result = await this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
         action: "batch-verify", authorizationMode: "confirmed_paths", entries });
       live.forEach((i, position) => {
+        const target = row.targets[i];
         const entry = (result.targets || [])[position] || { status: "present" };
-        const archived = Boolean(row.targets[i].archived);
-        const state = entry.status === "gone" ? "completed"
-          : entry.status === "replaced" ? (archived ? "unknown" : "completed") : "pending";
-        proofs[i] = { ok: true, state, status: entry.status, target: entry };
+        const archived = Boolean(target.archived);
+        let state;
+        if (isoSlot.has(i)) {
+          const iso = (result.targets || [])[isoSlot.get(i)] || { status: "present" };
+          // The non-overwriting rename is the first mutation of the chain:
+          // while the entry-bound isolation tree still stands the deletion is
+          // unfinished regardless of what the original path shows. A same-name
+          // object recreated there is new data, never counted and never
+          // demanded for deletion.
+          state = iso.status === "present" ? "unknown"
+            : entry.status === "gone" || entry.status === "replaced" ? "completed"
+              : row.batchExecuting || row.states[i] === "executing" || row.states[i] === "completed" ? "unknown" : "pending";
+        } else {
+          state = entry.status === "gone" ? "completed"
+            : entry.status === "replaced" ? (archived ? "unknown" : "completed") : "pending";
+        }
+        proofs[i] = { ok: true, state, status: entry.status, target: entry,
+          ...(isoSlot.has(i) ? { isolationStatus: ((result.targets || [])[isoSlot.get(i)] || {}).status } : {}) };
       });
     }
     return single ? proofs[list[0]] : proofs;
@@ -387,10 +430,13 @@ class CleanupFileApi {
             result = await this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity, action: "delete-fast",
               authorizationMode: "confirmed_paths", operationId: row.operationId, entries });
           } catch (error) {
-            // Refusals proven to come from the pre-mutation entry check leave
-            // the batch retryable; anything else keeps the uncertain state so a
-            // later active query, not a blind rerun, decides.
-            if (FAST_ZERO_MUTATION_CODES.has(error.code)) { row.batchExecuting = false; for (const { i } of pending) row.states[i] = "pending"; await this.save(row); }
+            // Only the engine's explicit zero-mutation fact makes a refusal
+            // retryable. An error code alone proves nothing: TYPE_CHANGED or
+            // ENTRY_IDENTITY_CHANGED can also raise mid-walk or during the
+            // file-group recheck AFTER earlier unlinks (partial mutation), and
+            // a lost/uncertain receipt must be resolved by active verify, not
+            // by a blind second mutation RPC.
+            if (error.mutationStarted === false && FAST_ZERO_MUTATION_CODES.has(error.code)) { row.batchExecuting = false; for (const { i } of pending) row.states[i] = "pending"; await this.save(row); }
             throw error;
           }
           for (const { i } of pending) row.states[i] = "completed";

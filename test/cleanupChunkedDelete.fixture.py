@@ -1,191 +1,164 @@
-"""v1.5 chunked frozen-manifest contract: a >50000-entry registered archive is
-deleted only through bounded frozen chunks. Fresh runs stream two bounded
-passes (O(1) state) that re-derive the frozen digest, then materialize every
-hash-bound chunk and the applied watermark before the first unlink; an
-interrupted run resumes from the watermark; unconfirmed new files are refused
-and never absorbed; completion keeps only the minimal anti-replay identity; a
-rebuilt same-name directory is new data that replay never touches. Fresh
-disposable temp root only."""
-import hashlib, json, os, pathlib, re, runpy, subprocess, sys, tempfile
+"""v1.9 FakeOS migration of the interrupted-archive contract.
 
-engine_path = pathlib.Path(sys.argv[1]).resolve()
-stage = sys.argv[2]
-state_path = pathlib.Path(sys.argv[3])
-BATCH = "job-" + "c" * 48
-SRC_REL = "outputs/run"
-OP_ID = "chunked-delete-op"
+The old frozen-chunk journal is retired: the fast chain handles archives of
+any size as one confirmed batch. What the five-stage protocol still proves,
+with zero real deletion (no real deletion approval exists in this round):
+an interrupted isolate-then-delete reports honest mutation facts; the stale
+frozen selection is refused against reality (MISSING_TARGET, zero further
+mutation) instead of blindly replaying; completion happens only through a
+fresh confirmation of the actual isolation tree; a rebuilt same-name
+directory is new data that replay never absorbs or touches. Tree state
+persists through the state file between stages; every stage runs a fresh
+engine under the shared fake OS. The tree is 2000 entries because the
+contract under test is interruption/resume honesty, not volume: the v1.9
+fast chain is size-agnostic.
+"""
+import json, os, sys
 
-def engine_run(root, request, timeout=9):
-    proc = subprocess.run([sys.executable, "-B", "-X", "utf8", str(engine_path)],
-                          input=json.dumps(request), capture_output=True, text=True, timeout=timeout)
-    assert proc.returncode == 0, (proc.stdout, proc.stderr)
-    return json.loads(proc.stdout)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fastdelete_harness as H
+
+ROOT = "/srv/proj"
+REL = "work_dirs/run"
+OP = "cleanup-interrupted-op"
+FILE_COUNT = 2000
+ABORT_AFTER_UNLINKS = 800
+
+engine_path, stage, state_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+
+def new_tree():
+    tree = H.Tree(ROOT)
+    tree.seed_base()
+    tree.add_dir(ROOT + "/work_dirs")
+    tree.add_dir(ROOT + "/" + REL)
+    tree.add_dir(ROOT + "/" + REL + "/sub")
+    for index in range(FILE_COUNT):
+        tree.add_file(ROOT + "/%s/f%05d.log" % (REL, index), b"x")
+    tree.add_file(ROOT + "/%s/sub/deep.bin" % REL, b"deep")
+    return tree
+
+
+def save(state, tree):
+    payload = dict(state)
+    payload["tree"] = tree.to_dict()
+    with open(state_path, "w", encoding="utf-8") as stream:
+        stream.write(json.dumps(payload))
+
+
+def load():
+    with open(state_path, "r", encoding="utf-8") as stream:
+        payload = json.loads(stream.read())
+    tree_payload = payload.pop("tree")
+    return payload, H.Tree.from_dict(tree_payload)
+
+
+def engine_for(tree, options=None):
+    return H.build_engine(tree, engine_path, options)
+
+
+def inspect_row(engine, root, identity, rel):
+    result = engine["batch_inspect"](root, identity, {"authorizationMode": "confirmed_paths",
+                                                      "operationId": OP, "targets": [{"relativePath": rel, "type": "directory"}]})
+    assert result["ok"] and len(result["targets"]) == 1 and not result["targets"][0].get("missing")
+    return result["targets"][0]
+
+
+def entry_of(row):
+    value = {key: row[key] for key in ("relativePath", "type", "absolutePath", "device", "inode") if key in row}
+    if row.get("isolationName"):
+        value["isolationName"] = row["isolationName"]
+    return value
+
 
 if stage == "build":
-    root = pathlib.Path(tempfile.mkdtemp(prefix="se-chunked-"))
-    src = root / SRC_REL
-    src.mkdir(parents=True)
-    # Mixed shape, 50001 frozen rows: 2000 small directories (8 files each,
-    # names sorting after the flat files so descending post-order clears them
-    # first) plus 32000 flat files, crossing the 50000 threshold by 1.
-    for index in range(2000):
-        deep = src / ("zz%04d" % index)
-        deep.mkdir()
-        for leaf in range(8):
-            (deep / ("g%d" % leaf)).write_bytes(b"x")
-    for index in range(32000):
-        (src / ("yy%05d" % index)).write_bytes(b"y")
-    dest = "clean_dir/%s/%s" % (BATCH, SRC_REL)
-    insp = engine_run(str(root), {"root": str(root), "action": "inspect", "isolate": True,
-                                  "operationId": OP_ID,
-                                  "target": {"relativePath": SRC_REL, "type": "directory",
-                                             "archiveBatch": BATCH, "destination": dest}})
-    assert insp.get("ok"), insp
-    isolated = engine_run(str(root), {"root": str(root), "rootIdentity": insp["rootIdentity"],
-                                      "operationId": OP_ID, "action": "isolate",
-                                      "target": {"relativePath": SRC_REL, "type": "directory",
-                                                 "archiveBatch": BATCH, "destination": dest}})
-    assert isolated.get("ok"), isolated
-    assert not (root / SRC_REL).exists() and (root / dest).is_dir()
-    state_path.write_text(json.dumps({"root": str(root), "dest": dest}), encoding="utf-8")
+    tree = new_tree()
+    engine = engine_for(tree)
+    root, identity = engine["root_guard"](ROOT)
+    row = inspect_row(engine, root, identity, REL)
+    save({"entries": [entry_of(row)], "isoRel": "work_dirs/" + row["isolationName"]}, tree)
     print("ok")
     sys.exit(0)
 
-state = json.loads(state_path.read_text(encoding="utf-8"))
-root_text = state["root"]
-root = pathlib.Path(root_text)
-dest = state["dest"]
+state, tree = load()
+engine = engine_for(tree, {"unlink_limit": ABORT_AFTER_UNLINKS} if stage == "abort" else None)
+refusal = H.make_refusal(engine)
+root, identity = engine["root_guard"](ROOT)
+frozen = state["entries"]
+iso_rel = state["isoRel"]
 
-def target_for(extra=None):
-    target = {"relativePath": dest, "type": "directory",
-              "authorizationMode": "confirmed_paths", "destination": dest}
-    return {**target, **(extra or {})}
 
-def preview():
-    value = engine_run(root_text, {"root": root_text, "action": "inspect", "target": target_for()})
-    assert value.get("ok"), value
-    return value
+def delete(entries):
+    return engine["delete_fast"](root, identity, {"rootIdentity": identity, "operationId": OP,
+                                                  "authorizationMode": "confirmed_paths", "entries": entries})
 
-def frozen_delete_request():
-    return {"root": root_text, "rootIdentity": state["rootIdentity"], "operationId": OP_ID,
-            "action": "delete",
-            "target": target_for({"chunked": True, "count": state["count"],
-                                  "fingerprint": state["fingerprint"]})}
 
-def summary_now():
-    frozen = root / "clean_dir/.operations/frozen" / state["manifestKey"]
-    return json.loads((frozen / "summary.json").read_text(encoding="utf-8")), frozen
+def iso_children():
+    prefix = ROOT + "/" + iso_rel + "/"
+    return sum(1 for path in tree.entries if path.startswith(prefix))
+
 
 if stage == "abort":
-    seen = preview()
-    shown = seen["target"]
-    assert shown.get("chunked") is True and shown["count"] == 50001 > 50000, shown
-    assert re.fullmatch(r"[0-9a-f]{64}", shown["fingerprint"])
-    assert re.fullmatch(r"\d+", shown["inode"]) and shown["type"] == "directory"
-    assert "inventory" not in shown and "sha256" not in json.dumps(seen), "preview must stay bounded"
-    state.update({"count": shown["count"], "fingerprint": shown["fingerprint"],
-                  "rootIdentity": seen["rootIdentity"]})
-    # The bounded small path is closed for a chunked-claiming ghost target:
-    # an unregistered archive batch refuses before any traversal or unlink.
-    ghost = engine_run(root_text, {"root": root_text, "rootIdentity": state["rootIdentity"],
-                                   "operationId": "ghost-op", "action": "delete",
-                                   "target": {"relativePath": "clean_dir/%s/ghost" % BATCH,
-                                              "type": "directory", "authorizationMode": "confirmed_paths",
-                                              "destination": "clean_dir/%s/ghost" % BATCH,
-                                              "chunked": True, "count": 50001, "fingerprint": "0" * 64}})
-    assert ghost.get("ok") is not True and ghost["error"]["code"] == "NOT_REGISTERED_ISOLATION", ghost
-    engine = runpy.run_path(str(engine_path))
-    request = frozen_delete_request()
-    unlinks = []
-    real_unlink = os.unlink
-    def bomb(name):
-        unlinks.append(name)
-        # Chunks apply newest-first (reversed frozen pre-order). The 5000th
-        # unlink lands inside the second applied chunk, after the newest chunk
-        # completed with a single unlink, so the watermark must read exactly 1.
-        if len(unlinks) == 5000:
-            raise OSError("fixture-interrupt")
-        real_unlink(name)
-    os.unlink = bomb
+    # Power loss inside the tree walk: the fake unlink starts failing with
+    # EIO after ABORT_AFTER_UNLINKS files. The rename already happened, so the
+    # mutation fact must report the partial change.
     try:
-        engine["main"](request)
-        raise AssertionError("the interrupted run must not report completion")
+        delete(frozen)
+        raise AssertionError("interrupted deletion reported success")
     except OSError as error:
-        assert str(error) == "fixture-interrupt", error
-    finally:
-        os.unlink = real_unlink
-    state["manifestKey"] = engine["manifest_key"](OP_ID, dest, dest)
-    summary, frozen = summary_now()
-    digests = summary.pop("chunkDigests", None)
-    assert summary == {"schemaVersion": 1, "fingerprint": state["fingerprint"],
-                       "count": 50001, "applied": 1}, summary
-    chunks = sorted(name for name in os.listdir(frozen) if name.startswith("chunk-"))
-    assert chunks == ["chunk-%06d.json" % index for index in range(6)], chunks
-    assert isinstance(digests, list) and len(digests) == 6, digests
-    for index, value in enumerate(digests):
-        blob = (frozen / ("chunk-%06d.json" % index)).read_bytes()
-        assert re.fullmatch(r"[0-9a-f]{64}", value) and hashlib.sha256(blob).hexdigest() == value, index
-    assert not (root / dest / "zz1999").exists(), "the newest applied chunk must have been applied"
-    assert (root / dest / "yy31999").exists() and (root / dest / "zz0005" / "g0").exists()
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+        assert error.errno == 5, error
+    assert engine["FAST_MUTATION_FACTS"]["started"] is True
+    assert tree.renamed == [("./run", "./" + frozen[0]["isolationName"], ROOT + "/work_dirs")], tree.renamed
+    assert ROOT + "/" + REL not in tree.entries
+    assert 0 < len(tree.removed) < FILE_COUNT + 1, len(tree.removed)
+    assert ROOT + "/" + iso_rel in tree.entries and iso_children() > 0
+    save(state, tree)
     print("ok")
     sys.exit(0)
 
 if stage == "refuse":
-    injector = root / dest / "zz0005" / "unconfirmed-new.txt"
-    injector.write_text("user data", encoding="utf-8")
-    result = engine_run(root_text, frozen_delete_request())
-    assert result.get("ok") is not True and result["error"]["code"] == "DIRECTORY_INVENTORY_CHANGED", result
-    assert injector.read_text(encoding="utf-8") == "user data", "new data must never be absorbed"
-    summary, _ = summary_now()
-    assert summary["applied"] == 2, summary
-    assert summary["chunkDigests"] and len(summary["chunkDigests"]) == 6
-    # The refusal happened while applying the third newest chunk (zz0005 was no
-    # longer empty): finishing the second chunk advanced the watermark once and
-    # the refusing chunk never advanced it.
-    # The injected file is a test-owned artifact: move it (never delete it)
-    # into a retained directory inside this fixture root, so later stages see
-    # the frozen layout again while the evidence file survives. Verify the
-    # canonical fixture parent and a fresh non-existing target first, then do
-    # a no-overwrite rename.
-    assert os.path.realpath(str(root)) == str(root), "fixture root must be canonical"
-    retain = root / "refuse-retained"
-    retain.mkdir()
-    assert not os.path.islink(retain) and os.path.realpath(str(retain)) == str(retain)
-    retired = retain / injector.name
-    assert not os.path.lexists(str(retired)), "retention target must not pre-exist"
-    os.rename(str(injector), str(retired))
-    assert not injector.exists() and retired.read_text(encoding="utf-8") == "user data"
+    # Blind replay of the stale frozen selection: reality says the original
+    # entry is gone; nothing may mutate and unconfirmed leftovers are never
+    # absorbed into the old selection.
+    new_file = ROOT + "/" + iso_rel + "/late-new.json"
+    tree.add_file(new_file, b"created after interruption")
+    children_before = iso_children()
+    error = refusal(lambda: delete(frozen), "MISSING_TARGET")
+    assert error.code == "MISSING_TARGET"
+    assert engine["FAST_MUTATION_FACTS"]["started"] is False
+    assert tree.removed == [] and tree.renamed == []
+    assert iso_children() == children_before and tree.entries[new_file][2] == b"created after interruption"
+    assert ROOT + "/" + iso_rel in tree.entries
+    save(state, tree)
     print("ok")
     sys.exit(0)
 
 if stage == "complete":
-    result = engine_run(root_text, frozen_delete_request())
-    assert result.get("ok"), result
-    receipt = result["receipt"]
-    assert receipt["chunked"] is True and receipt["count"] == 50001, receipt
-    assert receipt["fingerprint"] == state["fingerprint"]
-    assert "inventory" not in json.dumps(result), "no deleted file list may survive"
-    assert not (root / dest).exists() and (root / "clean_dir" / BATCH / "outputs").is_dir()
-    control = "isolation:" + os.path.normcase(dest)
-    iso = json.loads((root / "clean_dir/.operations/isolation" /
-                      (hashlib.sha256(control.encode("utf-8")).hexdigest() + ".json")).read_text(encoding="utf-8"))
-    assert iso["state"] == "deleted"
-    assert not (root / "clean_dir/.operations/frozen" / state["manifestKey"]).exists()
-    replay = engine_run(root_text, frozen_delete_request())
-    assert replay.get("state") == "completed" and replay.get("verifiedBy") == "isolation_deleted", replay
-    assert "receipt" not in replay and len(json.dumps(replay)) < 600, replay
+    # Completion arrives only through a fresh confirmation of the isolation
+    # tree as it exists now; the second isolate-then-delete clears it exactly.
+    row = inspect_row(engine, root, identity, iso_rel)
+    second = row["isolationName"]
+    delete([entry_of(row)])
+    assert ROOT + "/" + iso_rel not in tree.entries
+    assert "work_dirs/" + second not in tree.entries or not any(
+        path.startswith(ROOT + "/work_dirs/" + second) for path in tree.entries)
+    assert ROOT + "/" + REL not in tree.entries
+    save(state, tree)
     print("ok")
     sys.exit(0)
 
 if stage == "rebuild":
-    fresh = root / dest
-    fresh.mkdir(parents=True)
-    (fresh / "new.txt").write_text("new job", encoding="utf-8")
-    replay = engine_run(root_text, frozen_delete_request())
-    assert replay.get("state") == "completed" and replay.get("verifiedBy") == "isolation_deleted", replay
-    assert (fresh / "new.txt").read_text(encoding="utf-8") == "new job"
+    # A same-name directory rebuilt afterwards is new data: active verify
+    # reports the frozen identity as replaced and demands nothing.
+    tree.add_dir(ROOT + "/" + REL)
+    tree.add_file(ROOT + "/" + REL + "/new-run.log", b"brand new result")
+    verify = engine["batch_verify"](root, identity, {"authorizationMode": "confirmed_paths", "entries": [
+        frozen[0], {"relativePath": iso_rel, "type": "directory",
+                    "device": frozen[0]["device"], "inode": frozen[0]["inode"]}]})
+    statuses = [row["status"] for row in verify["targets"]]
+    assert statuses == ["replaced", "gone"], statuses
+    assert tree.entries[ROOT + "/" + REL + "/new-run.log"][2] == b"brand new result"
     print("ok")
     sys.exit(0)
 
-raise SystemExit("unknown stage")
+raise AssertionError("unknown stage " + stage)

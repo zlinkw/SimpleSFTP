@@ -15,7 +15,7 @@ function stage(name, stateFile) {
   return result.stdout.trim();
 }
 
-test('a >50000-entry registered archive deletes only through resumable frozen chunks', () => {
+test('an interrupted archive deletion reports honest facts, refuses stale replay, and never touches rebuilt data', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'simple-cleanup-chunked-'));
   const stateFile = path.join(root, 'state.json');
   assert.equal(stage('build', stateFile), 'ok');

@@ -1,3 +1,8 @@
+# v1.9 note: confirmed exact paths never pass through the managed window;
+# they run on the entry-bound fast chain (covered by fastDeleteGuard and the
+# confirmed* fixtures). The multi-MiB managed lifecycle proven here stays on
+# the live non-confirmed managed route, with deletions still replaced by
+# moves inside the fixture's own disposable scratch (noDeletion contract).
 import json, os, pathlib, runpy, subprocess, sys, tempfile
 
 engine_path = pathlib.Path(sys.argv[1]).resolve()
@@ -21,7 +26,7 @@ job.mkdir(parents=True)
 archive = root / 'clean_dir' / 'fixture-only'
 archive.mkdir(parents=True)
 root_text, identity = engine['root_guard'](str(root))
-target = {'relativePath':'output/job', 'destination':'clean_dir/output/job', 'type':'directory', 'authorizationMode':'confirmed_paths'}
+target = {'relativePath':'output/job', 'destination':'clean_dir/output/job', 'type':'directory'}
 value = engine['inspect'](root_text, target)
 inventory = value['inventory'] + [{'path':'trace/' + str(i).zfill(8) + '/checkpoint-name-with-metadata.bin', 'type':'file', 'size':1024,
     'mtime':'123456789123456789', 'ctime':'123456789123456789', 'device':'12', 'inode':str(i)} for i in range(8000)]
@@ -45,7 +50,7 @@ frozen_file = managed / (key + '.json')
 frozen = {'root':root_text,'rootIdentity':identity,'operationId':request['operationId'],'action':'delete','managedInner':True,'target':target}
 raw = json.dumps(frozen,ensure_ascii=False,sort_keys=True)
 frozen_file.write_text(raw,encoding='utf-8')
-compact_target = {name:target[name] for name in ('relativePath','destination','type','fingerprint','contentFingerprint','inode','fingerprintMode','authorizationMode')}
+compact_target = {name:target[name] for name in ('relativePath','destination','type','fingerprint','contentFingerprint','inode','fingerprintMode','authorizationMode') if name in target}
 compact = {**request,'action':'managed-observe','target':compact_target,'frozenTargetDigest':engine['frozen_target_digest'](target)}
 assert len(json.dumps(compact).encode('utf-8')) < 8192
 env['managed_tmux'] = lambda args: '@1\t%1\t0\t\t' + key
@@ -84,7 +89,7 @@ assert (archive / 'preserved-job' / 'keep.bin').read_bytes() == b'fixture'
 second = root / 'output' / 'second'
 second.mkdir()
 (second / 'keep.txt').write_text('preserve child bytes',encoding='utf-8')
-t = {'relativePath':'output/second','destination':'clean_dir/output/second','type':'directory','authorizationMode':'confirmed_paths'}
+t = {'relativePath':'output/second','destination':'clean_dir/output/second','type':'directory'}
 t = {**t, **engine['inspect'](root_text,t), 'destination':t['destination'], 'fixturePadding':'x'*1200000}
 source = engine_path.read_text(encoding='utf-8')
 patch = '''

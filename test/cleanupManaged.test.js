@@ -18,7 +18,9 @@ test('a busy live mutation lock delays managed admission without becoming a term
       assert.fail(request.action);
     }});
   await assert.rejects(api.preview({tmuxSessionPrefix:'bad;command'}), /INVALID_TMUX_SESSION_PREFIX/);
-  const p=await api.preview({tmuxSessionPrefix:'research',node:{kind:'remote',root:'/scope'},action:'delete',authorizationMode:'confirmed_paths',targets:[{relativePath:'job',type:'directory',destination:'clean_dir/job'}]});
+  // v1.9: confirmed paths no longer admit through the managed window, so the
+  // busy-lock contract runs on the surviving managed_tmux observation route.
+  const p=await api.preview({tmuxSessionPrefix:'research',node:{kind:'remote',root:'/scope'},action:'delete',observationMode:'managed_tmux',targets:[{relativePath:'job',type:'directory',destination:'clean_dir/job'}]});
   for(const phase of [1,2])await api.confirm({token:p.token,digest:p.digest,phase,confirm:true,exactTargets:['/scope/job']});
   const request={token:p.token,digest:p.digest,index:0};
   assert.equal((await api.execute(request)).state,'waiting');
@@ -44,11 +46,11 @@ test('managed cleanup is observable while its execute response is lost, without 
   assert.equal((await api.execute({token:preview.token,digest:preview.digest,index:0})).state,'completed');
   assert.equal(mutations,1);
 });
-test('real isolated tmux removes and moves only confirmed fixture targets; fresh queries detect recreation',()=>{
+test('confirmed managed deletion is retired fail-closed with no mutation, tmux window, or receipt payload',()=>{
   const fixture=path.resolve(__dirname,'cleanupManaged.fixture.py'),engine=path.resolve(__dirname,'../cleanup-files.py');
   const args=process.platform==='win32'?['--distribution',process.env.SIMPLE_TEST_WSL_DISTRO||'Ubuntu-Codex','--exec','python3',linux(fixture),linux(engine)]:[fixture,engine];
   const proc=spawnSync(process.platform==='win32'?'wsl.exe':'python3',args,{encoding:'utf8',timeout:10000,windowsHide:true});
-  assert.equal(proc.status,0,proc.stderr||proc.stdout);assert.deepEqual(JSON.parse(proc.stdout),{ok:true,realTmux:true,receiptsRequired:false});
+  assert.equal(proc.status,0,proc.stderr||proc.stdout);assert.deepEqual(JSON.parse(proc.stdout),{ok:true,managedDeleteRetired:true,receiptsRequired:false});
 });
 test('local cleanup queries the actual in-flight operation and cannot launch a concurrent duplicate',async()=>{
   let removed=false,mutations=0,release;
