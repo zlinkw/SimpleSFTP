@@ -13,6 +13,12 @@ const canonical = value => typeof value === "number" ? "n" + (() => {
     .map(key => JSON.stringify(key) + ":" + canonical(value[key])).join(",") + "}" : JSON.stringify(value);
 const targetHash = value => crypto.createHash("sha256").update(canonical(value)).digest("hex");
 const copy = value => JSON.parse(JSON.stringify(value));
+// Refusals the engine can only raise in its pre-mutation entry-check pass;
+// they keep a fast batch retryable instead of poisoning it as uncertain.
+const FAST_ZERO_MUTATION_CODES = new Set(["ENTRY_IDENTITY_CHANGED", "MISSING_TARGET", "TYPE_CHANGED", "UNCERTAIN_TYPE",
+  "UNSAFE_PATH", "UNSAFE_PARENT", "FAST_BATCH_INVALID", "INVALID_AUTHORIZATION_MODE", "ROOT_IDENTITY_CHANGED",
+  "NOT_REGISTERED_ISOLATION", "PROTECTED_PATH", "UNSAFE_ARCHIVE_BATCH"]);
+const isFastDeleteRow = row => row.authorizationMode === "confirmed_paths" && row.action === "delete";
 // The only remote deletion chain runs a content-addressed engine program that
 // was pinned into the protected managed program area; requests never carry a
 // copy of the source through argv. Commands stay far below the Windows argv
@@ -210,9 +216,11 @@ class CleanupFileApi {
     const { node, action = "move", targets } = params;
     if (params.authorizationMode !== undefined && params.authorizationMode !== "confirmed_paths") fail("INVALID_AUTHORIZATION_MODE");
     const pathOnly = params.authorizationMode === "confirmed_paths";
+    // Confirmed paths only ever authorize permanent deletion; a move/restore
     if (pathOnly && action !== "delete") fail("INVALID_ACTION");
     const observationMode = params.observationMode === "managed_tmux" || pathOnly ? node?.kind === "local" ? "filesystem" : "tmux" : undefined;
     if (!node?.root || !["move", "delete", "restore", "isolate"].includes(action) || !Array.isArray(targets) || !targets.length || targets.length > 500) fail("INVALID_REQUEST");
+    if (pathOnly) return await this.previewFast(node, targets, tmuxSessionPrefix);
     if (!pathOnly) await this.activity(node);
     const rows = []; let identity;
     for (const original of targets) {
@@ -250,6 +258,52 @@ class CleanupFileApi {
     this.previews.set(row.token, copy(row)); // Preview does not write a journal or a remote hash cache.
     return copy(row);
   }
+  /** v1.9 confirmed selection: entry identity binds, one batched read-only
+   * metadata transfer per chunk, bounded parallel reads; mutation stays one
+   * serial delete-fast call. Directories isolate by non-overwriting rename. */
+  async previewFast(node, targets, tmuxSessionPrefix) {
+    for (const target of targets) {
+      if (!target || !["file", "directory"].includes(target.type)) fail("UNCERTAIN_TYPE");
+      const rel = target.relativePath;
+      if (typeof rel !== "string" || !rel || rel.length > 4096 || rel.startsWith("/")
+        || /[\\\x00\r\n\x00-\x1f:*?[\]{}]/.test(rel) || rel.split("/").some(part => !part || part === "." || part === "..")) fail("INVALID_REQUEST");
+      if (rel.split("/").includes(".git")) fail("PROTECTED_PATH");
+      const archivedDelete = /^clean_dir\/job-[a-f0-9]{48}\//.test(rel);
+      if (rel.startsWith("clean_dir/") && !archivedDelete) fail("UNSAFE_DESTINATION");
+      if (archivedDelete && target.destination !== rel) fail("UNSAFE_DESTINATION");
+    }
+    const operationId = "cleanup-" + crypto.randomBytes(16).toString("hex");
+    const chunks = [];
+    for (let i = 0; i < targets.length; i += 1000) chunks.push(targets.slice(i, i + 1000));
+    const inspected = [];
+    for (let i = 0; i < chunks.length; i += 2) { // bounded parallel: at most two reads in flight
+      const part = await Promise.all(chunks.slice(i, i + 2).map(chunk => this.checked({ node, root: node.root,
+        action: "batch-inspect", authorizationMode: "confirmed_paths", operationId,
+        targets: chunk.map(target => ({ relativePath: target.relativePath, type: target.type })) })));
+      inspected.push(...part);
+    }
+    const rows = []; let identity;
+    for (const result of inspected) {
+      if (identity && hash(identity) !== hash(result.rootIdentity)) fail("ROOT_IDENTITY_CHANGED");
+      identity = result.rootIdentity;
+      for (const entry of result.targets) rows.push({ ...entry, ...(entry.archived ? { destination: entry.relativePath } : {}) });
+    }
+    const row = { token: crypto.randomBytes(24).toString("hex"), operationId, node: copy(node), rootIdentity: identity,
+      action: "delete", authorizationMode: "confirmed_paths", targets: rows,
+      safety: { batchPreviewCapacity: 4096, confirmedPathDeletion: 1, entryIdentityBind: 1, batchedFastDelete: 1,
+        directoryTreeIsolateDelete: 1, isolationRenameNoReplace: 1, registeredIsolationDeletion: 1, subtreeSingleWriter: 1,
+        pinnedRuntimeProgram: 1, fastDeleteBatchLimit: 5000, contentHash: 0, descendantFingerprint: 0, handleScan: "entry_only" },
+      metrics: { inspectRpcCalls: inspected.length,
+        metadataReads: inspected.reduce((sum, result) => sum + (result.metrics?.metadataReads || 0), 0),
+        mountReads: inspected.reduce((sum, result) => sum + (result.metrics?.mountReads || 0), 0),
+        entryCheckMs: inspected.reduce((sum, result) => sum + (result.metrics?.entryCheckMs || 0), 0) },
+      expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(entry => entry.missing ? "absent" : "pending") };
+    row.tmuxSessionPrefix = tmuxSessionPrefix;
+    row.targetDigests = rows.map(targetHash);
+    row.digest = hash({ node: row.node, rootIdentity: identity, action: "delete", targets: rows, safety: row.safety, tmuxSessionPrefix });
+    this.previews.set(row.token, copy(row)); // Preview performs no journal or remote write.
+    return copy(row);
+  }
   async inspect(params) {
     if (!params.node?.root || !["file", "directory"].includes(params.target?.type)) fail("INVALID_REQUEST");
     const result = await this.checked({ node: params.node, root: params.node.root, action: "inventory", target: params.target,
@@ -266,9 +320,35 @@ class CleanupFileApi {
     return result;
   }
   /** Read-only observation of a frozen receipt. Never settles audit state or starts a file operation. */
+  /** Active batched presence query for a fast confirmed row; read-only. */
+  async fastVerify(row, indexes) {
+    const single = !Array.isArray(indexes);
+    const list = single ? [indexes] : indexes;
+    for (const i of list) if (!Number.isInteger(i) || !row.targets[i]) fail("INVALID_TARGET");
+    const proofs = {};
+    const live = list.filter(i => {
+      if (row.targets[i].missing) proofs[i] = { ok: true, state: "absent", status: "absent", target: row.targets[i] };
+      return !row.targets[i].missing;
+    });
+    if (live.length) {
+      const entries = live.map(i => ({ relativePath: row.targets[i].relativePath, type: row.targets[i].type,
+        device: row.targets[i].device, inode: row.targets[i].inode }));
+      const result = await this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
+        action: "batch-verify", authorizationMode: "confirmed_paths", entries });
+      live.forEach((i, position) => {
+        const entry = (result.targets || [])[position] || { status: "present" };
+        const archived = Boolean(row.targets[i].archived);
+        const state = entry.status === "gone" ? "completed"
+          : entry.status === "replaced" ? (archived ? "unknown" : "completed") : "pending";
+        proofs[i] = { ok: true, state, status: entry.status, target: entry };
+      });
+    }
+    return single ? proofs[list[0]] : proofs;
+  }
   async check(params) {
     const row = await this.read(params.token), index = params.index;
     if (!Number.isInteger(index) || !row.targets[index]) fail("INVALID_TARGET");
+    if (isFastDeleteRow(row)) return this.fastVerify(row, index);
     if (row.observationMode) return this.observe(row, index);
     return this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity, target: row.targets[index],
       action: "check", deleted: row.action === "delete", receiptCompleted: row.states[index] === "completed" });
@@ -287,6 +367,42 @@ class CleanupFileApi {
     const index = params.index;
     if (!Number.isInteger(index) || !row.targets[index]) fail("INVALID_TARGET");
     if (row.states[index] === "absent") fail("NOT_AN_EXECUTABLE_TARGET");
+    if (row.authorizationMode === "confirmed_paths" && row.action === "delete") {
+      // One serial delete-fast RPC executes the whole confirmed batch; the
+      // engine re-checks every entry identity before touching anything.
+      if (this.busy.has(row.token)) fail("OPERATION_BUSY");
+      this.busy.add(row.token);
+      try {
+        return await this.lease(row.node, row.targets, async () => {
+          const pending = row.targets.map((target, i) => ({ target, i })).filter(({ target, i }) => !target.missing && row.states[i] !== "completed");
+          if (!pending.length) return { ok: true, alreadyCompleted: true, receipt: row.batchReceipt };
+          if (row.batchExecuting) fail("DELETE_RECEIPT_UNCERTAIN");
+          const entries = pending.map(({ target }) => ({ relativePath: target.relativePath, type: target.type, device: target.device, inode: target.inode,
+            ...(target.type === "directory" && !target.archived && target.isolationName ? { isolationName: target.isolationName } : {}) }));
+          row.batchExecuting = true;
+          for (const { i } of pending) row.states[i] = "executing";
+          await this.save(row);
+          let result;
+          try {
+            result = await this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity, action: "delete-fast",
+              authorizationMode: "confirmed_paths", operationId: row.operationId, entries });
+          } catch (error) {
+            // Refusals proven to come from the pre-mutation entry check leave
+            // the batch retryable; anything else keeps the uncertain state so a
+            // later active query, not a blind rerun, decides.
+            if (FAST_ZERO_MUTATION_CODES.has(error.code)) { row.batchExecuting = false; for (const { i } of pending) row.states[i] = "pending"; await this.save(row); }
+            throw error;
+          }
+          for (const { i } of pending) row.states[i] = "completed";
+          row.batchExecuting = false;
+          row.batchReceipt = result.receipt;
+          row.metrics = { ...(row.metrics || {}), executeRpcCalls: (row.metrics?.executeRpcCalls || 0) + 1,
+            deleteMetrics: result.receipt?.metrics || null };
+          await this.save(row);
+          return result;
+        });
+      } finally { this.busy.delete(row.token); }
+    }
     if (row.observationMode) {
       const key = row.token + ":" + index;
       if (row.observationMode === "filesystem" && this.localExecutions.has(key)) return { ok: true, state: "executing" };
@@ -369,6 +485,24 @@ class CleanupFileApi {
   }
   async status(params) {
     const row = await this.read(params.token);
+    if (isFastDeleteRow(row)) {
+      // One batched active query refreshes the whole selection, never one RPC per file.
+      const indexes = row.targets.map((_, i) => i).filter(i => !row.targets[i].missing && row.states[i] !== "absent");
+      try {
+        const proofs = await this.fastVerify(row, indexes);
+        row.observations = row.observations || [];
+        for (const i of indexes) {
+          const proof = proofs[i];
+          row.observations[i] = proof;
+          row.states[i] = proof.state === "completed" ? "completed" : proof.state === "pending" && row.states[i] === "pending" ? "pending" : "unknown";
+        }
+        // An active query that accounts for every entry resolves a lost receipt;
+        // the resolved truth is persisted so a later rerun sees alreadyCompleted.
+        if (row.batchExecuting && row.targets.every((target, i) => target.missing || row.states[i] === "completed")) row.batchExecuting = false;
+        await this.save(row);
+      } catch (error) { row.statusQueryError = error.code || error.message; }
+      return row;
+    }
     if (row.observationMode) {
       row.observations = [];
       for (let index = 0; index < row.targets.length; index++) {
@@ -384,6 +518,7 @@ class CleanupFileApi {
   async settle(params) {
     const row = await this.read(params.token), index = params.index, target = row.targets[index];
     if (params.digest !== row.digest || !Number.isInteger(index) || !target || row.confirmations !== (row.action === "delete" ? 2 : 1)) fail("CONFIRM_REQUIRED");
+    if (isFastDeleteRow(row)) return this.fastVerify(row, index);
     if (row.observationMode) return this.observe(row, index);
     if (row.action === "delete") fail("DELETE_RECEIPT_UNCERTAIN");
     if (this.busy.has(row.token)) fail("OPERATION_BUSY");
@@ -410,6 +545,11 @@ class CleanupFileApi {
   }
   async verify(params) {
     const row = await this.read(params.token), target = row.targets[params.index];
+    if (isFastDeleteRow(row) && target) {
+      const proof = await this.fastVerify(row, params.index);
+      if (proof.state !== "completed") fail("CLEANUP_NOT_VERIFIED");
+      return proof;
+    }
     if (row.observationMode && target) {
       const proof = await this.observe(row, params.index);
       if (proof.state !== "completed") fail("CLEANUP_NOT_VERIFIED");

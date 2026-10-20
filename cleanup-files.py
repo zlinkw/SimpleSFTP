@@ -100,11 +100,24 @@ def checked_parent(root, full, code="UNSAFE_PARENT"):
     return parent
 
 
+_MOUNT_CACHE = {"at": 0.0, "reads": 0, "value": None}
+
+
 def mount_points():
-    if not os.path.exists("/proc/self/mountinfo"):
-        return set()
-    with open("/proc/self/mountinfo", "r", encoding="utf-8") as stream:
-        return {os.path.abspath(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), line.split()[4])) for line in stream if len(line.split()) > 4}
+    # One bounded read of the mount table per request burst; batched entry
+    # checks share it instead of re-reading mountinfo for every path.
+    now = time.monotonic()
+    if _MOUNT_CACHE["value"] is not None and now - _MOUNT_CACHE["at"] < 1.0:
+        return _MOUNT_CACHE["value"]
+    if os.path.exists("/proc/self/mountinfo"):
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as stream:
+            value = {os.path.abspath(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), line.split()[4])) for line in stream if len(line.split()) > 4}
+    else:
+        value = set()
+    _MOUNT_CACHE["at"] = now
+    _MOUNT_CACHE["value"] = value
+    _MOUNT_CACHE["reads"] += 1
+    return value
 
 
 def relative(value):
@@ -1040,6 +1053,264 @@ def register_isolation(root, destination_rel, source_rel, operation_id, value, m
         "source": source_rel, "type": value["type"], "inode": value["inode"], "isolatedAt": moment})
 
 
+# ---------------------------------------------------------------------------
+# v1.9 fast confirmed-path deletion chain (the single production executor for
+# user-confirmed exact paths). The confirmation binds the ENTRY identity only
+# (device+inode+type of each explicitly selected path); descendants are never
+# content-hashed or fingerprint-frozen. A selected directory is first renamed
+# inside its verified direct parent, on the same filesystem and without ever
+# overwriting, to a unique isolation name; afterwards only that new name is
+# removed, so a result that reappears under the original path is preserved.
+# Scattered files are removed grouped by their verified direct parent with
+# one entry lstat each. Kept hard constraints: full ancestor link/reparse/
+# mount/protected-name walk, safe root, physical direct-parent cwd check,
+# delete arguments only ./<direct child>, serial mutation, double confirmation
+# (the client binds the batch digest; a replaced entry refuses with
+# ENTRY_IDENTITY_CHANGED and must be re-confirmed). No handle scan, no task
+# registry gate, no content hashing.
+
+FAST_BATCH_LIMIT = 5000
+FAST_TREE_MAX_DEPTH = 256
+ISOLATION_SUFFIX = "__iso_"
+
+
+def isolation_name(operation_id, rel, leaf):
+    # Deterministic from the preview operation id and the exact relative path
+    # so the confirmation page can show original -> isolation before execution.
+    return leaf + ISOLATION_SUFFIX + hashlib.sha256(
+        (str(operation_id) + "\n" + rel).encode("utf-8")).hexdigest()[:16]
+
+
+def fast_entry_check(root, item, operation_id):
+    """Entry-only guard + frozen identity compare; never enumerates descendants."""
+    if not isinstance(item, dict) or item.get("type") not in ("file", "directory"):
+        deny("UNCERTAIN_TYPE")
+    rel = item.get("relativePath")
+    if not isinstance(rel, str):
+        deny("UNSAFE_PATH")
+    relative(rel)
+    archived = bool(ARCHIVED_BATCH_RE.match(rel))
+    full = path_guard(root, rel, allow_clean=archived, missing=True)
+    if not os.path.lexists(full):
+        return {"relativePath": rel, "type": item["type"], "missing": True, "absolutePath": full, "archived": archived}
+    st = os.lstat(full)
+    actual = "directory" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "unknown"
+    if actual != item["type"]:
+        deny("TYPE_CHANGED", full)
+    checked_parent(root, full)
+    row = {"relativePath": rel, "type": actual, "absolutePath": full, "archived": archived,
+           "device": str(st.st_dev), "inode": str(st.st_ino),
+           "size": st.st_size if actual == "file" else 0, "mtime": str(st.st_mtime_ns)}
+    if archived:
+        state = isolation_state(root, rel)
+        row["isolationState"] = (state or {}).get("state")
+    elif actual == "directory":
+        row["isolationName"] = isolation_name(operation_id, rel, os.path.basename(full))
+    for key in ("device", "inode"):
+        if item.get(key) is not None and str(item[key]) != row[key]:
+            deny("ENTRY_IDENTITY_CHANGED", full, "所选入口在确认后被替换为另一个对象，请重新确认")
+    return row
+
+
+def batch_inspect(root, identity, request):
+    """One read-only metadata transfer for the whole confirmed selection."""
+    if request.get("authorizationMode") != "confirmed_paths":
+        deny("INVALID_AUTHORIZATION_MODE")
+    targets = request.get("targets")
+    if not isinstance(targets, list) or not 1 <= len(targets) <= FAST_BATCH_LIMIT:
+        deny("FAST_BATCH_INVALID")
+    operation_id = str(request.get("operationId") or "")
+    mount_reads = _MOUNT_CACHE["reads"]
+    started = time.monotonic()
+    rows = [fast_entry_check(root, item, operation_id) for item in targets]
+    return {"ok": True, "rootIdentity": identity, "targets": rows,
+            "metrics": {"selected": len(rows), "metadataReads": len(rows),
+                        "mountReads": _MOUNT_CACHE["reads"] - mount_reads,
+                        "entryCheckMs": round((time.monotonic() - started) * 1000, 1)}}
+
+
+def batch_verify(root, identity, request):
+    """Active presence query after a fast deletion; entry-only and read-only."""
+    if request.get("authorizationMode") != "confirmed_paths":
+        deny("INVALID_AUTHORIZATION_MODE")
+    entries = request.get("entries")
+    if not isinstance(entries, list) or not 1 <= len(entries) <= FAST_BATCH_LIMIT:
+        deny("FAST_BATCH_INVALID")
+    rows = []
+    for item in entries:
+        rel = item.get("relativePath") if isinstance(item, dict) else None
+        if not isinstance(rel, str):
+            deny("UNSAFE_PATH")
+        relative(rel)
+        full = path_guard(root, rel, allow_clean=bool(ARCHIVED_BATCH_RE.match(rel)), missing=True)
+        if not os.path.lexists(full):
+            rows.append({"relativePath": rel, "status": "gone"})
+            continue
+        st = os.lstat(full)
+        same = (item.get("device") is None or str(st.st_dev) == str(item["device"])) \
+            and (item.get("inode") is None or str(st.st_ino) == str(item["inode"]))
+        kind = "directory" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "unknown"
+        rows.append({"relativePath": rel, "status": "present" if same else "replaced", "type": kind,
+                     "device": str(st.st_dev), "inode": str(st.st_ino)})
+    return {"ok": True, "rootIdentity": identity, "targets": rows}
+
+
+def fast_tree_remove(root, entry_abs, allow_clean, stats):
+    """Post-order removal of one fully authorized tree under the ./<leaf> rule.
+
+    Precondition: the physical cwd is entry_abs's verified direct parent.
+    The walk never follows links or crosses devices/mounts, refuses protected
+    names, and unwinds the cwd chain back to the entry parent on any refusal.
+    """
+    tree_dev = os.lstat("./" + os.path.basename(entry_abs)).st_dev
+    mounts = mount_points()
+
+    def walk(rel_name, abs_dir, depth):
+        if depth > FAST_TREE_MAX_DEPTH:
+            deny("TREE_TOO_DEEP", abs_dir)
+        if rel_name.lower() == "clean_dir" and not allow_clean:
+            deny("PROTECTED_DESCENDANT", abs_dir, "归档区受保护，不能随父目录删除")
+        info = os.lstat("./" + rel_name)
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 1024:
+            deny("LINK_OR_REPARSE_POINT", abs_dir)
+        if not stat.S_ISDIR(info.st_mode):
+            deny("UNCERTAIN_TYPE", abs_dir)
+        if info.st_dev != tree_dev or os.path.ismount(abs_dir) or abs_dir in mounts:
+            deny("MOUNT_ESCAPE", abs_dir)
+        os.chdir("./" + rel_name)
+        try:
+            for leaf in sorted(os.listdir(".")):
+                relative(leaf)
+                leaf_full = os.path.join(abs_dir, leaf)
+                leaf_info = os.lstat("./" + leaf)
+                if stat.S_ISLNK(leaf_info.st_mode) or getattr(leaf_info, "st_file_attributes", 0) & 1024:
+                    deny("LINK_OR_REPARSE_POINT", leaf_full)
+                if leaf.lower() == "clean_dir" and not allow_clean:
+                    deny("PROTECTED_DESCENDANT", leaf_full, "归档区受保护，不能随父目录删除")
+                if leaf_info.st_dev != tree_dev:
+                    deny("MOUNT_ESCAPE", leaf_full)
+                stats["entries"] += 1
+                if stat.S_ISREG(leaf_info.st_mode):
+                    os.unlink("./" + leaf)
+                    stats["files"] += 1
+                    progress_heartbeat()
+                elif stat.S_ISDIR(leaf_info.st_mode):
+                    walk(leaf, leaf_full, depth + 1)
+                else:
+                    deny("UNCERTAIN_TYPE", leaf_full)
+        finally:
+            os.chdir("..")
+        os.rmdir("./" + rel_name)
+        stats["rmdirs"] += 1
+
+    walk(os.path.basename(entry_abs), entry_abs, 1)
+
+
+def delete_fast(root, identity, request):
+    """The single confirmed-path production executor: entry-bound, batched,
+    directories isolated by non-overwriting rename first, mutation serial."""
+    if request.get("authorizationMode") != "confirmed_paths":
+        deny("INVALID_AUTHORIZATION_MODE")
+    if request.get("rootIdentity") != identity:
+        deny("ROOT_IDENTITY_CHANGED")
+    entries = request.get("entries")
+    operation_id = request.get("operationId")
+    if not isinstance(entries, list) or not 1 <= len(entries) <= FAST_BATCH_LIMIT \
+            or not isinstance(operation_id, str) or not operation_id:
+        deny("FAST_BATCH_INVALID")
+    mount_reads = _MOUNT_CACHE["reads"]
+    stage = {"check": 0.0, "mutate": 0.0, "confirm": 0.0}
+    started = time.monotonic()
+    # Phase 1: every entry re-confirms identity before anything is mutated,
+    # so a refused batch never leaves a partially deleted selection.
+    file_groups = {}
+    directories = []
+    already = []
+    for item in entries:
+        if not isinstance(item, dict) or not isinstance(item.get("device"), str) or not isinstance(item.get("inode"), str):
+            deny("ENTRY_IDENTITY_CHANGED", "", "缺少入口设备/节点号绑定，请重新确认")
+        row = fast_entry_check(root, item, operation_id)
+        if row.get("missing"):
+            deny("MISSING_TARGET", row["absolutePath"], "确认目标已不存在，请重新确认")
+        if row["archived"] and row.get("isolationState") == "deleted":
+            already.append(row["relativePath"])
+            continue
+        if row["archived"] and row.get("isolationState") != "isolated":
+            deny("NOT_REGISTERED_ISOLATION", row["absolutePath"], "只有已登记的隔离产物子树可以经确认路径永久删除")
+        if not row["archived"] and row["type"] == "directory" and item.get("isolationName") is not None \
+                and item["isolationName"] != row["isolationName"]:
+            deny("ENTRY_IDENTITY_CHANGED", row["absolutePath"], "隔离映射与本次确认不一致，请重新确认")
+        if row["type"] == "file":
+            file_groups.setdefault(os.path.dirname(row["absolutePath"]), []).append(row)
+        else:
+            directories.append(row)
+    stage["check"] = time.monotonic() - started
+    stats = {"files": 0, "entries": 0, "rmdirs": 0, "renames": 0}
+    receipts = []
+    started = time.monotonic()
+    # Phase 2a: directories — isolate by rename (never overwriting), then
+    # remove only the new name. The original path is never deleted directly.
+    for row in directories:
+        full = row["absolutePath"]
+        leaf = os.path.basename(full)
+        child = parent_cd(root, full)
+        if row["archived"]:
+            fast_tree_remove(root, full, True, stats)
+            if os.path.lexists("./" + leaf):
+                deny("TARGET_STILL_EXISTS", full)
+            write_control_json(root, isolation_control_rel(row["relativePath"]),
+                               {"schemaVersion": 1, "state": "deleted", "operationId": operation_id,
+                                "destination": row["relativePath"], "deletedAt": time.time()})
+            receipts.append({"relativePath": row["relativePath"], "mode": "registered-isolation", "phase": "completed"})
+            continue
+        iso = row["isolationName"]
+        iso_relative = row["relativePath"][:len(row["relativePath"]) - len(leaf)] + iso
+        if os.path.lexists("./" + iso):
+            deny("ISOLATION_NAME_TAKEN", os.path.join(os.path.dirname(full), iso))
+        no_replace(child, "./" + iso)
+        stats["renames"] += 1
+        after = os.lstat("./" + iso)
+        if str(after.st_ino) != row["inode"] or str(after.st_dev) != row["device"] or not stat.S_ISDIR(after.st_mode):
+            deny("MOVE_VERIFICATION_FAILED", os.path.join(os.path.dirname(full), iso))
+        iso_full = os.path.join(os.path.dirname(full), iso)
+        fast_tree_remove(root, iso_full, False, stats)
+        if os.path.lexists("./" + iso):
+            deny("TARGET_STILL_EXISTS", iso_full)
+        receipts.append({"relativePath": row["relativePath"], "mode": "isolate-then-delete", "isolationRelativePath": iso_relative,
+                         "originalPathRecreated": os.path.lexists("./" + leaf), "phase": "completed"})
+    # Phase 2b: scattered files, grouped by their verified direct parent;
+    # one physical parent-cd per group, one entry lstat + unlink per file.
+    for parent in sorted(file_groups):
+        rows = file_groups[parent]
+        parent_cd(root, rows[0]["absolutePath"])
+        for row in rows:
+            leaf = os.path.basename(row["absolutePath"])
+            info = os.lstat("./" + leaf)
+            if not stat.S_ISREG(info.st_mode):
+                deny("TYPE_CHANGED", row["absolutePath"])
+            if str(info.st_ino) != row["inode"] or str(info.st_dev) != row["device"]:
+                deny("ENTRY_IDENTITY_CHANGED", row["absolutePath"], "所选文件在确认后被替换，请重新确认")
+            os.unlink("./" + leaf)
+            stats["files"] += 1
+            progress_heartbeat()
+            if row["archived"]:
+                write_control_json(root, isolation_control_rel(row["relativePath"]),
+                                   {"schemaVersion": 1, "state": "deleted", "operationId": operation_id,
+                                    "destination": row["relativePath"], "deletedAt": time.time()})
+        receipts.append({"parent": os.path.relpath(parent, root).replace(os.sep, "/"), "removedFiles": len(rows), "phase": "completed"})
+    stage["mutate"] = time.monotonic() - started
+    started = time.monotonic()
+    groups = len(file_groups) + len(directories)
+    metrics = {"selected": len(entries), "alreadyDeleted": len(already), "groups": groups, "renames": stats["renames"],
+               "unlinkedFiles": stats["files"], "treeEntriesRemoved": stats["entries"], "treeDirsRemoved": stats["rmdirs"],
+               "mountReads": _MOUNT_CACHE["reads"] - mount_reads,
+               "stages": {"entryCheckMs": round(stage["check"] * 1000, 1), "mutateMs": round(stage["mutate"] * 1000, 1),
+                          "confirmMs": round((time.monotonic() - started) * 1000, 1)}}
+    return {"ok": True, "rootIdentity": identity,
+            "receipt": {"operationId": operation_id, "action": "delete-fast", "phase": "completed",
+                        "metrics": metrics, "receipts": receipts[:220], "alreadyDeleted": already[:220]}}
+
+
 def top_identity(full, expected_type):
     st = os.lstat(full)
     actual = "directory" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "unknown"
@@ -1519,9 +1790,20 @@ def main(request):
     action = request["action"]
     if action == "runtime-prepare":
         return runtime_prepare(request)
+    if action == "batch-inspect":
+        return batch_inspect(root, identity, request)
+    if action == "batch-verify":
+        return batch_verify(root, identity, request)
+    if action == "delete-fast":
+        return delete_fast(root, identity, request)
     if request.get("target", {}).get("authorizationMode") == "confirmed_paths":
         if action in ("move", "restore", "settle", "isolate") or action in ("managed-start", "managed-observe") and request.get("cleanupAction") != "delete":
             deny("INVALID_AUTHORIZATION_MODE")
+        if action == "delete" or action == "managed-start" and request.get("cleanupAction") == "delete":
+            # v1.9 keeps exactly one confirmed-path production executor; the old
+            # frozen-inventory and managed-window deletion routes are retired
+            # instead of silently falling back to them.
+            deny("UPDATE_REQUIRED", "", "确认路径永久删除已切换为入口绑定的隔离式快速链（delete-fast），请更新 SimpleSFTP 端后重试")
     if action == "managed-observe":
         return managed_observe(request)
     if action == "managed-start":
@@ -1793,7 +2075,7 @@ if __name__ == "__main__":
         raw = sys.stdin.buffer.read(MAX_CLEANUP_REQUEST_BYTES + 1).rstrip(b"\x00")
         request = decode_request(raw)
         action = request.get("action")
-        if action in ("move", "delete", "restore", "settle", "isolate", "managed-start"):
+        if action in ("move", "delete", "restore", "settle", "isolate", "managed-start", "delete-fast"):
             checked_root, _ = root_guard(request["root"])
         if action == "managed-start":
             # C2: the root lock stays a short control transaction covering the
@@ -1802,6 +2084,20 @@ if __name__ == "__main__":
             while True:
                 try:
                     lock = mutation_lock(checked_root)
+                    break
+                except GuardError as error:
+                    if error.code != "OPERATION_BUSY" or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.02)
+        elif action == "delete-fast":
+            entries = request.get("entries") or []
+            rels = [entry.get("relativePath") for entry in entries if isinstance(entry, dict)] \
+                if isinstance(entries, list) else []
+            rels = [value for value in rels if isinstance(value, str) and value]
+            deadline = time.monotonic() + 3
+            while True:
+                try:
+                    locks = acquire_target_locks(checked_root, rels)
                     break
                 except GuardError as error:
                     if error.code != "OPERATION_BUSY" or time.monotonic() >= deadline:

@@ -4981,7 +4981,7 @@ async function cleanupFileTransport(request) {
     output = await new Promise((resolve, reject) => {
       const child = spawn(process.platform === "win32" ? "python" : "python3", ["-B", "-X", "utf8", path.join(__dirname, "cleanup-files.py")], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
       let text = "";
-      const monitor = watchTransferProcess(child, reject, true, [], request.action !== "inspect" && request.action !== "check");
+      const monitor = watchTransferProcess(child, reject, true, [], !["inspect", "check", "batch-inspect", "batch-verify"].includes(request.action));
       child.stdout.on("data", chunk => { text += chunk.toString("utf8"); if (text.length > 16 * 1024 * 1024) { child.kill(); reject(new Error("INVENTORY_LIMIT")); } });
       child.on("error", error => { monitor.dispose(); reject(error); });
       child.on("close", code => { monitor.dispose(); code === 0 ? resolve(text) : reject(new Error("LOCAL_CLEANUP_FAILED")); });
@@ -5001,7 +5001,7 @@ async function cleanupFileTransport(request) {
     if (knownIdentity) runtime.request.rootIdentity = knownIdentity;
     const programPath = node.root.replace(/\/+$/, "") + "/" + runtime.programRelativePath;
     const command = remoteRuntimeCommand(programPath, shellQuote);
-    const options = { remoteMutation: !["check", "inspect", "inventory", "verify", "managed-observe"].includes(request.action), stage: "PLAN 安全文件操作" };
+    const options = { remoteMutation: !["check", "inspect", "inventory", "verify", "managed-observe", "batch-inspect", "batch-verify"].includes(request.action), stage: "PLAN 安全文件操作" };
     const missingProgram = error => /can't open file|No such file or directory|RUNTIME_PROGRAM_MISSING|RUNTIME_CODE_MISMATCH/i.test(String(error?.stderr || "") + String(error?.message || ""));
     if (!remoteRuntimePrograms.has(runtime.cacheKey)) await ensureRemoteRuntimeProgram(source, runtime);
     try {
