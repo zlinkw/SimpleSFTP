@@ -10,7 +10,8 @@ test('confirmed whole-subtree deletion includes nested git, preserves main git a
 });
 
 test('real engine fast preview stays entry-only read-only; protected descendants arm at execution',async()=>{
- const root=fs.mkdtempSync(path.join(os.tmpdir(),'nested-error-path-')),relativePath='repos/cpsc',blocked=path.join(root,'repos','cpsc','clean_dir');fs.mkdirSync(blocked,{recursive:true});
+ // realpathSync, like the engine's root identity check, so the expectation is byte-exact.
+ const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'nested-error-path-'))),relativePath='repos/cpsc',blocked=path.join(root,'repos','cpsc','clean_dir');fs.mkdirSync(blocked,{recursive:true});
  const api=new CleanupFileApi({storageRoot:path.join(root,'state'),transport:async request=>{
   assert.ok(request.action==='batch-inspect','confirmed fast preview must stay on the read-only entry route');
   const result=spawnSync(process.platform==='win32'?'python':'python3',['-B','-X','utf8',path.resolve(__dirname,'../cleanup-files.py')],{input:JSON.stringify(request),encoding:'utf8',timeout:10000,windowsHide:true});
@@ -18,7 +19,16 @@ test('real engine fast preview stays entry-only read-only; protected descendants
  }});
  const preview=await api.preview({node:{kind:'local',root},action:'delete',authorizationMode:'confirmed_paths',targets:[{relativePath,type:'directory',destination:'clean_dir/'+relativePath}]});
  // v1.9 entry-only preview: no descendant walk, so no preview-time refusal.
- assert.equal(preview.targets.length,1);assert.ok(preview.targets[0].absolutePath.endsWith('/repos/cpsc'));
+ // The engine builds absolutePath with its own platform path_guard for a LOCAL
+ // node, so the expectation follows the host separator exactly (never a fixed
+ // slash suffix, never a loosened includes/last-name check).
+ assert.equal(preview.targets.length,1);assert.equal(preview.targets[0].absolutePath,path.join(root,'repos','cpsc'));
+ // Deterministic host-model contrast (model only, not a real Windows run):
+ // the old fixed-slash suffix matched the POSIX shape but would reject the
+ // win32-shaped host path, while the exact host join matches both platforms.
+ assert.ok(!path.win32.join('C:\\fixture','repos','cpsc').endsWith('/repos/cpsc')
+   && path.win32.join('C:\\fixture','repos','cpsc')==='C:\\fixture\\repos\\cpsc'
+   && path.posix.join('/fixture','repos','cpsc')==='/fixture/repos/cpsc');
  // Preview performed zero filesystem writes and opened no isolation.
  assert.ok(fs.readdirSync(path.join(root,'repos','cpsc')).includes('clean_dir'));
  assert.equal(fs.readdirSync(blocked).length,0);
