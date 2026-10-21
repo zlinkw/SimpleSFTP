@@ -32,7 +32,7 @@ const { execFile, spawn } = require("child_process");
 const { resolveWorkspaceLocation } = require("./workspace-path.js");
 const { toTarPath: tarEntryPath, writeTarEntriesToStream } = require("./tar-writer.js");
 const { LocalApiServer, confirmationRequired, currentApiRequestContext } = require("./api-server.js");
-const { CleanupFileApi, fail: cleanupFail, runtimePrepareRequest, remoteRuntimePrepareCommand, remoteRuntimeCommand } = require("./cleanup-file-api");
+const { CleanupFileApi, fail: cleanupFail, transferBusySnapshot, runtimePrepareRequest, remoteRuntimePrepareCommand, remoteRuntimeCommand } = require("./cleanup-file-api");
 let cleanupFileApi;
 const {
   HostOperationLeaseConflictError,
@@ -281,8 +281,10 @@ function startLocalApiServer(context) {
     storageRoot: path.join(context.globalStorageUri.fsPath, "cleanup-operations"),
     transport: cleanupFileTransport,
     activity: async () => {
-      if ([...activeTransfers.values()].some(row => !["completed", "failed", "cancelled"].includes(row.status))
-        || activeUploadOperations.size || uploadQueues.size) cleanupFail("ACTIVE_TRANSFER");
+      // 守卫与只读 transfers.list 共用同一份纯内存投影；拒绝那一刻把快照放进 ACTIVE_TRANSFER 错误里，
+      // 配套侧因此能看到“是哪一类忙、各多少条”，而集合之后清空也不会把未知说成当时活跃。
+      const snapshot = currentTransferBusySnapshot();
+      if (snapshot.busy) cleanupFail("ACTIVE_TRANSFER", "ACTIVE_TRANSFER", { busy: snapshot });
     },
     lease: (node, targets, work) => withFileResourceLease("PLAN 安全清理", node.root, [""],
       node.kind === "local" ? "local" : remoteResourceServer({ host: node.host, port: node.port }), work),
@@ -3653,6 +3655,16 @@ function listActiveTransfers() {
   }));
 }
 
+/** 守卫与只读 transfers.list 的唯一忙投影入口：同步、纯内存，不加租约、不碰远端、不写状态。
+ *  活跃条件与 0.2.102 逐项等价（非终态传输 / 上传操作 / 保存时上传排队队列），未知状态继续按忙处理。 */
+function currentTransferBusySnapshot(observedAt = new Date().toISOString()) {
+  return transferBusySnapshot({
+    transfers: [...activeTransfers.values()],
+    uploadOperations: [...activeUploadOperations.values()],
+    uploadQueueKeys: [...uploadQueues.keys()],
+  }, { observedAt, instanceId: currentTransferApiInstanceId() });
+}
+
 function currentTransferApiInstanceId() {
   return localApiServer && typeof localApiServer.instanceId === "function" && localApiServer.instanceId()
     ? localApiServer.instanceId()
@@ -4400,7 +4412,9 @@ function createLocalApiMethods() {
     },
     "transfers.list": async () => {
       const operationState = await listTransferOperationState();
-      return { ok: true, instanceId: operationState.instanceId, transfers: listActiveTransfers(), operations: operationState.operations, settledOperations: operationState.settledOperations };
+      // 仍是只读路由：只在内存上算一次守卫同款投影，不加租约、不连远端、不写队列。
+      return { ok: true, instanceId: operationState.instanceId, transfers: listActiveTransfers(), operations: operationState.operations,
+        settledOperations: operationState.settledOperations, busy: currentTransferBusySnapshot() };
     },
     "transfers.reconcile": async (params = {}) => reconcileTransferOperation(params),
     "transfers.cancel": async (params = {}) => {

@@ -188,8 +188,69 @@ function remoteRuntimeCommand(programPath, shellQuote) {
   if (command.length > REMOTE_COMMAND_BUDGET) fail("REMOTE_COMMAND_TOO_LARGE");
   return command;
 }
+// One synchronous, memory-only projection of the three transfer-activity sets. The cleanup guard and the read-only
+// transfers.list route must agree on exactly this value, so the predicate is written once here instead of twice.
+// A status that is not one of the terminal names stays busy (fail closed). Nothing here reads the filesystem, the
+// network or any ledger, and a raw workspace key never leaves the projection: queue keys travel as one-way hashes only.
+const TERMINAL_TRANSFER_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const MAX_BUSY_ROWS = 12;
+// 文本化只用于输出：恶意/异常 toString 不得让守卫抛出别的错误码，兜底成空串后仍按原值判忙。
+const busyText = (value, max = 40) => { try { return String(value ?? "").slice(0, max).replace(/[\u0000-\u001f]/g, " "); } catch { return ""; } };
+// 终态判定必须用 status 原值：0.2.102 用的是 ["completed","failed","cancelled"].includes(row.status)（SameValueZero），
+// new String("completed")、自定义 toString 的 {toString:()=>"completed"} 在原版里都不算终态，判忙之前绝不能先转成文本。
+const busyStatusText = status => typeof status === "string" ? busyText(status, 32) || "unknown" : "unknown";
+// 队列键是一向哈希：无法文本化的键也要计入忙（原版 uploadQueues.size 无条件计数），但绝不外泄原值。
+const queueKeyHash = key => { let text; try { text = String(key).toLowerCase(); } catch { text = "unstringifiable:" + typeof key; }
+  return crypto.createHash("sha256").update(text).digest("hex").slice(0, 12); };
+function transferBusySnapshot(collections = {}, identity = {}) {
+  const activeTransfers = [...(collections.transfers || [])]
+    // Set.has(原值) 与原版 Array.includes(原值) 同语义；缺 row.status（含 null 行）按非终态计忙，比原版崩溃更保守。
+    .filter(row => !TERMINAL_TRANSFER_STATUSES.has(row && row.status))
+    .map(row => ({ id: busyText(row.id), status: busyStatusText(row.status),
+      ...(row.operation ? { operation: busyText(row.operation) } : {}), ...(row.phase ? { phase: busyText(row.phase) } : {}) }));
+  const uploadOperations = [...(collections.uploadOperations || [])]
+    .map(row => ({ id: busyText(row.id), ...(row.stage ? { stage: busyText(row.stage) } : {}) }));
+  const keys = [...(collections.uploadQueueKeys || [])];
+  const snapshot = {
+    schemaVersion: 1,
+    observedAt: busyText(identity.observedAt, 40),
+    instanceId: busyText(identity.instanceId, 60),
+    busy: activeTransfers.length > 0 || uploadOperations.length > 0 || keys.length > 0,
+    activeTransferCount: activeTransfers.length,
+    activeTransfers: activeTransfers.slice(0, MAX_BUSY_ROWS),
+    uploadOperationCount: uploadOperations.length,
+    uploadOperations: uploadOperations.slice(0, MAX_BUSY_ROWS),
+    uploadQueueCount: keys.length,
+    uploadQueues: { count: keys.length, keyHashes: keys.slice(0, MAX_BUSY_ROWS).map(queueKeyHash) },
+  };
+  if (activeTransfers.length > MAX_BUSY_ROWS || uploadOperations.length > MAX_BUSY_ROWS || keys.length > MAX_BUSY_ROWS) snapshot.truncated = true;
+  return snapshot;
+}
+// Only the projection's own shape may travel inside an error: an unrelated object can never smuggle extra fields.
+function busyEvidence(snapshot) {
+  if (!snapshot || typeof snapshot !== "object" || snapshot.schemaVersion !== 1) return undefined;
+  const row = (value, fields) => value && typeof value === "object"
+    ? Object.fromEntries(fields.filter(field => typeof value[field] === "string" && value[field]).map(field => [field, String(value[field]).slice(0, 40)])) : null;
+  const pick = (value, fields) => Array.isArray(value) ? value.map(item => row(item, fields)).filter(Boolean).slice(0, MAX_BUSY_ROWS) : [];
+  const queues = snapshot.uploadQueues && typeof snapshot.uploadQueues === "object" ? snapshot.uploadQueues : {};
+  const hashes = Array.isArray(queues.keyHashes) ? queues.keyHashes.filter(key => /^[0-9a-f]{6,64}$/.test(String(key))).map(String).slice(0, MAX_BUSY_ROWS) : [];
+  const counts = name => Number.isInteger(snapshot[name]) && snapshot[name] >= 0 ? snapshot[name] : undefined;
+  const evidence = {
+    schemaVersion: 1, observedAt: busyText(snapshot.observedAt, 40), instanceId: busyText(snapshot.instanceId, 60),
+    busy: snapshot.busy === true,
+    activeTransferCount: counts("activeTransferCount") ?? 0, activeTransfers: pick(snapshot.activeTransfers, ["id", "status", "operation", "phase"]),
+    uploadOperationCount: counts("uploadOperationCount") ?? 0, uploadOperations: pick(snapshot.uploadOperations, ["id", "stage"]),
+    uploadQueueCount: counts("uploadQueueCount") ?? counts("queueCount") ?? hashes.length,
+    uploadQueues: { count: counts("uploadQueueCount") ?? hashes.length, keyHashes: hashes },
+  };
+  if (snapshot.truncated === true) evidence.truncated = true;
+  return evidence;
+}
 function fail(code, message = code, details = {}) { const error = new Error(message); error.code = code; error.apiCode = code === "CONFIRM_REQUIRED" ? 2001 : 2010; error.apiData = { code };
   for (const key of ["blockingPath", "reason"]) if (typeof details[key] === "string" && details[key]) error.apiData[key] = details[key].slice(0, 4096);
+  // The refuse-moment busy snapshot travels with the refusal: a later idle projection must never overwrite what
+  // was actually in flight when the guard said no, and the caller never has to guess from a bare code string.
+  const busy = busyEvidence(details.busy); if (busy) error.apiData.busy = busy;
   // The engine's explicit batch-phase fact travels with the error: a retry is
   // only admissible when it proves the refused batch mutated nothing.
   if (typeof details.mutationStarted === "boolean") error.mutationStarted = details.mutationStarted;
@@ -851,4 +912,4 @@ class CleanupFileApi {
     return this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity, target, action: "verify", deleted: row.action === "delete" });
   }
 }
-module.exports = { CleanupFileApi, fail, hash, runtimePrepareRequest, runtimeProgramRelativePath, RUNTIME_PREPARE_BOOTSTRAP, remoteRuntimePrepareCommand, remoteRuntimeCommand, REMOTE_COMMAND_BUDGET };
+module.exports = { CleanupFileApi, fail, hash, transferBusySnapshot, busyEvidence, TERMINAL_TRANSFER_STATUSES, runtimePrepareRequest, runtimeProgramRelativePath, RUNTIME_PREPARE_BOOTSTRAP, remoteRuntimePrepareCommand, remoteRuntimeCommand, REMOTE_COMMAND_BUDGET };
