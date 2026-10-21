@@ -22,6 +22,8 @@ const strip = (text, label) => {
 };
 const activitySource = strip(slice('activity: async () => {', '\n    lease: (node, targets, work)', 'CleanupFileApi activity guard').replace(/^activity: /, ''), 'activity guard');
 const snapshotSource = slice('function currentTransferBusySnapshot(', '\n\nfunction currentTransferApiInstanceId', 'currentTransferBusySnapshot');
+// 0.2.104 起 activity 只是转调真实的 cleanupActivityGuard；守卫本体也取自生产源码，测试不重写谓词。
+const guardSource = strip(slice('function cleanupActivityGuard(', '\n\nfunction startLocalApiServer(', 'cleanupActivityGuard'), 'cleanupActivityGuard');
 const enqueueSource = slice('function enqueueWorkspaceUpload(', '\n\nasync function uploadChangedLocalFiles(', 'enqueueWorkspaceUpload');
 const listSource = strip(slice(String.fromCharCode(34) + 'transfers.list' + String.fromCharCode(34) + ': async () => {',
   ',\n    ' + String.fromCharCode(34) + 'transfers.reconcile', 'transfers.list handler')
@@ -33,9 +35,10 @@ function productionGuard(env) {
   const currentTransferBusySnapshot = new Function('activeTransfers', 'activeUploadOperations', 'uploadQueues', 'currentTransferApiInstanceId', 'transferBusySnapshot',
     snapshotSource + '\nreturn currentTransferBusySnapshot;')(collections.activeTransfers, collections.activeUploadOperations, collections.uploadQueues,
     collections.currentTransferApiInstanceId, transferBusySnapshot);
-  const activity = new Function('activeTransfers', 'activeUploadOperations', 'uploadQueues', 'currentTransferBusySnapshot', 'cleanupFail',
-    'return ' + activitySource)(collections.activeTransfers, collections.activeUploadOperations, collections.uploadQueues,
-    currentTransferBusySnapshot, fail);
+  // apiRouteController 在此固定 “无自身控制器”，等价于非 API 路由（如上传/下载）里的守卫调用。
+  const cleanupActivityGuard = new Function('currentTransferBusySnapshot', 'cleanupFail', 'apiRouteController',
+    guardSource + '\nreturn cleanupActivityGuard;')(currentTransferBusySnapshot, fail, { getStore: () => null });
+  const activity = new Function('cleanupActivityGuard', 'return ' + activitySource)(cleanupActivityGuard);
   const transfersList = new Function('listTransferOperationState', 'listActiveTransfers', 'currentTransferBusySnapshot',
     'return ' + listSource)(async () => ({ instanceId: '50924:test-instance', operations: [], settledOperations: [] }), () => [], currentTransferBusySnapshot);
   return Object.assign(collections, { activity, transfersList, currentTransferBusySnapshot });
@@ -137,7 +140,8 @@ test('拒绝瞬间的快照与之后集合变化区分开，事后空闲不得�
   const later = await guard.transfersList();
   assert.equal(later.busy.busy, false, '之后确实空闲了');
   assert.equal(error.apiData.busy.activeTransferCount, 1, '错误里的快照必须仍是拒绝那一刻的');
-  assert.deepEqual(error.apiData.busy.activeTransfers, [{ id: 't9', status: 'uploading', operation: 'upload.files', phase: 'transfer' }]);
+  assert.deepEqual(error.apiData.busy.activeTransfers, [{ id: 't9', status: 'uploading', operation: 'upload.files', phase: 'transfer', readOnlyObserver: false, selfAttempt: false }]);
+  assert.equal(error.apiData.busy.blockingTransferCount, 1, '未证明只读的传输必须计入阻断数量');
   assert.equal(Date.parse(error.apiData.busy.observedAt) <= Date.parse(later.busy.observedAt), true, '快照时间必须是不晚于后续观测的那一次');
   assert.notEqual(error.apiData.busy.busy, later.busy.busy, '同一实例的两次观测必须能分出当时忙与事后闲');
   assert.equal(error.apiData.busy.observedAt, error.apiData.busy.observedAt && guard.currentTransferBusySnapshot(error.apiData.busy.observedAt).observedAt,
@@ -166,7 +170,7 @@ test('忙快照只能是自己这份形状，任意对象不得借道进入错�
   const plain = (() => { try { fail('SOME_CODE'); } catch (error) { return error; } })();
   assert.equal('busy' in plain.apiData, false);
   const smuggled = (() => { try { fail('SOME_CODE', 'SOME_CODE', { busy: { schemaVersion: 1, evil: 'x', activeTransfers: [{ secret: 'D:/x', status: 'a'.repeat(500) }] } }); } catch (error) { return error; } })();
-  assert.deepEqual(smuggled.apiData.busy.activeTransfers, [{ status: 'a'.repeat(40) }], '未知字段必须被丢弃、字符串必须截断');
+  assert.deepEqual(smuggled.apiData.busy.activeTransfers, [{ status: 'a'.repeat(40), readOnlyObserver: false, selfAttempt: false }], '未知字段必须被丢弃、字符串必须截断，只读与自身豁免标记只能是白名单布尔');
   assert.equal('evil' in smuggled.apiData.busy, false);
   assert.equal(busyEvidence({ schemaVersion: 2 }), undefined);
   const withReason = (() => { try { fail('ACTIVE_TRANSFER', 'ACTIVE_TRANSFER', { reason: '原原因', busy: transferBusySnapshot({ uploadQueueKeys: ['k'] }, { observedAt: '2026-10-21T07:17:18.000Z', instanceId: 'i' }) }); } catch (error) { return error; } })();

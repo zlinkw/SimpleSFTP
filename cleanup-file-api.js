@@ -203,11 +203,19 @@ const busyStatusText = status => typeof status === "string" ? busyText(status, 3
 const queueKeyHash = key => { let text; try { text = String(key).toLowerCase(); } catch { text = "unstringifiable:" + typeof key; }
   return crypto.createHash("sha256").update(text).digest("hex").slice(0, 12); };
 function transferBusySnapshot(collections = {}, identity = {}) {
-  const activeTransfers = [...(collections.transfers || [])]
+  // 只读观测身份只认控制器携带的生产事实（路由证明的 readObserver 且明确非远端变更）；
+  // 缺任一项、值为 null 或状态异常的行都继续按写入计忙，绝不因为名字像只读就放行。
+  const readOnlyObserver = row => Boolean(row) && row.readObserver === true && row.remoteMutation === false;
+  // 自身豁免只认调用上下文里由服务端路由登记的那一个控制器对象（对象同一性）。
+  // 控制器 id 由服务端生成、operationId 可被客户端 _operationId 指定，因此两者都不作为豁免依据；
+  // 缺上下文、非同一对象或其他任何在途行一律继续按写入计忙（fail closed）。
+  const self = collections.self && typeof collections.self === "object" ? collections.self : null;
+  const nonTerminalRows = [...(collections.transfers || [])]
     // Set.has(原值) 与原版 Array.includes(原值) 同语义；缺 row.status（含 null 行）按非终态计忙，比原版崩溃更保守。
     .filter(row => !TERMINAL_TRANSFER_STATUSES.has(row && row.status))
-    .map(row => ({ id: busyText(row.id), status: busyStatusText(row.status),
-      ...(row.operation ? { operation: busyText(row.operation) } : {}), ...(row.phase ? { phase: busyText(row.phase) } : {}) }));
+    .map(row => ({ readOnlyObserver: readOnlyObserver(row), selfAttempt: Boolean(self) && row === self, id: busyText(row && row.id), status: busyStatusText(row && row.status),
+      ...(row && row.operation ? { operation: busyText(row.operation) } : {}), ...(row && row.phase ? { phase: busyText(row.phase) } : {}) }));
+  const blockingTransferCount = nonTerminalRows.filter(row => row.readOnlyObserver !== true && row.selfAttempt !== true).length;
   const uploadOperations = [...(collections.uploadOperations || [])]
     .map(row => ({ id: busyText(row.id), ...(row.stage ? { stage: busyText(row.stage) } : {}) }));
   const keys = [...(collections.uploadQueueKeys || [])];
@@ -215,15 +223,20 @@ function transferBusySnapshot(collections = {}, identity = {}) {
     schemaVersion: 1,
     observedAt: busyText(identity.observedAt, 40),
     instanceId: busyText(identity.instanceId, 60),
-    busy: activeTransfers.length > 0 || uploadOperations.length > 0 || keys.length > 0,
-    activeTransferCount: activeTransfers.length,
-    activeTransfers: activeTransfers.slice(0, MAX_BUSY_ROWS),
+    // 忙判定只认真正可能改动文件系统的传输（写入/未知状态）；被生产事实证明的只读观测
+    // （清理预览/巡检、代码清单等）不再互相对撞，但逐条保留在快照里，当时在途的事实不会被抹掉。
+    busy: blockingTransferCount > 0 || uploadOperations.length > 0 || keys.length > 0,
+    activeTransferCount: nonTerminalRows.length,
+    blockingTransferCount,
+    observerTransferCount: nonTerminalRows.filter(row => row.readOnlyObserver === true).length,
+    selfAttemptCount: nonTerminalRows.filter(row => row.selfAttempt === true).length,
+    activeTransfers: nonTerminalRows.slice(0, MAX_BUSY_ROWS),
     uploadOperationCount: uploadOperations.length,
     uploadOperations: uploadOperations.slice(0, MAX_BUSY_ROWS),
     uploadQueueCount: keys.length,
     uploadQueues: { count: keys.length, keyHashes: keys.slice(0, MAX_BUSY_ROWS).map(queueKeyHash) },
   };
-  if (activeTransfers.length > MAX_BUSY_ROWS || uploadOperations.length > MAX_BUSY_ROWS || keys.length > MAX_BUSY_ROWS) snapshot.truncated = true;
+  if (nonTerminalRows.length > MAX_BUSY_ROWS || uploadOperations.length > MAX_BUSY_ROWS || keys.length > MAX_BUSY_ROWS) snapshot.truncated = true;
   return snapshot;
 }
 // Only the projection's own shape may travel inside an error: an unrelated object can never smuggle extra fields.
@@ -235,10 +248,18 @@ function busyEvidence(snapshot) {
   const queues = snapshot.uploadQueues && typeof snapshot.uploadQueues === "object" ? snapshot.uploadQueues : {};
   const hashes = Array.isArray(queues.keyHashes) ? queues.keyHashes.filter(key => /^[0-9a-f]{6,64}$/.test(String(key))).map(String).slice(0, MAX_BUSY_ROWS) : [];
   const counts = name => Number.isInteger(snapshot[name]) && snapshot[name] >= 0 ? snapshot[name] : undefined;
+  const transferRow = value => { const base = row(value, ["id", "status", "operation", "phase"]); if (!base) return null;
+    // 只读观测标记是白名单里的布尔事实：外部对象无法伪造出别的字段。
+    base.readOnlyObserver = value.readOnlyObserver === true; base.selfAttempt = value.selfAttempt === true; return base; };
+  const transferRows = Array.isArray(snapshot.activeTransfers) ? snapshot.activeTransfers.map(transferRow).filter(Boolean).slice(0, MAX_BUSY_ROWS) : [];
   const evidence = {
     schemaVersion: 1, observedAt: busyText(snapshot.observedAt, 40), instanceId: busyText(snapshot.instanceId, 60),
     busy: snapshot.busy === true,
-    activeTransferCount: counts("activeTransferCount") ?? 0, activeTransfers: pick(snapshot.activeTransfers, ["id", "status", "operation", "phase"]),
+    activeTransferCount: counts("activeTransferCount") ?? transferRows.length,
+    blockingTransferCount: counts("blockingTransferCount") ?? transferRows.filter(item => item.readOnlyObserver !== true).length,
+    observerTransferCount: counts("observerTransferCount") ?? transferRows.filter(item => item.readOnlyObserver === true).length,
+    selfAttemptCount: counts("selfAttemptCount") ?? transferRows.filter(item => item.selfAttempt === true).length,
+    activeTransfers: transferRows,
     uploadOperationCount: counts("uploadOperationCount") ?? 0, uploadOperations: pick(snapshot.uploadOperations, ["id", "stage"]),
     uploadQueueCount: counts("uploadQueueCount") ?? counts("queueCount") ?? hashes.length,
     uploadQueues: { count: counts("uploadQueueCount") ?? hashes.length, keyHashes: hashes },

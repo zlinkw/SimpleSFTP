@@ -21,6 +21,9 @@ const compressionSampleScript = require("node:fs").readFileSync(require("node:pa
 const compressionHistory = new CompressionHistory();
 let compressionProbeTransport = null;
 const transferContext = new AsyncLocalStorage();
+// 清理守卫需要判断「当前这次调用是不是它自己」；排队中的请求可能丢失 transferContext 异步链，
+// 因此在真正执行 handler 的那一层再登记一次控制器对象（仅进程内事实，不落盘、不出现在响应里）。
+const apiRouteController = new AsyncLocalStorage();
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -276,16 +279,21 @@ function activate(context) {
   startLocalApiServer(context);
 }
 
+
+function cleanupActivityGuard(selfController = apiRouteController.getStore()) {
+  // 守卫与只读 transfers.list 共用同一份纯内存投影；拒绝那一刻把快照放进 ACTIVE_TRANSFER 错误里。
+  // busy 已经排除被生产事实证明的只读观测，也排除当前调用自己的那一个控制器（自身执行隔离不得
+  // 把自己的 files.cleanup.execute 当成别人的忙）；其他任何在途传输仍按真实阻断处理。
+  const snapshot = currentTransferBusySnapshot(new Date().toISOString(), selfController);
+  if (snapshot.busy) cleanupFail("ACTIVE_TRANSFER", "ACTIVE_TRANSFER", { busy: snapshot });
+  return snapshot;
+}
+
 function startLocalApiServer(context) {
   cleanupFileApi = new CleanupFileApi({
     storageRoot: path.join(context.globalStorageUri.fsPath, "cleanup-operations"),
     transport: cleanupFileTransport,
-    activity: async () => {
-      // 守卫与只读 transfers.list 共用同一份纯内存投影；拒绝那一刻把快照放进 ACTIVE_TRANSFER 错误里，
-      // 配套侧因此能看到“是哪一类忙、各多少条”，而集合之后清空也不会把未知说成当时活跃。
-      const snapshot = currentTransferBusySnapshot();
-      if (snapshot.busy) cleanupFail("ACTIVE_TRANSFER", "ACTIVE_TRANSFER", { busy: snapshot });
-    },
+    activity: async () => { cleanupActivityGuard(); },
     lease: (node, targets, work) => withFileResourceLease("PLAN 安全清理", node.root, [""],
       node.kind === "local" ? "local" : remoteResourceServer({ host: node.host, port: node.port }), work),
   });
@@ -295,20 +303,7 @@ function startLocalApiServer(context) {
     preferredPort: 19766,
     discoveryPath: path.join(APPDATA, "SimpleSFTP", "api.json"),
     methods: createLocalApiMethods(),
-    methodOptions: {
-      "agents.lifecycle": { actions: ["inspect", "ensure", "stop", "restart", "migrate"], independentService: 1, controlStrategy: "assigned_tmux_window", noPidSignals: true, runtimeHashProof: true, inspectZeroWrites: true, schedulerRuntimeEvidence: 1, localTunnelRequired: false, activeTasksBlockRestart: false, restartPreservesTasks: true, researchEnvironmentManagement: "external", agentResearchEnvironmentValidation: false, legacyMigration: { explicitFrozenDigest: true, noActiveJobs: false, preservesState: true } },
-      "files.cleanup.inspect": { readOnly: true, zeroWrites: true },
-      "files.cleanup.observeBatch": { readOnly: true, zeroWrites: true, maxTargets: 5000, batchCleanupObservation: 1, readConcurrency: [1, 2] },
-      "files.cleanup.check": { readOnly: true, zeroWrites: true, receiptOnly: true, automaticExecution: false },
-      "files.cleanup.verify": { readOnly: true, completedReceiptRequired: true },
-      "files.cleanup.settle": { frozenApprovalRequired: true, receiptOnly: true, startsNewMoves: false },
-      "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: 1, requiredInputGuard: 1, registeredIsolationDeletion: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
-      "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
-      "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1, tmuxSessionPrefix: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1 },
-      "sync.projectInventory": { scopeTransport: "stdin", maxScopePaths: 5000, maxScopeBytes: 1048576, idlePolicy: "observe-filesystem", scopedTraversal: "direct-roots-v1", codeInventoryLane: 1, capacityTiming: 1, metadataOnly: 1, contentIdentity: 1 },
-      "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
-      "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, memoryWrapperResults: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024, memoryReadLane: 1, capacityTiming: 1 },
-    },
+    methodOptions: API_METHOD_CAPABILITIES,
   });
   localApiServer = server;
   context.subscriptions.push({
@@ -1687,6 +1682,25 @@ async function syncServerToServerBatch(options = {}) {
 
 // Streaming archives never buffer the batch; the byte limit bounds retry/staging cost.
 const FPSYNC_MAX_BATCH_BYTES = 512 * 1024 * 1024;
+
+// 对外能力表与清理守卫的只读身份判定共用同一份声明：只读方法只能在这里显式声明，
+// 守卫不会因为方法名看起来像只读就放行；没有声明的方法一律按可能写入计忙（fail closed）。
+const API_METHOD_CAPABILITIES = {
+      "agents.lifecycle": { actions: ["inspect", "ensure", "stop", "restart", "migrate"], independentService: 1, controlStrategy: "assigned_tmux_window", noPidSignals: true, runtimeHashProof: true, inspectZeroWrites: true, schedulerRuntimeEvidence: 1, localTunnelRequired: false, activeTasksBlockRestart: false, restartPreservesTasks: true, researchEnvironmentManagement: "external", agentResearchEnvironmentValidation: false, legacyMigration: { explicitFrozenDigest: true, noActiveJobs: false, preservesState: true } },
+      "files.cleanup.inspect": { readOnly: true, zeroWrites: true },
+      "files.cleanup.observeBatch": { readOnly: true, zeroWrites: true, maxTargets: 5000, batchCleanupObservation: 1, readConcurrency: [1, 2] },
+      "files.cleanup.check": { readOnly: true, zeroWrites: true, receiptOnly: true, automaticExecution: false },
+      "files.cleanup.verify": { readOnly: true, completedReceiptRequired: true },
+      "files.cleanup.settle": { frozenApprovalRequired: true, receiptOnly: true, startsNewMoves: false },
+      "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: 1, requiredInputGuard: 1, registeredIsolationDeletion: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
+      "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
+      "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1, tmuxSessionPrefix: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1 },
+      "sync.projectInventory": { scopeTransport: "stdin",
+        readOnly: true, ownCacheWritesOnly: true, maxScopePaths: 5000, maxScopeBytes: 1048576, idlePolicy: "observe-filesystem", scopedTraversal: "direct-roots-v1", codeInventoryLane: 1, capacityTiming: 1, metadataOnly: 1, contentIdentity: 1 },
+      "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
+      "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, memoryWrapperResults: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024, memoryReadLane: 1, capacityTiming: 1 },
+    };
+
 const FPSYNC_PARALLEL_STREAMS = 2;
 
 function partitionTransferPaths(paths, singleStreamFiles = 80, parallelSlots = 4, fileSizes, maxBytes = Infinity) {
@@ -3504,7 +3518,7 @@ function nextTransferId(operation) {
   return `transfer-${Date.now()}-${transferSequence}-${String(operation || "").replace(/[^\w.-]+/g, "-")}`;
 }
 
-function createTransferController({ id, operation, localPath, remotePath, host, observeOnlyIdle = true }) {
+function createTransferController({ id, operation, localPath, remotePath, host, observeOnlyIdle = true, readObserver = false, remoteMutation = false }) {
   const listeners = new Set();
   const progressListeners = new Set();
   let cancelled = false;
@@ -3630,6 +3644,9 @@ function createTransferController({ id, operation, localPath, remotePath, host, 
   };
   const parentController = transferContext.getStore();
   const parentCancellation = parentController?.onCancel((reason) => controller.cancel(reason));
+  // 只读观测身份在注册那一刻随控制器一起固定；未显式证明的控制器一律按可能写入处理。
+  controller.readObserver = readObserver === true;
+  controller.remoteMutation = remoteMutation === true;
   activeTransfers.set(controller.id, controller);
   if (parentController?.status === "cancelled") controller.cancel("上层操作已取消");
   return controller;
@@ -3657,8 +3674,9 @@ function listActiveTransfers() {
 
 /** 守卫与只读 transfers.list 的唯一忙投影入口：同步、纯内存，不加租约、不碰远端、不写状态。
  *  活跃条件与 0.2.102 逐项等价（非终态传输 / 上传操作 / 保存时上传排队队列），未知状态继续按忙处理。 */
-function currentTransferBusySnapshot(observedAt = new Date().toISOString()) {
+function currentTransferBusySnapshot(observedAt = new Date().toISOString(), selfController = null) {
   return transferBusySnapshot({
+    self: selfController,
     transfers: [...activeTransfers.values()],
     uploadOperations: [...activeUploadOperations.values()],
     uploadQueueKeys: [...uploadQueues.keys()],
@@ -4562,10 +4580,14 @@ function createLocalApiMethods() {
       const metadataRead = (READ_ONLY_SETTLEMENT_METHODS.includes(name) && (name !== "sync.downloadMappedPaths" || params.memoryOnly === true))
         || ["sync.projectTreeState", "sync.planLogPaths", "remote.listDirs"].includes(name) || cleanupRequest;
       if (!metadataRead) await beginTransferOperation(operationId, params._operationInstanceId, remoteMutation, params._requestKey || transferRequestKey(name, params), recoveryContext);
+      // 只读身份只能由生产事实成立：本次路由不进入持久写事务（metadataRead）、不是远端变更方法，
+      // 且对外能力表显式声明它只读。任一条件缺失就按普通（可能写入）传输计忙。
+      const readObserver = metadataRead === true && remoteMutation === false
+        && Boolean(API_METHOD_CAPABILITIES[name]) && API_METHOD_CAPABILITIES[name].readOnly === true;
       const controller = createTransferController({ id: controllerId, operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "",
         // No file operation is failed or killed because a filesystem call is slow.
         // Errors and explicit cancellation still settle through the original path.
-        observeOnlyIdle: true });
+        observeOnlyIdle: true, readObserver, remoteMutation });
       controller.operationId = operationId;
       const requestContext = currentApiRequestContext();
       const readSignal = requestContext?.readOnly ? requestContext.signal : undefined;
@@ -4581,7 +4603,7 @@ function createLocalApiMethods() {
         const metadataInventory = name === "sync.projectInventory" && params.metadataOnly === true;
         const pool = cleanupRead ? cleanupReadCapacity : metadataInventory ? metadataInventoryCapacity : memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
           : ["sync.projectTree", "sync.projectTreeState", "sync.projectFileStats"].includes(name) ? metadataTreeCapacity : transferCapacity;
-        const result = await transferContext.run(controller, () => withTransferCapacity(params, () => method(params), pool));
+        const result = await transferContext.run(controller, () => withTransferCapacity(params, () => apiRouteController.run(controller, () => method(params)), pool));
         if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认");
         if (name === "sync.projectInventory" || memoryRead) return { ...result, queryTiming: {
           capacityQueuedAt: controller.capacityQueuedAt, capacityGrantedAt: controller.capacityGrantedAt,
@@ -6902,6 +6924,7 @@ module.exports = {
     classifyTransportFailure,
     isRememberedTransferPath,
     listActiveTransfers,
+    currentTransferBusySnapshot, cleanupActivityGuard,
     refreshConnectTimeoutFromConfig,
     resolveCreateProjectTarget,
     updateWorkspaceTargetCore,
