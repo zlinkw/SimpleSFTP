@@ -1,8 +1,7 @@
-"""C3/C2 real-tmux contract (2/2): a cleanup window blocked by a real external
-subtree writer exits non-zero and stays preserved without any receipt; after
-the writer releases, the re-confirmed intent completes through its own window
-self-close, and a rebuilt same-name directory after completion is new data the
-replay never re-deletes. Fresh disposable temp root and own TMUX_TMPDIR."""
+"""C3/C2 current contract: managed isolation preserves its failed exact window
+under a real subtree writer; a re-confirmed isolation then self-closes. The
+retired managed confirmed-delete executor is refused before creating a window.
+Fresh disposable temp root and its own TMUX_TMPDIR only."""
 import hashlib, json, os, pathlib, subprocess, sys, tempfile, time
 
 engine_path = pathlib.Path(sys.argv[1]).resolve()
@@ -88,21 +87,34 @@ try:
     assert run_pinned({**isolate, "action": "managed-start"})["state"] == "requested"
     wait_state(isolate, "completed")
 
-    # A real external writer (held subtree chain lock, like a background
-    # deletion) makes the inner executor exit non-zero; the window must stay
-    # preserved without any completion receipt.
+    # The retired managed-delete chain must refuse before creating a window.
     archived = "clean_dir/" + BATCH + "/work_dirs/job-a"
-    holder = subprocess.Popen([sys.executable, "-B", str(helper), str(root), archived, "20"],
-                              stdout=subprocess.PIPE, text=True)
-    assert holder.stdout.readline().strip() == "LOCKED"
     delete_target = {"relativePath": archived, "destination": archived, "type": "directory",
                      "authorizationMode": "confirmed_paths", "activityEvidenceMode": "managed_tmux"}
     deleted_preview = run({"root": str(root), "action": "inspect", "target": dict(delete_target)})
-    delete = {"root": str(root), "rootIdentity": deleted_preview["rootIdentity"], "operationId": "del-job-a",
-              "cleanupAction": "delete",
-              "target": {**delete_target, **deleted_preview["target"], "destination": archived},
-              "tmuxSessionPrefix": "iso"}
-    assert run_pinned({**delete, "action": "managed-start"})["state"] == "requested"
+    before = panes()
+    refused = subprocess.run([sys.executable, "-B", str(pinned)], input=json.dumps({"root": str(root),
+        "rootIdentity": deleted_preview["rootIdentity"], "action": "managed-start", "operationId": "retired-delete",
+        "cleanupAction": "delete", "target": {**delete_target, **deleted_preview["target"]}, "tmuxSessionPrefix": "iso"}),
+        capture_output=True, text=True, timeout=6)
+    assert refused.returncode == 0, (refused.stdout, refused.stderr)
+    assert json.loads(refused.stdout)["error"]["code"] == "UPDATE_REQUIRED", refused.stdout
+    assert panes() == before and (root / archived).is_dir()
+
+    # A background writer blocks only job-b's source subtree. Isolation still
+    # uses its own bound window; permanent deletion now uses delete-fast.
+    busy_rel = "work_dirs/job-b"
+    busy_archive = "clean_dir/" + BATCH + "/" + busy_rel
+    (root / busy_rel).mkdir(parents=True)
+    (root / busy_rel / "old.bin").write_bytes(b"old")
+    holder = subprocess.Popen([sys.executable, "-B", str(helper), str(root), busy_rel, "20"], stdout=subprocess.PIPE, text=True)
+    assert holder.stdout.readline().strip() == "LOCKED"
+    busy_target = {"relativePath": busy_rel, "destination": busy_archive, "archiveBatch": BATCH,
+                   "type": "directory", "activityEvidenceMode": "managed_tmux"}
+    busy_preview = run({"root": str(root), "action": "inspect", "isolate": True, "target": dict(busy_target)})
+    busy = {"root": str(root), "rootIdentity": busy_preview["rootIdentity"], "operationId": "iso-job-b", "cleanupAction": "isolate",
+            "target": {**busy_target, **busy_preview["target"], "destination": busy_archive}, "tmuxSessionPrefix": "iso"}
+    assert run_pinned({**busy, "action": "managed-start"})["state"] == "requested"
     deadline = time.monotonic() + 5
     failed = None
     while time.monotonic() < deadline:
@@ -111,30 +123,30 @@ try:
             break
         time.sleep(.05)
     assert failed and failed[0][2] != "0", failed
-    observed = run({**delete, "action": "managed-observe"})
+    observed = run({**busy, "action": "managed-observe"})
     assert observed["state"] == "pending" and observed["executor"] and observed["executor"]["dead"], observed
-    assert (root / archived).is_dir()
+    assert (root / busy_rel / "old.bin").read_bytes() == b"old" and not (root / busy_archive).exists()
+    assert (root / archived / "weight.bin").read_bytes() == b"x" * 4096
     # The external writer releases; the same confirmed intent is re-previewed
     # and completes, closing its own window without any client close call.
     holder.kill()
     holder.wait(timeout=5)
-    second = run({"root": str(root), "action": "inspect", "target": dict(delete_target)})
-    delete2 = {**delete, "rootIdentity": second["rootIdentity"],
-               "target": {**delete_target, **second["target"], "destination": archived}}
-    assert run_pinned({**delete2, "action": "managed-start"})["state"] == "requested"
-    deleted = wait_state(delete2, "completed")
-    assert deleted.get("verifiedBy") == "completion_receipt" and deleted.get("irreversible") is True, deleted
-    assert not (root / archived).exists()
-    assert any(state["state"] == "deleted" for state in isolation_states()), isolation_states()
+    second = run({"root": str(root), "action": "inspect", "isolate": True, "target": dict(busy_target)})
+    retried = {**busy, "rootIdentity": second["rootIdentity"], "target": {**busy_target, **second["target"], "destination": busy_archive}}
+    assert run_pinned({**retried, "action": "managed-start"})["state"] == "requested"
+    completed = wait_state(retried, "completed")
+    assert completed.get("verifiedBy") == "completion_receipt", completed
+    assert not (root / busy_rel).exists() and (root / busy_archive / "old.bin").read_bytes() == b"old"
+    assert any(state["state"] == "isolated" and state["destination"] == busy_archive for state in isolation_states()), isolation_states()
     deadline = time.monotonic() + 4
     while time.monotonic() < deadline and live_bound():
         time.sleep(.05)
     assert not live_bound(), panes()
     # A rebuilt name after completion is new data: replay never re-deletes.
-    (root / archived).mkdir(parents=True)
-    (root / archived / "fresh.bin").write_text("keep", encoding="utf-8")
-    replay2 = run({**delete2, "action": "managed-observe"})
-    assert replay2["state"] == "completed" and (root / archived / "fresh.bin").exists(), replay2
+    (root / busy_rel).mkdir(parents=True)
+    (root / busy_rel / "fresh.bin").write_text("keep", encoding="utf-8")
+    replay2 = run({**retried, "action": "managed-observe"})
+    assert replay2["state"] == "completed" and (root / busy_rel / "fresh.bin").read_text() == "keep", replay2
     print(json.dumps({"ok": True, "failureWindowPreserved": True}))
 finally:
     for session in subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
