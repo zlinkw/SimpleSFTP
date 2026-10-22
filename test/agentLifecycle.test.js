@@ -15,4 +15,8 @@ test('restricted lifecycle transport allows no caller commands/env and preserves
  assert.equal(window.tmuxSession,'configured-worker-agent');assert.equal(window.tmuxWindow,'agent');
  assert.throws(()=>agentPayload({...p,tmuxSession:'user-gpu-0'}),/AGENT_TMUX_TARGET_INVALID/);
  assert.throws(()=>agentPayload({...p,tmuxWindow:'*'}),/AGENT_TMUX_TARGET_INVALID/);
+ const roots=agentPayload({...p,stateDir:'/srv/project/control',workerStateDir:'/srv/machine'});
+ assert.equal(roots.stateDir,'/srv/project/control');assert.equal(roots.workerStateDir,'/srv/machine');
+ assert.throws(()=>agentPayload({...p,stateDir:'relative'}),/AGENT_PATH_INVALID/);
+ assert.throws(()=>agentPayload({...p,workerStateDir:'/srv/../machine'}),/AGENT_PATH_INVALID/);
 });

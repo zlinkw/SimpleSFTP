@@ -1,5 +1,6 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');
 const {spawnSync}=require('node:child_process');
+const os=require('node:os');
 // v1.10 contract tests for the public read-only recovery round
 // files.cleanup.observeBatch (cleanup-file-api observeBatch + engine
 // batch-observe): one caller round shares one engine sweep per batch, stays
@@ -54,7 +55,7 @@ function harness(options={}){
     }
     throw Object.assign(Error('UNEXPECTED_ACTION'),{code:'UNEXPECTED_ACTION'});
   };
-  const storageRoot=fs.mkdtempSync(path.join('/tmp/opencode','observe-batch-'));
+  const storageRoot=fs.mkdtempSync(path.join(os.tmpdir(),'observe-batch-'));
   const api=new CleanupFileApi({storageRoot,transport,activity:async()=>({}),lease:async(n,t,run)=>run()});
   return {api,calls,stats,storageRoot};
 }

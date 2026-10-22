@@ -1,4 +1,5 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');
+const os=require('node:os');
 // v1.9 defect 7 (reviewer probe /tmp/opencode/iv-n/probe-scale-settle.js P3,
 // kept frozen as red evidence of the OLD behavior): api.status expanded 2501
 // directories into 5002 original+isolation entries in ONE batch-verify RPC,
@@ -53,7 +54,7 @@ function harness(options={}){
     }
     throw Error('UNEXPECTED '+request.action);
   };
-  const storageRoot=fs.mkdtempSync(path.join('/tmp/opencode','scale-verify-'));
+  const storageRoot=fs.mkdtempSync(path.join(os.tmpdir(),'scale-verify-'));
   const api=new CleanupFileApi({storageRoot,transport,activity:async()=>({}),lease:async(n,t,run)=>run(),readRuntimeVersion:async()=>'1.9.0'});
   return {api,calls,stats};
 }
@@ -220,7 +221,7 @@ test('an explicit ROOT_IDENTITY_CHANGED demotes completed to unknown, while an o
 });
 test('a root identity change mid-round yields safe unknown everywhere, never completion',async()=>{
   // engine refuses every verify with ROOT_IDENTITY_CHANGED (identity drift surfaces as an error envelope)
-  const api=new CleanupFileApi({storageRoot:fs.mkdtempSync(path.join('/tmp/opencode','scale-verify-')),
+  const api=new CleanupFileApi({storageRoot:fs.mkdtempSync(path.join(os.tmpdir(),'scale-verify-')),
     transport:async request=>{
       if(request.action==='batch-inspect')return {ok:true,rootIdentity:IDENTITY,metrics:{entryReads:2},
         targets:request.targets.map(t=>({relativePath:t.relativePath,type:t.type,absolutePath:'/srv/proj/'+t.relativePath,
