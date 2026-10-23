@@ -10,14 +10,19 @@ test("receiver verifies all files before publication, retries fixed slots and cl
 });
 test("receiver bounds metadata, protects unknown owners and consumes staging files by replace", () => {
   const source = fs.readFileSync(path.join(__dirname, "../staged-tar-receive.py"), "utf8");
-  assert.match(source, /range\(32\)/);
   assert.match(source, /MAX_METADATA = 65536/);
   assert.match(source, /staged SHA256 mismatch/);
   assert.match(source, /LOCK_EX \| fcntl\.LOCK_NB/);
   assert.match(source, /os\.replace\(/);
   assert.doesNotMatch(source, /os\.unlink\(|rmtree\(|os\.rmdir\(/);
+  // Staging lives in identity-owned two-slot directories; foreign checkpoints are never silently cleared.
+  assert.match(source, /STAGING_CONTAINER = "simple_cluster"/);
+  assert.match(source, /STAGING_DIRECTORY = "\.simple-sftp-staging"/);
+  assert.match(source, /IDENTITY_SLOTS = \("0", "1"\)/);
+  assert.match(source, /TRANSFER_STAGE_PENDING/);
+  assert.doesNotMatch(source, /scrub_terminal_slot|OWNED_SLOT_FILE|os\.listdir|range\(32\)/);
 });
-for (const scenario of ["resume-slot", "continuous-chunks", "continuous-interruption"]) {
+for (const scenario of ["generation-rotation", "continuous-chunks", "continuous-interruption", "foreign-admission", "same-key-admission"]) {
   test(`large-file receiver preserves checkpoint identity: ${scenario}`, () => {
     const run = spawnSync("python", ["-B", "-X", "utf8", path.join(__dirname, "staged_receive_probe.py"), scenario],
       { encoding: "utf8", timeout: 10000, windowsHide: true });
