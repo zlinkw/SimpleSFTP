@@ -10,6 +10,10 @@ root = pathlib.Path(tempfile.mkdtemp(prefix="se-isolate-window-"))
 engine = root / "engine.py"
 engine.write_text(source, encoding="utf-8")
 os.environ["TMUX_TMPDIR"] = str(root)
+sys.path.insert(0, str(pathlib.Path(__file__).parent / "_helpers"))
+from closeFixtureTmuxWindows import close_fixture_tmux_windows
+def fixture_tmux(args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=2)
 BATCH = "job-" + "b" * 48
 
 def run(request, timeout=6):
@@ -88,7 +92,4 @@ try:
     assert isolation_states()[0]["state"] == "isolated"
     print(json.dumps({"ok": True, "serverSelfClose": True}))
 finally:
-    for session in subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
-                                  capture_output=True, text=True, timeout=2).stdout.splitlines():
-        if session.startswith("iso-"):
-            subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True, timeout=2)
+    close_fixture_tmux_windows(fixture_tmux, private_root=root)

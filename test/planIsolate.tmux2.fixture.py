@@ -10,6 +10,10 @@ root = pathlib.Path(tempfile.mkdtemp(prefix="se-isolate-window2-"))
 engine = root / "engine.py"
 engine.write_text(source, encoding="utf-8")
 os.environ["TMUX_TMPDIR"] = str(root)
+sys.path.insert(0, str(pathlib.Path(__file__).parent / "_helpers"))
+from closeFixtureTmuxWindows import close_fixture_tmux_windows
+def fixture_tmux(args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=2)
 BATCH = "job-" + "b" * 48
 
 HELPER = """
@@ -25,7 +29,7 @@ for index in range(1, len(parts) + 1):
     fcntl.flock(stream.fileno(), fcntl.LOCK_EX if index == len(parts) else fcntl.LOCK_SH)
     streams.append(stream)
 print("LOCKED", flush=True)
-time.sleep(float(sys.argv[3]))
+sys.stdin.readline()
 """
 helper = root / "lockhelper.py"
 helper.write_text(HELPER, encoding="utf-8")
@@ -73,6 +77,7 @@ def isolation_states():
     return [json.loads(p.read_text(encoding="utf-8"))
             for p in (root / "clean_dir" / ".operations" / "isolation").glob("*.json")]
 
+holder = None
 try:
     # A registered isolated subtree is needed as the confirmed delete target.
     (root / "work_dirs/job-a").mkdir(parents=True)
@@ -87,7 +92,9 @@ try:
     assert run_pinned({**isolate, "action": "managed-start"})["state"] == "requested"
     wait_state(isolate, "completed")
 
-    # The retired managed-delete chain must refuse before creating a window.
+    # The active managed mutation is isolation. Permanent confirmed deletion
+    # uses delete-fast and cannot be revived as a managed-window executor; the
+    # retired managed-delete chain must refuse before creating a window.
     archived = "clean_dir/" + BATCH + "/work_dirs/job-a"
     delete_target = {"relativePath": archived, "destination": archived, "type": "directory",
                      "authorizationMode": "confirmed_paths", "activityEvidenceMode": "managed_tmux"}
@@ -101,20 +108,22 @@ try:
     assert json.loads(refused.stdout)["error"]["code"] == "UPDATE_REQUIRED", refused.stdout
     assert panes() == before and (root / archived).is_dir()
 
-    # A background writer blocks only job-b's source subtree. Isolation still
-    # uses its own bound window; permanent deletion now uses delete-fast.
-    busy_rel = "work_dirs/job-b"
-    busy_archive = "clean_dir/" + BATCH + "/" + busy_rel
-    (root / busy_rel).mkdir(parents=True)
-    (root / busy_rel / "old.bin").write_bytes(b"old")
-    holder = subprocess.Popen([sys.executable, "-B", str(helper), str(root), busy_rel, "20"], stdout=subprocess.PIPE, text=True)
-    assert holder.stdout.readline().strip() == "LOCKED"
-    busy_target = {"relativePath": busy_rel, "destination": busy_archive, "archiveBatch": BATCH,
-                   "type": "directory", "activityEvidenceMode": "managed_tmux"}
-    busy_preview = run({"root": str(root), "action": "inspect", "isolate": True, "target": dict(busy_target)})
-    busy = {"root": str(root), "rootIdentity": busy_preview["rootIdentity"], "operationId": "iso-job-b", "cleanupAction": "isolate",
-            "target": {**busy_target, **busy_preview["target"], "destination": busy_archive}, "tmuxSessionPrefix": "iso"}
-    assert run_pinned({**busy, "action": "managed-start"})["state"] == "requested"
+    # A background writer blocks job-b's source subtree. Isolation still uses
+    # its own bound window; permanent deletion now uses delete-fast.
+    source_rel = 'work_dirs/job-b'
+    busy_archive = 'clean_dir/' + BATCH + '/' + source_rel
+    (root / source_rel).mkdir(parents=True)
+    (root / source_rel / 'weight.bin').write_bytes(b'old')
+    holder = subprocess.Popen([sys.executable, '-B', str(helper), str(root), source_rel],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    assert holder.stdout.readline().strip() == 'LOCKED'
+    retry_target = {'relativePath':source_rel, 'destination':busy_archive,
+                    'type':'directory', 'archiveBatch':BATCH, 'activityEvidenceMode':'managed_tmux'}
+    inspected_retry = run({'root':str(root), 'action':'inspect', 'isolate':True, 'target':dict(retry_target)})
+    retry = {'root':str(root), 'rootIdentity':inspected_retry['rootIdentity'], 'operationId':'iso-job-b',
+             'cleanupAction':'isolate', 'target':{**retry_target, **inspected_retry['target'],
+             'destination':retry_target['destination']}, 'tmuxSessionPrefix':'iso'}
+    assert run_pinned({**retry, 'action':'managed-start'})['state'] == 'requested'
     deadline = time.monotonic() + 5
     failed = None
     while time.monotonic() < deadline:
@@ -123,33 +132,38 @@ try:
             break
         time.sleep(.05)
     assert failed and failed[0][2] != "0", failed
-    observed = run({**busy, "action": "managed-observe"})
+    observed = run({**retry, "action": "managed-observe"})
     assert observed["state"] == "pending" and observed["executor"] and observed["executor"]["dead"], observed
-    assert (root / busy_rel / "old.bin").read_bytes() == b"old" and not (root / busy_archive).exists()
+    assert (root / source_rel).is_dir() and (root / source_rel / "weight.bin").read_bytes() == b"old"
+    assert not (root / busy_archive).exists()
     assert (root / archived / "weight.bin").read_bytes() == b"x" * 4096
     # The external writer releases; the same confirmed intent is re-previewed
     # and completes, closing its own window without any client close call.
-    holder.kill()
-    holder.wait(timeout=5)
-    second = run({"root": str(root), "action": "inspect", "isolate": True, "target": dict(busy_target)})
-    retried = {**busy, "rootIdentity": second["rootIdentity"], "target": {**busy_target, **second["target"], "destination": busy_archive}}
-    assert run_pinned({**retried, "action": "managed-start"})["state"] == "requested"
-    completed = wait_state(retried, "completed")
-    assert completed.get("verifiedBy") == "completion_receipt", completed
-    assert not (root / busy_rel).exists() and (root / busy_archive / "old.bin").read_bytes() == b"old"
-    assert any(state["state"] == "isolated" and state["destination"] == busy_archive for state in isolation_states()), isolation_states()
+    holder.communicate(input='release\n', timeout=2)
+    assert holder.returncode == 0
+    holder = None
+    second = run({'root':str(root), 'action':'inspect', 'isolate':True, 'target':dict(retry_target)})
+    retry2 = {**retry, 'rootIdentity':second['rootIdentity'],
+              'target':{**retry_target, **second['target'], 'destination':retry_target['destination']}}
+    assert run_pinned({**retry2, 'action':'managed-start'})['state'] == 'requested'
+    done = wait_state(retry2, 'completed')
+    assert done.get('verifiedBy') == 'completion_receipt', done
+    assert not (root / source_rel).exists()
+    assert (root / busy_archive / 'weight.bin').read_bytes() == b'old'
+    assert all(state['state'] == 'isolated' for state in isolation_states()), isolation_states()
+    assert any(state['state'] == 'isolated' and state['destination'] == busy_archive for state in isolation_states()), isolation_states()
     deadline = time.monotonic() + 4
     while time.monotonic() < deadline and live_bound():
         time.sleep(.05)
     assert not live_bound(), panes()
     # A rebuilt name after completion is new data: replay never re-deletes.
-    (root / busy_rel).mkdir(parents=True)
-    (root / busy_rel / "fresh.bin").write_text("keep", encoding="utf-8")
-    replay2 = run({**retried, "action": "managed-observe"})
-    assert replay2["state"] == "completed" and (root / busy_rel / "fresh.bin").read_text() == "keep", replay2
+    (root / source_rel).mkdir(parents=True)
+    (root / source_rel / "fresh.bin").write_text("keep", encoding="utf-8")
+    replay2 = run({**retry2, "action": "managed-observe"})
+    assert replay2["state"] == "completed" and (root / source_rel / "fresh.bin").exists(), replay2
     print(json.dumps({"ok": True, "failureWindowPreserved": True}))
 finally:
-    for session in subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
-                                  capture_output=True, text=True, timeout=2).stdout.splitlines():
-        if session.startswith("iso-"):
-            subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True, timeout=2)
+    if holder is not None:
+        holder.communicate(input='release\n', timeout=2)
+        assert holder.returncode == 0
+    close_fixture_tmux_windows(fixture_tmux, private_root=root)

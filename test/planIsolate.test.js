@@ -8,7 +8,7 @@ function runFixture(name,timeout){const fixture=path.resolve(__dirname,name),eng
   assert.equal(proc.status,0,proc.stderr||proc.stdout);return JSON.parse(proc.stdout);}
 const BATCH='job-'+'a'.repeat(48);
 function makeApi(overrides={}){const requests=[];const api=new CleanupFileApi({storageRoot:path.join(os.tmpdir(),'plan-isolate-'+process.pid+'-'+Math.random().toString(36).slice(2)),activity:async()=>{},lease:async(_node,_targets,fn)=>fn(),transport:async request=>{requests.push(JSON.parse(JSON.stringify(request)));
-  if(request.action==='batch-inspect')return {ok:true,rootIdentity:{path:'/scope'},targets:request.targets.map(t=>({...t,absolutePath:'/scope/'+t.relativePath,archived:true,device:'1',inode:'7'}))};
+  if(request.action==='batch-inspect')return {ok:true,rootIdentity:{path:'/scope'},capabilities:{confirmedPathFastDelete:1,batchEntryInspect:1},targets:request.targets.map(t=>({...t,absolutePath:'/scope/'+t.relativePath,archived:true,device:'1',inode:'7'}))};
   if(request.action==='inspect'){if(overrides.inspect)return overrides.inspect(request);
     return {ok:true,rootIdentity:{path:'/scope'},target:{type:request.target.type,absolutePath:'/scope/'+request.target.relativePath,fingerprint:'top-'+request.target.relativePath,inode:'7',device:'1',fingerprintMode:'top_level',inventory:[]}};}
   if(request.action==='managed-start')return overrides.start?overrides.start(request):{ok:true,state:'requested',rootIdentity:{path:'/scope'}};
@@ -62,6 +62,8 @@ test('confirmed isolated subtree preview demands the destination equal the regis
   assert.equal(preview.safety.registeredIsolationDeletion,1);assert.equal(preview.safety.isolateFast,undefined);
   const inspected=requests.find(request=>request.action==='batch-inspect');
   assert.equal(inspected.targets[0].relativePath,rel);assert.equal(inspected.action,'batch-inspect');
+  assert.equal(preview.targets[0].destination,rel);
+  assert.equal(preview.safety.entryIdentityBind,1);assert.equal(preview.safety.batchedFastDelete,1);
   // Permanent deletion still needs the two exact confirmations.
   await api.confirm({token:preview.token,digest:preview.digest,phase:1,confirm:true,exactTargets:['/scope/'+rel]});
   await assert.rejects(api.execute({token:preview.token,digest:preview.digest,index:0}),/CONFIRM_REQUIRED/);

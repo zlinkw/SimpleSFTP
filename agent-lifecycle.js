@@ -5,7 +5,7 @@ const { spawn } = require('node:child_process');
 
 function validateAgentRequest(params) {
   if (!['inspect','ensure','stop','restart','migrate'].includes(params.action)) throw new Error('AGENT_ACTION_INVALID');
-  for (const key of ['projectDir','installDir']) {
+  for (const key of ['projectDir','installDir', ...['stateDir','workerStateDir'].filter(key => params[key] !== undefined && params[key] !== '')]) {
     const value = params[key];
     if (typeof value !== 'string' || !value.startsWith('/') || value === '/' || /[\r\n\0*?]/.test(value) || value.split('/').includes('..')) throw new Error('AGENT_PATH_INVALID: '+key);
   }
@@ -19,7 +19,7 @@ function validateAgentRequest(params) {
 function agentPayload(params) {
   validateAgentRequest(params);
   // Fixed allowlist: no caller-supplied program, command, cwd, signal or environment.
-  return Object.fromEntries(['action','projectDir','installDir','mode','workerId','host','port','condaEnv','expectedVersion','files','sessionPrefix','tmuxSession','tmuxWindow','agentToken','migrationDigest'].map(key=>[key,params[key]]));
+  return Object.fromEntries(['action','projectDir','installDir','stateDir','workerStateDir','mode','workerId','host','port','condaEnv','expectedVersion','files','sessionPrefix','tmuxSession','tmuxWindow','agentToken','migrationDigest'].map(key=>[key,params[key]]));
 }
 
 function agentRemoteCommand() {

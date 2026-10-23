@@ -4,7 +4,9 @@ const fsSync = require('node:fs'), fs = require('node:fs/promises'), os = requir
 const http = require('node:http');
 const { CleanupFileApi, fail, transferBusySnapshot, busyEvidence } = require('../cleanup-file-api');
 const { LocalApiServer } = require('../api-server');
-const source = fsSync.readFileSync(path.join(__dirname, '..', 'extension.js'), 'utf8');
+// EOL 接线（2026-10-23 合流返修）：合并候选 extension.js 在 Windows 树上为 CRLF（与 LF 源候选仅行尾差异，内容逐字节一致），
+// 下面的切片锚点以 \n\n 定界函数边界。按 LF 归一只影响行尾表示，不改变切片出的真实生产函数体，任何锚点/断言不放宽。
+const source = fsSync.readFileSync(path.join(__dirname, '..', 'extension.js'), 'utf8').replace(/\r\n/g, '\n');
 
 // 这些切片取的是已发布 extension.js 里的真实生产函数体：测试不另写一份谓词替身。
 /** 取 [startMarker, endMarker) 之间的真实生产源码；endMarker 属于后面的构造，一律排除。 */

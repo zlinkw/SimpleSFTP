@@ -186,63 +186,62 @@ finally:
 # lock stays immediately acquirable (C2 short control transaction).
 control = module['mutation_lock'](str(root)); control.close()
 
-# 8) C4 registered permanent deletion. Confirmed paths reach only registered
-# isolated subtrees; the delete itself is metadata-only and replays complete.
+# 8) registered deletion uses the sole entry-bound batch executor. Legacy
+# confirmed delete routes remain explicitly rejected, never silently revived.
 archived_rel = 'clean_dir/' + BATCH + '/work_dirs/run2'
-confirmed = {'relativePath': archived_rel, 'destination': archived_rel, 'type': 'directory', 'authorizationMode': 'confirmed_paths'}
-previewed = run({'action': 'inspect', 'target': dict(confirmed)})
-assert previewed['ok'] and not previewed['target'].get('missing')
-frozen_delete = {**confirmed, 'fingerprint': previewed['target']['fingerprint']}
-entry = run({'action': 'batch-inspect', 'authorizationMode': 'confirmed_paths', 'operationId': 'op-del-run2',
-             'targets': [{'relativePath': archived_rel, 'type': 'directory'}]})['targets'][0]
-fast_delete = {'action': 'delete-fast', 'authorizationMode': 'confirmed_paths', 'operationId': 'op-del-run2', 'entries': [entry]}
-expect_code({'action': 'delete', 'operationId': 'retired-delete', 'target': frozen_delete}, 'UPDATE_REQUIRED')
-permanent = run(fast_delete)
-assert permanent['ok'] and not (root / archived_rel).exists()
+delete_target = {'relativePath': archived_rel, 'type': 'directory'}
+frozen_delete = run({'action':'batch-inspect', 'authorizationMode':'confirmed_paths',
+                     'operationId':'op-del-run2', 'targets':[delete_target]})['targets'][0]
+expect_code({'action':'delete', 'operationId':'op-old-delete',
+             'target':{**delete_target, 'destination':archived_rel, 'authorizationMode':'confirmed_paths'}}, 'UPDATE_REQUIRED')
+# Allocate the replacement before removing the original, so inode reuse cannot
+# accidentally turn this replay test into an equal-inode fixture.
+replacement = root / 'fresh-replacement'
+replacement.mkdir(); (replacement / 'fresh.bin').write_text('keep', encoding='utf-8')
+permanent = run({'action':'delete-fast', 'authorizationMode':'confirmed_paths',
+                 'operationId':'op-del-run2', 'entries':[frozen_delete]})
+assert permanent['ok'] and permanent['receipt']['phase'] == 'completed' and not (root / archived_rel).exists()
 state = isolation_state(archived_rel)
-assert state['state'] == 'deleted' and set(state) == {'schemaVersion', 'state', 'operationId', 'destination', 'deletedAt'}, state
-expect_code(fast_delete, 'MISSING_TARGET')  # Public capability replay is tested in batchDeleteApi; raw missing entries never mutate.
-check_after = run({'action': 'check', 'target': frozen_delete})
+assert state['state'] == 'deleted' and set(state) == {'schemaVersion','state','operationId','destination','deletedAt'}, state
+# Lost mutation responses settle through a read-only presence query; no blind
+# resend of the retired deletion or the new mutation is allowed.
+verified = run({'action':'batch-verify', 'authorizationMode':'confirmed_paths',
+                'entries':[frozen_delete]})
+assert verified['targets'][0]['status'] == 'gone', verified
+expect_code({'action':'delete-fast', 'authorizationMode':'confirmed_paths',
+             'operationId':'op-del-run2', 'entries':[frozen_delete]}, 'MISSING_TARGET')
+# the deleted subtree's own confirmed-path check still reports completion through the registration.
+check_after = run({'action': 'check', 'target': {'relativePath': archived_rel, 'destination': archived_rel,
+                'type': 'directory', 'authorizationMode': 'confirmed_paths'}})
 assert check_after['state'] == 'completed' and check_after.get('verifiedBy') == 'isolation_deleted'
-# the original isolation operation of that deleted subtree also stays proven
-# completed through the registration, never revoked or re-moved.
-isolate_check = run({'action': 'check', 'operationId': 'op-iso-run2',
-                     'target': {key: frozen2[key] for key in ('relativePath', 'destination', 'type', 'fingerprint', 'inode', 'device', 'fingerprintMode')}})
+isolate_check = run({'action':'check', 'operationId':'op-iso-run2',
+    'target':{key:frozen2[key] for key in ('relativePath','destination','type','fingerprint','inode','device','fingerprintMode')}})
 assert isolate_check['state'] == 'completed' and isolate_check.get('verifiedBy') == 'isolation_deleted', isolate_check
-# a rebuilt name after completion stays new data: replays complete and a fresh
-# deletion requires a fresh registration (anti-replay, never re-delete).
-(root / archived_rel).mkdir(parents=True); (root / archived_rel / 'fresh.bin').write_text('keep', encoding='utf-8')
-try:
-    rebuilt = run(fast_delete)
-    assert rebuilt['ok']
-except module['GuardError'] as error:
-    assert error.code == 'ENTRY_IDENTITY_CHANGED', error.code
+replacement.rename(root / archived_rel)
+expect_code({'action':'delete-fast', 'authorizationMode':'confirmed_paths',
+             'operationId':'op-del-replay2', 'entries':[frozen_delete]}, 'ENTRY_IDENTITY_CHANGED')
 assert (root / archived_rel / 'fresh.bin').read_text(encoding='utf-8') == 'keep'
-# re-isolating into the recreated old destination stays refused (that
-# directory is new data; it is never overwritten or re-moved). A new rerun
-# intent derives a fresh batch, lands cleanly and registers there, while the
-# old batch keeps its completed deletion identity.
 (outputs / 'run2').mkdir()
-expect_code({'action': 'isolate', 'operationId': 'op-x', 'target': isolate_target('run2')}, 'DESTINATION_EXISTS')
+expect_code({'action':'isolate', 'operationId':'op-x', 'target':isolate_target('run2')}, 'DESTINATION_EXISTS')
 fresh_batch = 'job-' + 'c' * 48
 frozen2b = isolate_request('run2', batch=fresh_batch)
-run({'action': 'isolate', 'operationId': 'op-iso-run2b', 'target': frozen2b})
+run({'action':'isolate', 'operationId':'op-iso-run2b', 'target':frozen2b})
 assert isolation_state('clean_dir/' + fresh_batch + '/work_dirs/run2')['state'] == 'isolated'
 assert isolation_state(archived_rel)['state'] == 'deleted'
 assert (root / archived_rel / 'fresh.bin').read_text(encoding='utf-8') == 'keep'
 
-# 9) control regions and unregistered archive paths always stay refused.
-unregistered = root / 'clean_dir' / BATCH / 'never/registered'
-unregistered.mkdir(parents=True)
-for rel, code in (('clean_dir', 'PROTECTED_PATH'), ('clean_dir/MANIFEST.md', 'PROTECTED_PATH'),
-                  ('clean_dir/.operations/isolation', 'PROTECTED_PATH'), ('clean_dir/' + BATCH, 'PROTECTED_PATH'),
-                  ('clean_dir/' + BATCH + '/never/registered', 'NOT_REGISTERED_ISOLATION')):
-    if code == 'NOT_REGISTERED_ISOLATION':
-        rejected_entry = run({'action': 'batch-inspect', 'authorizationMode': 'confirmed_paths', 'operationId': 'op-x',
-                              'targets': [{'relativePath': rel, 'type': 'directory'}]})['targets'][0]
-    else:
-        rejected_entry = {'relativePath': rel, 'type': 'directory', 'device': '1', 'inode': '1'}
-    expect_code({'action': 'delete-fast', 'authorizationMode': 'confirmed_paths', 'operationId': 'op-x', 'entries': [rejected_entry]}, code)
+# 9) control regions and unregistered archive paths remain protected on the
+# current production batch chain, including before any mutation.
+for rel in ('clean_dir','clean_dir/MANIFEST.md','clean_dir/.operations/isolation','clean_dir/' + BATCH):
+    expect_code({'action':'batch-inspect', 'authorizationMode':'confirmed_paths',
+                 'targets':[{'relativePath':rel,'type':'directory'}]}, 'PROTECTED_PATH')
+unregistered = 'clean_dir/' + BATCH + '/never/registered'
+(root / unregistered).mkdir(parents=True)
+unbound = run({'action':'batch-inspect','authorizationMode':'confirmed_paths',
+               'targets':[{'relativePath':unregistered,'type':'directory'}]})['targets'][0]
+expect_code({'action':'delete-fast','authorizationMode':'confirmed_paths','operationId':'op-unbound','entries':[unbound]},
+            'NOT_REGISTERED_ISOLATION')
+assert (root / unregistered).is_dir()
 
 # 10) restore clears the isolation registration so a later confirmed delete
 # requires a fresh registration. Restore keeps the ordinary move contract
@@ -255,10 +254,14 @@ restored = run({'action': 'restore', 'operationId': 'op-restore-run3',
                 'target': {**restore_target, 'fingerprint': restore_preview['target']['fingerprint']}})
 assert restored['ok'] and (outputs / 'run3' / 'epoch.ckpt').exists()
 assert isolation_state(archived2)['state'] == 'restored'
+# Recreating the restored archive name cannot acquire a deletion grant from
+# its old registration: fresh entry binding still sees state=restored.
 (root / archived2).mkdir(parents=True)
-restored_entry = run({'action': 'batch-inspect', 'authorizationMode': 'confirmed_paths', 'operationId': 'op-x',
-                      'targets': [{'relativePath': archived2, 'type': 'directory'}]})['targets'][0]
-expect_code({'action': 'delete-fast', 'authorizationMode': 'confirmed_paths', 'operationId': 'op-x', 'entries': [restored_entry]}, 'NOT_REGISTERED_ISOLATION')
+restored_entry = run({'action':'batch-inspect','authorizationMode':'confirmed_paths',
+                      'targets':[{'relativePath':archived2,'type':'directory'}]})['targets'][0]
+expect_code({'action':'delete-fast','authorizationMode':'confirmed_paths','operationId':'op-restored',
+             'entries':[restored_entry]}, 'NOT_REGISTERED_ISOLATION')
+assert (root / archived2).is_dir()
 
 assert not fast_reads, ('data content was read on fast paths', fast_reads[:3])
 assert any('epoch.ckpt' in read for read in data_reads), 'ordinary restore must still verify restored content fully'
