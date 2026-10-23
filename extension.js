@@ -137,7 +137,7 @@ const DEFAULT_IGNORES = [
 ];
 
 // These editor and Git internals never belong in a project transfer.
-const FIXED_IGNORES = [".git", ".vscode", ".simple-sftp-stage-*", "*.simple-sftp-partial-*"];
+const FIXED_IGNORES = [".git", ".vscode", ".simple-sftp-stage-*", ".simple-sftp-staging", "*.simple-sftp-partial-*"];
 
 const HIDDEN_TOP_LEVEL = new Set([
   ".codex",
@@ -822,7 +822,7 @@ function directSyncRelativePath(value) {
   if (Buffer.byteLength(relative, "utf8") > 4096 || /[:\0\r\n]/.test(relative)) throw new Error("Plan 产物相对路径不安全。");
   if (!relative || relative.startsWith("/") || relative.split("/").some((part) => !part || part === "." || part === "..")) throw new Error("Plan 产物相对路径不安全。");
   if (relative.split("/").some(part => part.toLowerCase() === "clean_dir")) throw new Error("归档目录不参与同步或收集。");
-  if (relative.split("/").some((part) => part.startsWith(".simple-sftp-stage-") || part.includes(".simple-sftp-partial-"))) throw new Error("路径保留给 SimpleSFTP 传输暂存使用。");
+  if (relative.split("/").some((part) => part.startsWith(".simple-sftp-stage-") || part === ".simple-sftp-staging" || part.includes(".simple-sftp-partial-"))) throw new Error("路径保留给 SimpleSFTP 传输暂存使用。");
   return relative;
 }
 
@@ -935,7 +935,7 @@ function relayTarFilesCore(source, destination, paths, timeoutMs, options = {}) 
   if (!paths.length) return Promise.resolve();
   const compression = transferCompression(options);
   const sourceCommand = options.sourceCommand || `bash -o pipefail -c ${shellQuote(`cd ${shellQuote(source.remotePath)} && ${tarPackingCommand(compression)}`)}`;
-  const destinationCommand = options.destinationCommand || `bash -o pipefail -c ${shellQuote(stagedTarUnpackingCommand(destination, compression, options.transferId, options.expectedFiles, paths) )}`;
+  const destinationCommand = options.destinationCommand || `bash -o pipefail -c ${shellQuote(stagedTarUnpackingCommand(destination, compression, options, options.expectedFiles, paths) )}`;
   return new Promise((resolve, reject) => {
     const reader = spawn("ssh", getSshArgs(source, sourceCommand), { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     const writer = spawn("ssh", getSshArgs(destination, destinationCommand), { windowsHide: true, stdio: ["pipe", "ignore", "pipe"] });
@@ -1271,7 +1271,7 @@ function projectInventoryScript(metadataOnly = false) {
 
 function projectTreePathAllowed(relative) {
   const parts = String(relative || "").toLowerCase().split("/");
-  if (parts.some(part => part.startsWith(".simple-sftp-stage-") || part.includes(".simple-sftp-partial-"))) return false;
+  if (parts.some(part => part.startsWith(".simple-sftp-stage-") || part === ".simple-sftp-staging" || part.includes(".simple-sftp-partial-"))) return false;
   if (parts[0] === "tmp" && parts.length > 1 && parts[1] !== "result" || parts.some((part) => [".git", ".vscode", ".codex", ".agents", ".coding-tools", ".local-gpt", ".runtime", "clean_dir", "zlk_cluster", ".venv", "venv", "env", "node_modules", "__pycache__", ".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"].includes(part))) return false;
   if (parts[0] === "experiments" && parts[1] === "results" && parts.at(-1).endsWith(".csv.lock")) return false;
   if (parts[0] === "work_dirs" && parts.at(-1) === ".tb_mean.lock") return false;
@@ -1370,7 +1370,7 @@ function transferErrorLog(paths = []) {
   const append = line => {
     const text = line.trim();
     if (!text || filenames.has(text) || /^SIMPLE_(?:CHUNK_VERIFIED|COMPRESSION_WIRE) \d+$/.test(text)
-      || /^SIMPLE_STAGE_COMMITTED \.simple-sftp-stage-[0-9a-f]{2}$/.test(text)) return;
+      || /^SIMPLE_STAGE_COMMITTED (?:d-[0-9a-f]{24}\/[01]|\.simple-sftp-stage-[0-9a-f]{2})$/.test(text)) return;
     if (text.startsWith("SIMPLE_PROGRESS ")) {
       try {
         const row = JSON.parse(text.slice(16));
@@ -1694,10 +1694,11 @@ const API_METHOD_CAPABILITIES = {
       "files.cleanup.settle": { frozenApprovalRequired: true, receiptOnly: true, startsNewMoves: false },
       "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: 1, requiredInputGuard: 1, registeredIsolationDeletion: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
       "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
+      "files.cleanup.stagedSlots": { readOnly: true, incomingGenerationPreview: true, retainedGenerations: 2 },
       "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1, tmuxSessionPrefix: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1 },
       "sync.projectInventory": { scopeTransport: "stdin",
         readOnly: true, ownCacheWritesOnly: true, maxScopePaths: 5000, maxScopeBytes: 1048576, idlePolicy: "observe-filesystem", scopedTraversal: "direct-roots-v1", codeInventoryLane: 1, capacityTiming: 1, metadataOnly: 1, contentIdentity: 1 },
-      "sync.serverToServerFpsync": { compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
+      "sync.serverToServerFpsync": { retentionKey: "stable-logical-source", generation: "stable-run-id", retainedGenerations: 2, compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
       "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, memoryWrapperResults: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024, memoryReadLane: 1, capacityTiming: 1 },
     };
 
@@ -1822,22 +1823,44 @@ function tarUnpackingCommand(compression) {
   return `${decoder}tar -xvf - --index-file=/dev/stderr`;
 }
 
-function stagedTarUnpackingCommand(destination, compression, stageId, expectedFiles = {}, paths = Object.keys(expectedFiles)) {
+function transferScope64(value) {
+  const text = String(value || "");
+  return /^[0-9a-f]{64}$/.test(text) ? text : crypto.createHash("sha256").update(text).digest("hex");
+}
+
+// Logical identity of a staging source: the destination PROJECT path plus the sorted set of
+// project-relative source paths. It never contains stage ids, content hashes, Worker/GPU or node
+// identities, so the same logical source keeps ONE two-generation slot across workers and reruns;
+// generation is the caller's stable run/command id (retries and extra batches reuse it).
+function stagedLogicalKey(destinationRemotePath, paths, options = {}) {
+  // Scope is declared by the caller, not the current changed-file selection or content.
+  // Two fixed lanes belong to the same job/run; changing archive partitions opens no new keys.
+  const scope = String(options.retentionKey || (options.directory ? "directory:" + options.relativePath : "project-files"));
+  return transferScope64(JSON.stringify([scope, Number(options.stagingLane) === 1 ? 1 : 0]));
+}
+
+function stagedTarUnpackingCommand(destination, compression, options = {}, expectedFiles = {}, paths = Object.keys(expectedFiles)) {
   const entries = paths.map(name => {
     const item = expectedFiles[name];
     return { path: directSyncRelativePath(name), sha256: typeof item === "string" ? item : item?.sha256 || "", size: typeof item?.size === "number" ? item.size : null };
   });
-  const identity = crypto.createHash("sha256").update(String(stageId || "") + JSON.stringify(entries)).digest("hex");
-  const request = Buffer.from(JSON.stringify({ root: destination.remotePath, identity, entries }), "utf8");
+  if (typeof options === "string") options = { generation: options };
+  const identity = stagedLogicalKey(destination.remotePath, paths.map(name => directSyncRelativePath(name)), options);
+  const generation = transferScope64(options.generation || options._operationId || options.transferId || transferContext.getStore()?.operationId || identity);
+  const request = Buffer.from(JSON.stringify({ root: destination.remotePath, identity, generation, entries }), "utf8");
   if (request.length > 65536) throw new Error("暂存 manifest 超过有界大小，必须拆分批次。");
   const payload = require("node:zlib").deflateRawSync(request).toString("base64");
   const decoder = compression === "zstd" ? "zstd -dc | " : compression === "none" ? "" : "gzip -dc | ";
   return decoder + stagedReceiverInvocation(payload);
 }
 
-function stagedReceiverInvocation(payload) {
+function stagedReceiverCode() {
   const source = fs.readFileSync(path.join(__dirname, "staged-tar-receive.py"), "utf8");
-  const code = require("node:zlib").deflateSync(Buffer.from(source, "utf8")).toString("base64");
+  return require("node:zlib").deflateSync(Buffer.from(source, "utf8")).toString("base64");
+}
+
+function stagedReceiverInvocation(payload) {
+  const code = stagedReceiverCode();
   const loader = "import base64,zlib,sys; code=zlib.decompress(base64.b64decode(sys.argv[1])); sys.argv=sys.argv[1:]; exec(compile(code,'simple_sftp_staged_receive','exec'))";
   return `python3 -c ${shellQuote(loader)} ${shellQuote(code)} ${shellQuote(payload)}`;
 }
@@ -1845,7 +1868,7 @@ function stagedReceiverInvocation(payload) {
 function directTarBatchCommand(source, destination, options = {}) {
   const compression = transferCompression(options);
   const destinationHost = `${destination.username}@${destination.host}`;
-  const destinationScript = stagedTarUnpackingCommand(destination, compression, options.transferId, options.expectedFiles, options.groupPaths);
+  const destinationScript = stagedTarUnpackingCommand(destination, compression, options, options.expectedFiles, options.groupPaths);
   const destinationCommand = `bash -o pipefail -c ${shellQuote(destinationScript)}`;
   const sshOptions = `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${destination.port}`;
   const sourceCommand = `root=$(realpath -e -- ${shellQuote(source.remotePath)}) && test "$root" = ${shellQuote(source.remotePath)} && cd -- "$root" && ${tarPackingCommand(compression, options.wireTelemetry === true)} | ${sshOptions} ${shellQuote(destinationHost)} ${shellQuote(destinationCommand)}`;
@@ -1855,6 +1878,29 @@ function directTarBatchCommand(source, destination, options = {}) {
 function chunkTransferCommand(target, request) {
   const payload = require("node:zlib").deflateRawSync(Buffer.from(JSON.stringify({ ...request, root: target.remotePath }), "utf8")).toString("base64");
   return stagedReceiverInvocation(payload);
+}
+
+// Read-only classification of one logical source's staging slots. WITH an incoming generation this is
+// the admission preview: the returned leaving slot (current/previous stay protected) becomes an exact
+// subtree candidate that ONLY continues through files.cleanup.preview(confirmed_paths) and both path
+// confirmations before the batched executor runs — never auto-confirmed. WITHOUT a generation the
+// inventory never proposes the retained two generations at all.
+function stagedSlotStaleReportCommand(target, identity, generation) {
+  const payload = require("node:zlib").deflateRawSync(Buffer.from(JSON.stringify({ mode: "staleReport", root: target.remotePath, identity, ...(generation ? { generation } : {}) }), "utf8")).toString("base64");
+  return stagedReceiverInvocation(payload);
+}
+
+async function stagedSlotStaleReport(node, identity, generation) {
+  if (node?.kind === "local") return { stale: [], held: [] };
+  if (!/^[0-9a-f]{64}$/.test(String(identity || "")) || (generation != null && generation !== "" && !/^[0-9a-f]{64}$/.test(String(generation)))) cleanupFail("INVALID_REQUEST");
+  const target = directSyncTarget({ host: node.host, username: node.user, port: node.port, remotePath: node.root }, "清点暂存槽");
+  const reply = await runRemoteBatchSsh(target, stagedSlotStaleReportCommand(target, identity, generation ? String(generation) : undefined), [], 20000, { stage: "清点暂存槽" });
+  const report = JSON.parse(reply);
+  return { stale: Array.isArray(report.stale) ? report.stale : [], held: Array.isArray(report.held) ? report.held : [] };
+}
+
+function stagedSlotCleanupCandidates(report) {
+  return (report.stale || []).map(row => ({ relativePath: row.path, type: "directory", status: row.status, logicalKey: row.identity || "", generation: row.generation || "", updatedAt: row.updatedAt || 0 }));
 }
 
 function remoteTransferOutcomeUnknown() {
@@ -1867,8 +1913,12 @@ async function transferChunkedServerFile(source, destination, name, timeoutMs, o
     const entry = options.expectedFiles?.[name];
     if (!entry || !Number.isSafeInteger(entry.size) || entry.size > 64 * 1024 * 1024 * 1024 || !/^[a-f0-9]{64}$/.test(entry.sha256 || "")) throw new Error("大文件分块需要完整 SHA256/size，单文件上限 64GiB。");
     const entries = [{ path: name, sha256: entry.sha256, size: entry.size }];
-    const identity = crypto.createHash("sha256").update(JSON.stringify([destination.remotePath, entries])).digest("hex");
-    const request = { identity, entries };
+    // Stable source scope: destination project path + relative file name — identical across
+    // retries/workers; the generation is the caller's stable run id so one run resumes its own
+    // checkpoint instead of opening a new generation.
+    const identity = stagedLogicalKey(destination.remotePath, [directSyncRelativePath(name)], options);
+    const generation = transferScope64(options.generation || options._operationId || options.transferId || transferContext.getStore()?.operationId || identity);
+    const request = { identity, generation, entries };
     // Checkpoint reconciliation can create/truncate an owned staging file and write its journal.
     // A disconnected status request therefore requires the same settlement protection as writes.
     const reply = await runRemoteBatchSsh(destination, chunkTransferCommand(destination, { ...request, mode: "chunkStatus" }), [], timeoutMs, { remoteMutation: true, stage: "核验分块检查点" });
@@ -1882,7 +1932,15 @@ async function transferChunkedServerFile(source, destination, name, timeoutMs, o
     const receive = decode + chunkTransferCommand(destination, { ...request, mode: "receiveChunks", offset });
     const sourceCommand = `bash -o pipefail -c ${shellQuote(read)}`;
     const destinationCommand = `bash -o pipefail -c ${shellQuote(receive)}`;
-    const direct = `bash -o pipefail -c ${shellQuote(`${read} | ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${destination.port} ${shellQuote(`${destination.username}@${destination.host}`)} ${shellQuote(destinationCommand)}`)}`;
+    // Both endpoints execute the identical pinned receiver. Send its compressed code once in
+    // the SSH command, expanding a quoted base64-only shell variable into both invocations.
+    // This preserves the bounded command frame as the guarded receiver grows.
+    const receiverCode = stagedReceiverCode();
+    const sharedCode = "'\"$simple_sftp_receiver\"'";
+    const directRead = read.replace(receiverCode, sharedCode);
+    const directDestination = shellQuote(destinationCommand).replace(receiverCode, sharedCode);
+    const directScript = `simple_sftp_receiver=${shellQuote(receiverCode)}; ${directRead} | ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${destination.port} ${shellQuote(`${destination.username}@${destination.host}`)} ${directDestination}`;
+    const direct = `bash -o pipefail -c ${shellQuote(directScript)}`;
     try { await runRemoteBatchSsh(source, direct, [], timeoutMs, { ...options, stage: options.compression === "none" ? "分块传输" : "压缩分块传输" }); }
     catch (error) {
       if (remoteTransferOutcomeUnknown() || !/host key verification failed|no .* host key|permission denied|connect to host|network is unreachable|could not resolve hostname|connection refused/i.test(formatError(error))) throw error;
@@ -1916,7 +1974,7 @@ async function transferPartitionedTarCore(source, destination, paths, timeoutMs,
     failed = true;
     if (!failure) failure = error;
   };
-  const workers = Array.from({ length: Math.min(FPSYNC_PARALLEL_STREAMS, groups.length) }, async () => {
+  const workers = Array.from({ length: Math.min(FPSYNC_PARALLEL_STREAMS, groups.length) }, async (_, stagingLane) => {
     try {
       while (next < groups.length) {
         if (failed) return;
@@ -1928,14 +1986,14 @@ async function transferPartitionedTarCore(source, destination, paths, timeoutMs,
         if (failed) return;
         const transferId = require("crypto").createHash("sha256").update(group.join("\0")).digest("hex").slice(0, 32);
         if (group.length === 1 && Number(options.fileSizes?.[group[0]]) > FPSYNC_MAX_BATCH_BYTES) {
-          await transferChunkedServerFile(source, destination, group[0], timeoutMs, options);
+          await transferChunkedServerFile(source, destination, group[0], timeoutMs, { ...options, stagingLane });
           if (failed) return;
           completed += 1;
           completedFiles += 1;
           report("done", index + 1, group);
           continue;
         }
-        const directCommand = directTarBatchCommand(source, destination, { ...options, transferId, groupPaths: group });
+        const directCommand = directTarBatchCommand(source, destination, { ...options, stagingLane, transferId, groupPaths: group });
         try {
           await runRemoteBatchSsh(source, directCommand, group, timeoutMs, options);
         } catch (error) {
@@ -1945,7 +2003,7 @@ async function transferPartitionedTarCore(source, destination, paths, timeoutMs,
             return;
           }
           try {
-            await relayTarFiles(source, destination, group, timeoutMs, { ...options, transferId });
+            await relayTarFiles(source, destination, group, timeoutMs, { ...options, stagingLane, transferId });
           } catch (relayError) {
             noteFailure(relayError);
             return;
@@ -2068,7 +2126,7 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
     : { compression: requestedCompression === "none" ? "none" : requestedCompression === "zstd" ? "zstd" : "gzip", reason: "no-changed-files", sampleBytes: 0 };
   const compression = compressionDecision.compression;
   let wireBytes = 0;
-  const effectiveOptions = { ...options, compression, expectedFiles: sourceHashes, wireTelemetry: true, onWireBytes: (count) => { wireBytes += count; } };
+  const effectiveOptions = { ...options, generation: options.generation || options._operationId || transferController?.operationId || transferController?.id || nextTransferId("staging"), compression, expectedFiles: sourceHashes, wireTelemetry: true, onWireBytes: (count) => { wireBytes += count; } };
   const planned = partitionTransferPaths(changed, options.singleStream === true ? Math.max(changed.length, 1) : 80,
     FPSYNC_PARALLEL_STREAMS, fileSizes, FPSYNC_MAX_BATCH_BYTES);
   progress.report({ message: changed.length
@@ -2571,7 +2629,9 @@ function writeLocalCodeSyncState(localPath, state) {
 function atomicWriteJsonIfMissing(targetPath, value) {
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
   if (fs.existsSync(targetPath)) return false;
-  const temp = `${targetPath}.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`;
+  // One deterministic staging path: a crash can leave at most this single .writing sibling,
+  // which the next write overwrites in place — random temp names must never accumulate.
+  const temp = `${targetPath}.writing`;
   fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   fs.renameSync(temp, targetPath);
   return true;
@@ -4100,6 +4160,17 @@ function createLocalApiMethods() {
     "files.cleanup.inspect": params => cleanupFileApi.inspect(params),
     "files.cleanup.observeBatch": params => cleanupFileApi.observeBatch(params),
     "files.cleanup.preview": params => cleanupFileApi.preview(params),
+    "files.cleanup.stagedSlots": async params => {
+      // params.generation (a stable incoming run id) turns this into an admission preview; without
+      // it the call is a pure read-only inventory that never lists the retained two generations.
+      const generation = params.generation ? transferScope64(params.generation) : undefined;
+      const identities = params.identity ? [String(params.identity)] : [0, 1].map(stagingLane =>
+        stagedLogicalKey(params.node?.root, [], { retentionKey: params.retentionKey, stagingLane }));
+      if (!params.identity && !String(params.retentionKey || "").trim()) cleanupFail("INVALID_REQUEST");
+      const reports = await Promise.all(identities.map(identity => stagedSlotStaleReport(params.node, identity, generation)));
+      return { candidates: reports.flatMap(stagedSlotCleanupCandidates),
+        held: reports.reduce((count, report) => count + report.held.length, 0), identities };
+    },
     "files.cleanup.confirm": params => cleanupFileApi.confirm(params),
     "files.cleanup.execute": params => cleanupFileApi.execute(params),
     "files.cleanup.status": params => cleanupFileApi.status(params),
@@ -4599,7 +4670,7 @@ function createLocalApiMethods() {
         const codeInventory = name === "sync.projectInventory" && params.inventoryPurpose === "code-sync"
           && Array.isArray(params.scopePaths) && params.scopePaths.length > 0 && !params.scopePaths.includes(".");
         const memoryRead = name === "sync.downloadMappedPaths" && params.memoryOnly === true && params.metricsOnly === true;
-        const cleanupRead = ["files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.check", "files.cleanup.verify", "files.cleanup.status", "files.cleanup.observeBatch"].includes(name);
+        const cleanupRead = ["files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.check", "files.cleanup.verify", "files.cleanup.status", "files.cleanup.observeBatch", "files.cleanup.stagedSlots"].includes(name);
         const metadataInventory = name === "sync.projectInventory" && params.metadataOnly === true;
         const pool = cleanupRead ? cleanupReadCapacity : metadataInventory ? metadataInventoryCapacity : memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
           : ["sync.projectTree", "sync.projectTreeState", "sync.projectFileStats"].includes(name) ? metadataTreeCapacity : transferCapacity;
@@ -6029,7 +6100,7 @@ async function extractMappedTarStream({ stream, byArchiveName, localPath, maxFil
         if (existing.isSymbolicLink() || !existing.isFile() || existing.nlink !== 1) throw failExtract(`写入前本机目标不再是独占普通文件：${target.localRelativePath}`);
         if (!overwrite) throw failExtract(`本机文件已存在，未确认覆盖：${target.localRelativePath}`);
       }
-      const staging = mappedStagingPath(destination);
+      const staging = mappedStagingPath(root, destination);
       residuals.push(staging);
       const handle = openMappedStagingStream(staging);
       trackTransferResource(handle);
@@ -6094,9 +6165,28 @@ function cleanupMappedStagingFiles(root, paths) {
   return paths.filter(candidate => fs.existsSync(candidate));
 }
 
-function mappedStagingPath(destination) {
+// Local transfer staging lives inside the reserved project staging subtree: failed transfers no longer
+// scatter partial siblings through the workspace, and names stay deterministic per destination identity.
+function mappedStagingDirectory(root) {
+  const cluster = path.join(root, "simple_cluster");
+  let clusterInfo = null;
+  try { clusterInfo = fs.lstatSync(cluster); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  if (clusterInfo && (clusterInfo.isSymbolicLink() || !clusterInfo.isDirectory())) throw new Error("本机映射暂存容器不是普通目录：simple_cluster");
+  if (!clusterInfo) fs.mkdirSync(cluster, { recursive: true });
+  const base = path.join(cluster, ".simple-sftp-staging");
+  let baseInfo = null;
+  try { baseInfo = fs.lstatSync(base); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  if (!baseInfo) fs.mkdirSync(base, { recursive: true });
+  else if (baseInfo.isSymbolicLink() || !baseInfo.isDirectory()) throw new Error("本机映射暂存目录不是普通目录");
+  const realRoot = fs.realpathSync(root);
+  const realBase = fs.realpathSync(base);
+  const within = path.relative(realRoot, realBase);
+  if (!within || within === ".." || within.startsWith(`..${path.sep}`) || path.isAbsolute(within)) throw new Error("本机映射暂存目录会越出项目根目录，已停止。");
+  return realBase;
+}
+function mappedStagingPath(root, destination) {
   const identity = crypto.createHash("sha256").update(path.resolve(destination)).digest("hex").slice(0, 32);
-  return path.join(path.dirname(destination), `.${path.basename(destination)}.simple-sftp-partial-${identity}`);
+  return path.join(mappedStagingDirectory(root), `.${path.basename(destination)}.simple-sftp-partial-${identity}`);
 }
 
 function openMappedStagingStream(staging) {
@@ -6853,6 +6943,9 @@ module.exports = {
     downloadMappedPathsCore,
     setMappedDownloadTransport,
     extractMappedTarStream,
+    mappedStagingPath,
+    stagedSlotCleanupCandidates,
+    stagedSlotStaleReportCommand,
     openMappedDownloadStream,
     directSyncTarget,
     directSyncRelativePath,
