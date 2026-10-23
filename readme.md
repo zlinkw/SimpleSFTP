@@ -19,7 +19,7 @@ SimpleSFTP 与 [SimpleExperiment](https://github.com/zlinkw/SimpleExperiment) �
 - 共享服务器配置，可从 `~/.ssh/config` 导入。
 - 独立的远端下载范围；上传与下载范围分别配置。
 - 上传前强制确认本机路径、服务器账号和远端目标路径。
-- 本机 JSON-RPC API 和 `simple-sftp-api` CLI，供自动化工具调用。
+- 本机 JSON-RPC API；自动化调用统一使用 `simpleex sftp ...`（`simple-sftp-api` 独立 CLI 已撤销）。
 
 ## 安装
 
@@ -152,13 +152,15 @@ API 调用危险动作必须传 `confirm: true`。SFTP 路径动作还需要 `pa
 Authorization: Bearer <token>
 ```
 
-CLI 示例：
+CLI 示例（统一入口，旧 `simple-sftp-api` 已撤销）：
 
 ```powershell
-simple-sftp-api status
-simple-sftp-api servers.list
-simple-sftp-api upload.workspace --json upload.json
+simpleex sftp status --json
+simpleex sftp server list --json
+simpleex doctor
 ```
+
+统一入口当前已提供 status/capabilities 与 server、config、target、confirmations 域；同步、上传下载、清理与传输控制域随统一 CLI 后续批次提供。方法与参数以 `/api/v1/capabilities` 实时返回为准。
 
 公开方法以 `/api/v1/capabilities` 的实时返回为准。
 

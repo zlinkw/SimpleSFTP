@@ -4184,6 +4184,8 @@ function createLocalApiMethods() {
         api: localApiServer
           ? { port: localApiServer.port, pid: localApiServer.startedAt ? process.pid : 0, startedAt: localApiServer.startedAt }
           : null,
+        // Real backend metadata so the unified CLI never has to guess the shared server file location.
+        serverConfigFile: SHARED_SERVER_FILE,
       };
     },
     "config.list": async () => {
