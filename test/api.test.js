@@ -228,16 +228,18 @@ test('busy file RPCs leave directory browsing and operation controls available',
   assert.equal(api.activeRpc, 0);
 });
 
-test('CLI file RPC has no socket inactivity cutoff while small controls remain bounded',async()=>{
- const vm=require('node:vm'),{EventEmitter}=require('node:events'),source=fs.readFileSync(path.join(__dirname,'../bin/simple-sftp-api.js'),'utf8');
- const seen=[],context={URL,Buffer,JSON,Promise,Error,http:{request(options,receive){
-  seen.push(options);const req=new EventEmitter();req.end=()=>{const res=new EventEmitter();receive(res);res.emit('data',Buffer.from('{"result":{"ok":true}}'));res.emit('end');};return req;
- }}};
- vm.createContext(context);vm.runInContext(source.slice(source.indexOf('function request('),source.indexOf('function option('))+';this.call=request;',context);
- for(const method of ['sync.projectInventory','sync.projectTreeState','files.cleanup.execute','sync.downloadMappedPaths','upload.files','project.create','handoff.markReady','downloadScope.configure']){
-  await context.call({baseUrl:'http://127.0.0.1:1',token:'fixture'},JSON.stringify({method}));assert.equal(seen.at(-1).timeout,0,method);
- }
- await context.call({baseUrl:'http://127.0.0.1:1',token:'fixture'},JSON.stringify({method:'status'}));assert.equal(seen.at(-1).timeout,15000);
+test('revoked simple-sftp-api CLI only prints the unified entry pointer', () => {
+ // 独立命令体系已撤销（2026-10-23 用户决定）；超时/发现逻辑迁往统一传输，断言迁移见 A 仓 test/cli/simpleCliUnifiedEntry.test.js。
+ const vm=require('node:vm'),source=fs.readFileSync(path.join(__dirname,'../bin/simple-sftp-api.js'),'utf8');
+ new vm.Script(source);
+ const messages=[];
+ const context={console:{error:(line)=>messages.push(line)},require:()=>({}),module:{exports:{}},process:{exitCode:0}};
+ vm.createContext(context);vm.runInContext(source+';this.revokedCode=main();',context);
+ assert.equal(context.revokedCode,1);
+ const text=messages.join('\n');
+ assert.match(text,/has been revoked/);
+ assert.match(text,/simpleex sftp/);
+ assert.match(text,/simpleex doctor/);
 });
 
 test("local API requires bearer auth for every endpoint", async () => {
@@ -357,56 +359,17 @@ test("SSE stream is bounded and terminates after the event cap", async () => {
   }
 });
 
-test("CLI reads the SimpleSFTP discovery file", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-cli-test-"));
-  try {
-    const discoveryPath = path.join(root, "api.json");
-    fs.writeFileSync(discoveryPath, `${JSON.stringify({
-      schemaVersion: 1,
-      name: "SimpleSFTP",
-      baseUrl: "http://127.0.0.1:19766",
-      port: 19766,
-      token: "test-token",
-      pid: 123,
-    })}\n`, "utf8");
-    process.env.SIMPLE_SFTP_API_FILE = discoveryPath;
-    const { readDiscovery } = require("../bin/simple-sftp-api.js");
-    const discovery = readDiscovery();
-    assert.equal(discovery.port, 19766);
-    assert.equal(discovery.token, "test-token");
-    delete process.env.SIMPLE_SFTP_API_FILE;
-  } finally {
-    delete process.env.SIMPLE_SFTP_API_FILE;
-    fs.writeFileSync(path.join(root, "KEEP.txt"), "Isolated test evidence retained.\n", "utf8");
-  }
+test("revoked CLI module exports only main; discovery env handling lives in the unified transport", () => {
+  // 旧 readDiscovery/self-check 能力由统一入口 simpleex doctor 承担（A 仓覆盖），此处仅验证撤销桩闭包最小化。
+  const cli = require("../bin/simple-sftp-api.js");
+  assert.deepEqual(Object.keys(cli), ["main"]);
+  assert.equal(typeof cli.main, "function");
 });
 
-test("SimpleSFTP self-check reports missing discovery and listener", async () => {
-  const missing = path.join(os.tmpdir(), `simple-sftp-self-check-${process.pid}-${Date.now()}.json`);
-  const result = await runCli([path.join(__dirname, "../bin/simple-sftp-api.js"), "self-check"], {
-    SIMPLE_SFTP_API_FILE: missing,
-  });
+test("revoked CLI exits 1 and points at the unified entry", async () => {
+  const result = await runCli([path.join(__dirname, "../bin/simple-sftp-api.js"), "self-check"], {});
   assert.equal(result.code, 1, result.stderr || "");
-  const parsed = JSON.parse(result.stdout);
-  assert.equal(parsed.ok, false);
-  assert.equal(parsed.status, "missing");
-  assert.ok(parsed.checks.some((item) => item.name === "discovery" && !item.ok && item.detail.includes("missing discovery")));
-  assert.ok(parsed.checks.some((item) => item.name === "listener" && !item.ok && item.detail.includes("missing listener")));
-});
-
-test("SimpleSFTP self-check passes with live listener", async () => {
-  const f = await startServer({});
-  try {
-    const result = await runCli([path.join(__dirname, "../bin/simple-sftp-api.js"), "self-check"], {
-      SIMPLE_SFTP_API_FILE: path.join(f.root, "api.json"),
-    });
-    assert.equal(result.code, 0, result.stderr || "");
-    const parsed = JSON.parse(result.stdout);
-    assert.equal(parsed.ok, true);
-    assert.ok(parsed.checks.every((item) => item.ok));
-  } finally {
-    await f.cleanup();
-  }
+  assert.match(result.stderr, /simpleex sftp/);
 });
 
 test("SimpleSFTP gates direct rsync behind explicit path confirmation", () => {
