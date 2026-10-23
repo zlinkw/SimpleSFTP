@@ -516,15 +516,17 @@ test("success waits for SSH exit after the tar trailer", async () => {
   try {
     const deadline = Date.now() + 5000;
     let staged = [];
+    const stagingDirectory = path.join(root, "simple_cluster", ".simple-sftp-staging");
     while (Date.now() < deadline) {
-      if (fs.existsSync(path.join(root, "out"))) staged = fs.readdirSync(path.join(root, "out")).filter((name) => name.includes(".simple-sftp-partial-"));
-      if (staged.length === 1 && fs.readFileSync(path.join(root, "out", staged[0]), "utf8") === "ready") break;
+      if (fs.existsSync(stagingDirectory)) staged = fs.readdirSync(stagingDirectory).filter((name) => name.includes(".simple-sftp-partial-"));
+      if (staged.length === 1 && fs.readFileSync(path.join(stagingDirectory, staged[0]), "utf8") === "ready") break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.equal(settled, false);
     assert.equal(fs.existsSync(path.join(root, "out", "a.csv")), false);
     assert.equal(staged.length, 1);
-    assert.equal(fs.readFileSync(path.join(root, "out", staged[0]), "utf8"), "ready");
+    assert.equal(fs.readFileSync(path.join(stagingDirectory, staged[0]), "utf8"), "ready");
+    assert.equal(fs.readdirSync(path.join(root, "out")).some((name) => name.includes(".simple-sftp-partial-")), false, "partials must stay inside the reserved staging subtree");
   } finally {
     if (proc) proc.emitClose(0);
     // Settle this transport before the next test changes the shared transport hook.
@@ -652,7 +654,7 @@ test("ancestor junction swapped after the first file is rejected before the seco
   assert.equal(fs.existsSync(path.join(outside, "a.csv")), false);
 });
 
-test("truncated stream keeps the previous destination and reports the partial sibling", async () => {
+test("truncated stream keeps the previous destination and reports the contained partial", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-mapped-preserve-"));
   keep(root);
   fs.mkdirSync(path.join(root, "out"));
@@ -668,8 +670,8 @@ test("truncated stream keeps the previous destination and reports the partial si
   assert.equal(fs.readFileSync(path.join(root, "out", "a.csv"), "utf8"), "last-good");
   assert.ok(Array.isArray(error.partialResiduals) && error.partialResiduals.length === 1);
   assert.equal(fs.existsSync(error.partialResiduals[0]), true);
-  assert.equal(fs.existsSync(error.partialResiduals[0]), true);
   assert.equal(path.basename(error.partialResiduals[0]).includes(".simple-sftp-partial-"), true);
+  assert.equal(path.dirname(error.partialResiduals[0]), path.join(fs.realpathSync(root), "simple_cluster", ".simple-sftp-staging"));
 });
 
 test("remote mapped script checks the file list before writing a tar", () => {
