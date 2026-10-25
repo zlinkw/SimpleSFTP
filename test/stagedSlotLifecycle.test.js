@@ -24,7 +24,9 @@ test("staged slots keep two generations end to end: preview, fail-closed third, 
     : spawnSync("python3", argv, { encoding: "utf8", timeout: 10000, windowsHide: true });
   assert.equal(run.status, 0, (run.stderr || run.stdout || "").slice(-3000));
   assert.deepEqual(JSON.parse(run.stdout.trim().split("\n").pop()),
-    { ok: true, pendingBlocked: true, leaving: "simple_cluster/.simple-sftp-staging/d-" + "1".repeat(24) + "/0", thirdGenerationLanded: true });
+    { ok: true, pendingBlocked: true, leaving: "simple_cluster/.simple-sftp-staging/d-" + "1".repeat(24) + "/0", thirdGenerationLanded: true,
+      hardlinkPublication: { tarPublished: true, pendingAliasPreserved: true, chunkPublished: true,
+        normalTargetPublished: true, directoryTargetRejected: true, symlinkTargetRejected: true } });
 });
 
 // The extension-side production request builder must encode the SAME read-only protocol the

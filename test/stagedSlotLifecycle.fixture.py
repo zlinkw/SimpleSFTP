@@ -53,10 +53,10 @@ def payload_bytes(tag):
     return (tag.encode("utf-8") * 4096)[:65536]
 
 
-def land(generation, body):
+def land(generation, body, root=None, identity=None, path="out/large.bin"):
     digest = hashlib.sha256(body).hexdigest()
-    entries = [{"path": "out/large.bin", "sha256": digest, "size": len(body)}]
-    base = {"root": project, "identity": KEY, "generation": generation, "entries": entries}
+    entries = [{"path": path, "sha256": digest, "size": len(body)}]
+    base = {"root": root or project, "identity": identity or KEY, "generation": generation, "entries": entries}
     status = call(dict(base, mode="chunkStatus"))
     assert status.returncode == 0, status.stderr.decode()[-2000:]
     assert json.loads(status.stdout)["offset"] == 0
@@ -132,4 +132,108 @@ assert replay.returncode != 0 and b"TRANSFER_STAGE_PENDING" in replay.stderr, re
 after = json.loads(call({"mode": "staleReport", "root": project, "identity": KEY}).stdout)
 assert after["stale"] == [] and len(after["held"]) == 2
 
-print(json.dumps({"ok": True, "pendingBlocked": True, "leaving": leaving, "thirdGenerationLanded": True}))
+# ---------------------------------------------------------------------------
+# r61 hardlink publication contract (artifact pending-alias regression).
+# The scientific flow (quality_composition.py:402-406, read-only) writes the NEW content
+# into a hidden ".<name>.<uuid>.pending" file first, then os.link()s that pending onto the
+# declared result name — so target and alias share one inode (st_nlink == 2) and the alias
+# must keep its exact bytes/inode afterwards. Publishing replaces only the CURRENT result
+# directory entry (os.replace); it never writes new content into the shared inode, so a
+# legal multi-link regular target must publish while non-regular targets stay rejected.
+# Fixture mirrors that order: old file exists, then os.link onto the not-yet-existing alias.
+# Separate sub-roots and identities keep every scenario's two-generation slot pool
+# and artefact tree isolated (no shared state with the lifecycle block above).
+# ---------------------------------------------------------------------------
+import io
+import tarfile
+
+
+def tar_bytes(files):
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for name, body in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            info.mtime = 0
+            info.mode = 0o644
+            archive.addfile(info, io.BytesIO(body))
+    return buffer.getvalue()
+
+
+def publish_tar(root, identity, generation, files):
+    entries = [{"path": name, "sha256": hashlib.sha256(body).hexdigest(), "size": len(body)}
+               for name, body in files.items()]
+    return call({"root": root, "identity": identity, "generation": generation, "entries": entries},
+                stdin=tar_bytes(files))
+
+
+def write(rel, body, root=None):
+    full = os.path.join(root or project, rel)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "wb") as handle:
+        handle.write(body)
+    return full
+
+
+def identity_key(tag):
+    return (tag * 32)[:64]
+
+
+# --- positive: tar publish onto a legal hard-linked metrics target + pending alias -------
+KEY_T, KEY_C, KEY_N = identity_key("22"), identity_key("33"), identity_key("44")
+GEN_D, GEN_E = "d1" * 32, "e1" * 32
+tar_root = os.path.join(project, "tarcase")
+os.makedirs(tar_root)
+metrics = "test_results/job_metrics.csv"
+alias = "test_results/.job_metrics.csv.5b0e4a3c-1f2d-4c6e-9a7b-0123456789ab.pending"
+control = "test_results/metrics_summary.csv"
+write(metrics, payload_bytes("M1"), tar_root)
+os.link(os.path.join(tar_root, metrics), os.path.join(tar_root, alias))
+write(control, payload_bytes("S1"), tar_root)  # plain single-link control target
+before_target = os.lstat(os.path.join(tar_root, metrics))
+before_alias = os.lstat(os.path.join(tar_root, alias))
+assert before_target.st_ino == before_alias.st_ino and before_target.st_nlink == 2
+published = publish_tar(tar_root, KEY_T, GEN_D, {metrics: payload_bytes("M2"), control: payload_bytes("S2")})
+assert published.returncode == 0, published.stderr.decode()[-2000:]
+after_target = os.lstat(os.path.join(tar_root, metrics))
+after_alias = os.lstat(os.path.join(tar_root, alias))
+assert open(os.path.join(tar_root, metrics), "rb").read() == payload_bytes("M2")
+assert after_target.st_ino != before_target.st_ino, "publish must land a fresh inode, never write through the alias"
+assert os.lstat(os.path.join(tar_root, alias)).st_ino == before_alias.st_ino
+assert os.lstat(os.path.join(tar_root, alias)).st_nlink == 1  # old inode keeps exactly the alias reference
+assert open(os.path.join(tar_root, alias), "rb").read() == payload_bytes("M1"), "pending alias bytes changed"
+assert open(os.path.join(tar_root, control), "rb").read() == payload_bytes("S2"), "plain single-link control target must publish"
+
+# --- positive: chunk publish obeys the SAME target contract (guard at the chunk commit) ----
+chunk_root = os.path.join(project, "chunkcase")
+os.makedirs(chunk_root)
+chunk_file = "work2/metrics_case.csv"
+chunk_alias = "work2/.metrics_case.csv.0f0e0d0c-0b0a-0908-0706-0504030201ff.pending"
+write(chunk_file, payload_bytes("C1"), chunk_root)
+os.link(os.path.join(chunk_root, chunk_file), os.path.join(chunk_root, chunk_alias))
+chunk_before = os.lstat(os.path.join(chunk_root, chunk_file))
+land(GEN_E, payload_bytes("C2"), root=chunk_root, identity=KEY_C, path=chunk_file)
+chunk_after = os.lstat(os.path.join(chunk_root, chunk_file))
+assert open(os.path.join(chunk_root, chunk_file), "rb").read() == payload_bytes("C2")
+assert chunk_after.st_ino != chunk_before.st_ino
+assert os.lstat(os.path.join(chunk_root, chunk_alias)).st_ino == chunk_before.st_ino
+assert open(os.path.join(chunk_root, chunk_alias), "rb").read() == payload_bytes("C1")
+
+# --- negatives: the pre-existing protections stay exactly in force --------------------------
+neg_root = os.path.join(project, "negcase")
+os.makedirs(os.path.join(neg_root, "locked_dir", "x.bin"))
+link_target = write("link_target.bin", payload_bytes("L1"), neg_root)
+os.symlink("link_target.bin", os.path.join(neg_root, "sym.bin"))
+rejected_dir = publish_tar(neg_root, KEY_N, GEN_D, {"locked_dir/x.bin": payload_bytes("X2")})
+assert rejected_dir.returncode != 0 and b"unsafe publication target" in rejected_dir.stderr, rejected_dir.stderr[-800:]
+assert os.path.isdir(os.path.join(neg_root, "locked_dir", "x.bin")) and os.listdir(os.path.join(neg_root, "locked_dir", "x.bin")) == []
+GEN_N2 = "e2" * 32
+rejected_link = publish_tar(neg_root, KEY_N, GEN_N2, {"sym.bin": payload_bytes("Y2")})
+assert rejected_link.returncode != 0 and b"unsafe publication target" in rejected_link.stderr, rejected_link.stderr[-800:]
+assert os.readlink(os.path.join(neg_root, "sym.bin")) == "link_target.bin"
+assert open(link_target, "rb").read() == payload_bytes("L1")
+
+print(json.dumps({"ok": True, "pendingBlocked": True, "leaving": leaving, "thirdGenerationLanded": True,
+                  "hardlinkPublication": {"tarPublished": True, "pendingAliasPreserved": True,
+                                          "chunkPublished": True, "normalTargetPublished": True,
+                                          "directoryTargetRejected": True, "symlinkTargetRejected": True}}))
