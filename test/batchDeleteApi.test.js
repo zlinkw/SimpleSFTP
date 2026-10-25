@@ -1,4 +1,5 @@
 const test = require('node:test');
+const __CONSUMER__ = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'consumer-root-'));
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -60,7 +61,7 @@ function harness(options = {}) {
   const api = new CleanupFileApi({ storageRoot, transport, activity: async () => ({}), lease: async (node, targets, run) => run() });
   return { api, calls, transport, deleteFastReplies,
     get peakActive() { return counters.peakActive; },
-    preview: targets => api.preview({ node: { kind: 'local', root: '/srv/proj' }, action: 'delete',
+    preview: targets => api.preview({consumerRoot: __CONSUMER__,  node: { kind: 'local', root: '/srv/proj' }, action: 'delete',
       authorizationMode: 'confirmed_paths', targets }),
     counts: action => calls.filter(call => call.action === action).length,
     lastOf: action => [...calls].reverse().find(call => call.action === action) };
@@ -73,7 +74,7 @@ async function confirmed(h, row) {
   return apiConfirm(h, row, 2, exact);
 }
 async function apiConfirm(h, row, phase, exact) {
-  return h.api.confirm({ token: row.token, digest: row.digest, confirm: true, phase, exactTargets: exact });
+  return h.api.confirm({consumerRoot: __CONSUMER__,  token: row.token, digest: row.digest, confirm: true, phase, exactTargets: exact });
 }
 
 test('confirmed preview is one batched entry-only metadata read with identity-bound rows', async () => {
@@ -107,7 +108,7 @@ test('confirmed preview refuses protected paths and non-delete actions before an
   await assert.rejects(h.preview([file('.git/config')]), error => error.code === 'PROTECTED_PATH');
   await assert.rejects(h.preview([file('clean_dir/scratch')]), error => error.code === 'UNSAFE_DESTINATION');
   await assert.rejects(h.preview([{ relativePath: '/etc/passwd', type: 'file' }]), error => error.code === 'INVALID_REQUEST');
-  await assert.rejects(h.api.preview({ node: { kind: 'local', root: '/srv/proj' }, action: 'move',
+  await assert.rejects(h.api.preview({consumerRoot: __CONSUMER__,  node: { kind: 'local', root: '/srv/proj' }, action: 'move',
     authorizationMode: 'confirmed_paths', targets: [file('out/a')] }), error => error.code === 'INVALID_ACTION');
   assert.equal(h.calls.length, 0);
 });
@@ -130,7 +131,7 @@ test('the public confirmed preview entry carries 5000 targets through bounded ba
   await assert.rejects(h.preview(Array.from({ length: 5001 }, (_, i) => file('out/i' + i + '.log'))),
     error => error.code === 'INVALID_REQUEST', 'beyond 5000 the public entry refuses before any RPC');
   // move/restore/isolate keep their own per-target 500 limit untouched.
-  await assert.rejects(h.api.preview({ node: { kind: 'local', root: '/srv/proj' }, action: 'move',
+  await assert.rejects(h.api.preview({consumerRoot: __CONSUMER__,  node: { kind: 'local', root: '/srv/proj' }, action: 'move',
     targets: Array.from({ length: 501 }, (_, i) => file('out/j' + i + '.log')) }), error => error.code === 'INVALID_REQUEST');
 });
 
@@ -138,12 +139,12 @@ test('a full confirmed row mutates through one serial RPC and never re-runs', as
   const h = harness();
   const row = await h.preview(Array.from({ length: 500 }, (_, i) => file('out/f' + i + '.log')));
   await confirmed(h, row);
-  const executed = await h.api.execute({ token: row.token, digest: row.digest, index: 0 });
+  const executed = await h.api.execute({consumerRoot: __CONSUMER__,  token: row.token, digest: row.digest, index: 0 });
   assert.equal(executed.ok, true);
   assert.equal(h.counts('delete-fast'), 1, 'the whole batch mutates through exactly one serial RPC');
   assert.equal(h.lastOf('delete-fast').entries.length, 500);
   assert.equal(h.lastOf('delete-fast').rootIdentity.inode, '100');
-  const rerun = await h.api.execute({ token: row.token, digest: row.digest, index: 0 });
+  const rerun = await h.api.execute({consumerRoot: __CONSUMER__,  token: row.token, digest: row.digest, index: 0 });
   assert.equal(rerun.alreadyCompleted, true);
   assert.equal(h.counts('delete-fast'), 1, 'a completed batch must never re-mutate');
 });
@@ -153,17 +154,17 @@ test('execute passes entry identity through and verify settles with one batched 
   const row = await h.preview([file('out/a.log'), { relativePath: 'out/run1', type: 'directory' },
     { relativePath: JOB, type: 'directory', destination: JOB }, file('out/gone.log')]);
   await confirmed(h, row);
-  await h.api.execute({ token: row.token, digest: row.digest, index: 0 });
+  await h.api.execute({consumerRoot: __CONSUMER__,  token: row.token, digest: row.digest, index: 0 });
   const entries = h.lastOf('delete-fast').entries;
   assert.equal(entries.length, 3, 'the missing entry never reaches the mutation RPC');
   assert.deepEqual(entries.map(e => e.relativePath), ['out/a.log', 'out/run1', JOB]);
   assert.equal(entries[1].isolationName, 'iso_candidate', 'directories carry their preview isolation name');
   assert.ok(!entries[2].isolationName, 'registered archived artifacts must never gain an isolation rename');
   assert.equal(entries[0].device, '7');
-  const proof = await h.api.verify({ token: row.token, index: 0 });
+  const proof = await h.api.verify({consumerRoot: __CONSUMER__,  token: row.token, index: 0 });
   assert.equal(proof.state, 'completed');
   assert.equal(h.counts('batch-verify'), 1, 'verification is one batched active query, not per file');
-  const status = await h.api.status({ token: row.token });
+  const status = await h.api.status({consumerRoot: __CONSUMER__,  token: row.token });
   assert.equal(h.counts('batch-verify'), 2);
   assert.equal(status.statusQueryError, undefined);
   assert.ok(status.states.filter(s => s === 'completed').length === 3);
@@ -175,24 +176,24 @@ test('pre-mutation refusals keep the batch retryable; lost receipts stay uncerta
   h.deleteFastReplies.push({ ok: false, error: { code: 'ENTRY_IDENTITY_CHANGED', mutationStarted: false } });
   const row = await h.preview([file('out/a.log'), file('out/b.log')]);
   await confirmed(h, row);
-  await assert.rejects(h.api.execute({ token: row.token, digest: row.digest, index: 0 }),
+  await assert.rejects(h.api.execute({consumerRoot: __CONSUMER__,  token: row.token, digest: row.digest, index: 0 }),
     error => error.code === 'ENTRY_IDENTITY_CHANGED');
-  const stored = await h.api.read(row.token);
+  const stored = await h.api.read(row.token, __CONSUMER__);
   assert.deepEqual(stored.states, ['pending', 'pending'], 'a zero-mutation refusal must leave the batch retryable');
-  await h.api.execute({ token: row.token, digest: row.digest, index: 0 });
+  await h.api.execute({consumerRoot: __CONSUMER__,  token: row.token, digest: row.digest, index: 0 });
   assert.equal(h.counts('delete-fast'), 2, 'the retry after a proven zero-mutation refusal may run');
 
   const lost = harness();
   lost.deleteFastReplies.push({ ok: false, error: { code: 'TIMEOUT' } });
   const row2 = await lost.preview([file('out/c.log')]);
   await confirmed(lost, row2);
-  await assert.rejects(lost.api.execute({ token: row2.token, digest: row2.digest, index: 0 }),
+  await assert.rejects(lost.api.execute({consumerRoot: __CONSUMER__,  token: row2.token, digest: row2.digest, index: 0 }),
     error => error.code === 'TIMEOUT');
-  await assert.rejects(lost.api.execute({ token: row2.token, digest: row2.digest, index: 0 }),
+  await assert.rejects(lost.api.execute({consumerRoot: __CONSUMER__,  token: row2.token, digest: row2.digest, index: 0 }),
     error => error.code === 'DELETE_RECEIPT_UNCERTAIN', 'an unknown outcome must not blind-rerun');
-  const settled = await lost.api.status({ token: row2.token });
+  const settled = await lost.api.status({consumerRoot: __CONSUMER__,  token: row2.token });
   assert.equal(settled.states[0], 'completed', 'the active batch query, not a rerun, resolves reality');
-  const rerun = await lost.api.execute({ token: row2.token, digest: row2.digest, index: 0 });
+  const rerun = await lost.api.execute({consumerRoot: __CONSUMER__,  token: row2.token, digest: row2.digest, index: 0 });
   assert.equal(rerun.alreadyCompleted, true);
   assert.equal(lost.counts('delete-fast'), 1);
 
@@ -200,20 +201,20 @@ test('pre-mutation refusals keep the batch retryable; lost receipts stay uncerta
   const row3 = await present.preview([file('out/d.log')]);
   await confirmed(present, row3);
   present.deleteFastReplies.push({ ok: false, error: { code: 'TIMEOUT' } });
-  await assert.rejects(present.api.execute({ token: row3.token, digest: row3.digest, index: 0 }));
-  const contradicted = await present.api.status({ token: row3.token });
+  await assert.rejects(present.api.execute({consumerRoot: __CONSUMER__,  token: row3.token, digest: row3.digest, index: 0 }));
+  const contradicted = await present.api.status({consumerRoot: __CONSUMER__,  token: row3.token });
   assert.equal(contradicted.states[0], 'unknown', 'a still-present entry after a lost receipt is reported honestly');
 });
 
 test('check and settle on confirmed rows answer from one batched active query', async () => {
   const h = harness();
   const row = await h.preview([file('out/a.log'), file('out/b.log')]);
-  const checked = await h.api.check({ token: row.token, index: 0 });
+  const checked = await h.api.check({consumerRoot: __CONSUMER__,  token: row.token, index: 0 });
   assert.equal(checked.state, 'completed', 'entries already gone before execution report the truth');
   assert.equal(h.counts('batch-verify'), 1);
   assert.equal(h.counts('check'), 0, 'the fast chain must not use per-target check RPCs');
   await confirmed(h, row);
-  const settled = await h.api.settle({ token: row.token, digest: row.digest, index: 0 });
+  const settled = await h.api.settle({consumerRoot: __CONSUMER__,  token: row.token, digest: row.digest, index: 0 });
   assert.equal(settled.state, 'completed');
   assert.equal(h.counts('batch-verify'), 2);
 });
@@ -226,12 +227,12 @@ test('retry admits only the proven zero-mutation fact; partial or fact-less fail
   partial.deleteFastReplies.push({ ok: false, error: { code: 'TYPE_CHANGED', mutationStarted: true } });
   const row = await partial.preview([file('out/a.log'), file('out/b.log')]);
   await confirmed(partial, row);
-  await assert.rejects(partial.api.execute({ token: row.token, digest: row.digest, index: 0 }),
+  await assert.rejects(partial.api.execute({consumerRoot: __CONSUMER__,  token: row.token, digest: row.digest, index: 0 }),
     error => error.code === 'TYPE_CHANGED' && error.mutationStarted === true);
-  const stored = await partial.api.read(row.token);
+  const stored = await partial.api.read(row.token, __CONSUMER__);
   assert.equal(stored.batchExecuting, true, 'a proven partial batch stays uncertain');
   assert.deepEqual(stored.states, ['executing', 'executing'], 'already-unlinked entries must not be shown pending');
-  await assert.rejects(partial.api.execute({ token: row.token, digest: row.digest, index: 0 }),
+  await assert.rejects(partial.api.execute({consumerRoot: __CONSUMER__,  token: row.token, digest: row.digest, index: 0 }),
     error => error.code === 'DELETE_RECEIPT_UNCERTAIN');
   assert.equal(partial.counts('delete-fast'), 1, 'the partial batch must never be blindly rerun');
 
@@ -240,9 +241,9 @@ test('retry admits only the proven zero-mutation fact; partial or fact-less fail
   factless.deleteFastReplies.push({ ok: false, error: { code: 'ENTRY_IDENTITY_CHANGED' } });
   const row2 = await factless.preview([file('out/c.log')]);
   await confirmed(factless, row2);
-  await assert.rejects(factless.api.execute({ token: row2.token, digest: row2.digest, index: 0 }),
+  await assert.rejects(factless.api.execute({consumerRoot: __CONSUMER__,  token: row2.token, digest: row2.digest, index: 0 }),
     error => error.code === 'ENTRY_IDENTITY_CHANGED');
-  await assert.rejects(factless.api.execute({ token: row2.token, digest: row2.digest, index: 0 }),
+  await assert.rejects(factless.api.execute({consumerRoot: __CONSUMER__,  token: row2.token, digest: row2.digest, index: 0 }),
     error => error.code === 'DELETE_RECEIPT_UNCERTAIN', 'a missing fact must never unlock a rerun');
   assert.equal(factless.counts('delete-fast'), 1);
 
@@ -251,9 +252,9 @@ test('retry admits only the proven zero-mutation fact; partial or fact-less fail
   zero.deleteFastReplies.push({ ok: false, error: { code: 'TYPE_CHANGED', mutationStarted: false } });
   const row3 = await zero.preview([file('out/d.log')]);
   await confirmed(zero, row3);
-  await assert.rejects(zero.api.execute({ token: row3.token, digest: row3.digest, index: 0 }),
+  await assert.rejects(zero.api.execute({consumerRoot: __CONSUMER__,  token: row3.token, digest: row3.digest, index: 0 }),
     error => error.code === 'TYPE_CHANGED');
-  const retried = await zero.api.execute({ token: row3.token, digest: row3.digest, index: 0 });
+  const retried = await zero.api.execute({consumerRoot: __CONSUMER__,  token: row3.token, digest: row3.digest, index: 0 });
   assert.equal(retried.ok, true, 'a proven zero-mutation refusal may run again');
   assert.equal(zero.counts('delete-fast'), 2);
 });
@@ -266,19 +267,19 @@ test('an interrupted isolate-then-delete never settles completed while its isola
   const row = await h.preview([{ relativePath: 'out/run1', type: 'directory' }]);
   await confirmed(h, row);
   h.deleteFastReplies.push({ ok: false, error: { code: 'TIMEOUT' } });
-  await assert.rejects(h.api.execute({ token: row.token, digest: row.digest, index: 0 }), error => error.code === 'TIMEOUT');
-  const status = await h.api.status({ token: row.token });
+  await assert.rejects(h.api.execute({consumerRoot: __CONSUMER__,  token: row.token, digest: row.digest, index: 0 }), error => error.code === 'TIMEOUT');
+  const status = await h.api.status({consumerRoot: __CONSUMER__,  token: row.token });
   assert.equal(status.states[0], 'unknown', 'isolation tree standing means unfinished, not completed and not retryable-as-pending');
-  await assert.rejects(h.api.verify({ token: row.token, index: 0 }), e => ['CLEANUP_NOT_VERIFIED', 'NOT_VERIFIED'].includes(e.code));
+  await assert.rejects(h.api.verify({consumerRoot: __CONSUMER__,  token: row.token, index: 0 }), e => ['CLEANUP_NOT_VERIFIED', 'NOT_VERIFIED'].includes(e.code));
   const verify = h.lastOf('batch-verify');
   assert.deepEqual(verify.entries.map(e => e.relativePath), ['out/run1', 'out/iso_candidate'],
     'the verify batch carries the original entry and its entry-bound isolation probe');
   assert.equal(verify.entries[1].inode, row.targets[0].inode, 'the isolation probe stays bound to the frozen original identity');
-  const proof = await h.api.check({ token: row.token, index: 0 });
+  const proof = await h.api.check({consumerRoot: __CONSUMER__,  token: row.token, index: 0 });
   assert.equal(proof.state, 'unknown');
   assert.equal(proof.isolationStatus, 'present');
   // The next engine call for this row would be a blind rerun; the API must refuse it.
-  await assert.rejects(h.api.execute({ token: row.token, digest: row.digest, index: 0 }),
+  await assert.rejects(h.api.execute({consumerRoot: __CONSUMER__,  token: row.token, digest: row.digest, index: 0 }),
     error => error.code === 'DELETE_RECEIPT_UNCERTAIN');
 });
 
@@ -287,11 +288,11 @@ test('completion accounting finishes once the isolation tree is gone even if a f
     : entry.relativePath === 'out/run1' ? 'replaced' : 'gone' });
   const row = await h.preview([{ relativePath: 'out/run1', type: 'directory' }]);
   await confirmed(h, row);
-  await h.api.execute({ token: row.token, digest: row.digest, index: 0 });
-  const status = await h.api.status({ token: row.token });
+  await h.api.execute({consumerRoot: __CONSUMER__,  token: row.token, digest: row.digest, index: 0 });
+  const status = await h.api.status({consumerRoot: __CONSUMER__,  token: row.token });
   assert.equal(status.states[0], 'completed',
     'the confirmed tree is gone; a same-name fresh result is new data, never pending work nor a deletion demand');
-  const proof = await h.api.verify({ token: row.token, index: 0 });
+  const proof = await h.api.verify({consumerRoot: __CONSUMER__,  token: row.token, index: 0 });
   assert.equal(proof.state, 'completed');
   assert.equal(proof.isolationStatus, 'gone');
 });

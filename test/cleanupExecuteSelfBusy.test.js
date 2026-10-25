@@ -100,6 +100,7 @@ const NODES = {
 };
 const nodeFor = id => Object.assign({}, NODES[id]);
 
+const __CONSUMER__ = fs.mkdtempSync(path.join(os.tmpdir(), "selfbusy-consumer-"));
 async function confirmed(state, nodeId, relativePath, options = {}) {
   const node = nodeFor(nodeId);
   const action = options.action || "isolate";
@@ -107,9 +108,9 @@ async function confirmed(state, nodeId, relativePath, options = {}) {
   const archiveBatch = action === "isolate" ? "job-" + crypto.createHash("sha256").update(node.root + "|" + relativePath).digest("hex").slice(0, 48) : undefined;
   const destination = "clean_dir/" + (archiveBatch ? archiveBatch + "/" : "") + relativePath;
   const target = Object.assign({ relativePath, type: "directory", destination }, archiveBatch ? { archiveBatch } : {});
-  const preview = await state.methods["files.cleanup.preview"](Object.assign({ node, action,
+  const preview = await state.methods["files.cleanup.preview"](Object.assign({ consumerRoot: __CONSUMER__, node, action,
     observationMode: options.observationMode === null ? undefined : (options.observationMode || "managed_tmux"), targets: [target] }));
-  const approved = { token: preview.token, digest: preview.digest, index: 0 };
+  const approved = { token: preview.token, digest: preview.digest, index: 0, consumerRoot: __CONSUMER__ };
   await state.methods["files.cleanup.confirm"](Object.assign({}, approved, { phase: 1, confirm: true, exactTargets: [preview.targets[0].absolutePath] }));
   return Object.assign({ node, absolutePath: preview.targets[0].absolutePath }, approved);
 }
@@ -127,7 +128,7 @@ test("用户确认后的自身隔离执行完整走完，不被自己的 files.c
   assert.equal(state.leaseAcquisitions, 0, "受控观测链不得额外取得本地写租约");
   // 隔离执行完成的确认链：真实观测回报 completed 后，check 必须给出完成回执（不是“已发出”就算完）。
   state.observe = ["completed"];
-  const done = await state.methods["files.cleanup.check"]({ token: job.token, index: 0 });
+  const done = await state.methods["files.cleanup.check"]({ token: job.token, index: 0, consumerRoot: __CONSUMER__ });
   assert.equal(done.state, "completed", "确认后必须能观察到隔离完成");
   assert.ok(done.receipt && done.receipt.moved === true, "完成必须带真实移动回执");
 });
@@ -204,7 +205,7 @@ test("真实写入在途时只读预览仍被拒，且不产生任何 mutation�
   let release; state.startGate = new Promise(resolve => { release = resolve; state.release = release; });
   const running = state.methods["files.cleanup.execute"](first);
   assert.ok(await waitUntil(() => state.startStarted), "第一条写入必须已在途");
-  const blockedPreview = await state.methods["files.cleanup.preview"]({ node: nodeFor("nwpu5"), action: "isolate",
+  const blockedPreview = await state.methods["files.cleanup.preview"]({ consumerRoot: __CONSUMER__, node: nodeFor("nwpu5"), action: "isolate",
     observationMode: "managed_tmux", targets: [{ relativePath: "work/job9", type: "directory", destination: "clean_dir/work/job9" }] }).then(() => null, error => error);
   assert.ok(blockedPreview, "真实写入在途时预览必须仍然被拒（不得绕过他人互斥）");
   assert.equal(String(blockedPreview.code), "ACTIVE_TRANSFER");
