@@ -460,7 +460,8 @@ def receive(root, request, stream):
                     parent_fd = next_fd
                 try:
                     target = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
-                    if not stat.S_ISREG(target.st_mode) or target.st_nlink != 1:
+                    # os.replace below swaps only the directory entry, never writes through the existing inode, so a legal multi-link regular target (scientific pending alias) publishes while its aliases keep their exact inode and bytes.
+                    if not stat.S_ISREG(target.st_mode) or target.st_nlink < 1:
                         raise ValueError("unsafe publication target")
                 except FileNotFoundError:
                     pass
@@ -616,7 +617,8 @@ def chunk_state(request, stream=None):
                 parent = next_fd
             try:
                 target = os.stat(name.split("/")[-1], dir_fd=parent, follow_symlinks=False)
-                if not stat.S_ISREG(target.st_mode) or target.st_nlink != 1:
+                # Same publication contract as the tar path: os.replace swaps only the directory entry, never writes through the existing inode, so a legal multi-link regular target (scientific pending alias) publishes while its aliases keep their exact inode and bytes.
+                if not stat.S_ISREG(target.st_mode) or target.st_nlink < 1:
                     raise ValueError("unsafe publication target")
             except FileNotFoundError:
                 pass
