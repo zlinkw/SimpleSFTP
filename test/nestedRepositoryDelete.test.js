@@ -1,4 +1,5 @@
 const test=require('node:test'),assert=require('node:assert/strict'),path=require('node:path'),os=require('node:os'),fs=require('node:fs');
+const __CONSUMER__ = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'consumer-root-'));
 const {spawnSync}=require('node:child_process');
 const {CleanupFileApi}=require('../cleanup-file-api');
 
@@ -17,7 +18,7 @@ test('real engine fast preview stays entry-only read-only; protected descendants
   const result=spawnSync(process.platform==='win32'?'python':'python3',['-B','-X','utf8',path.resolve(__dirname,'../cleanup-files.py')],{input:JSON.stringify(request),encoding:'utf8',timeout:10000,windowsHide:true});
   assert.equal(result.status,0,result.error?.message||result.stderr);return JSON.parse(result.stdout);
  }});
- const preview=await api.preview({node:{kind:'local',root},action:'delete',authorizationMode:'confirmed_paths',targets:[{relativePath,type:'directory',destination:'clean_dir/'+relativePath}]});
+ const preview=await api.preview({consumerRoot: __CONSUMER__, node:{kind:'local',root},action:'delete',authorizationMode:'confirmed_paths',targets:[{relativePath,type:'directory',destination:'clean_dir/'+relativePath}]});
  // v1.9 entry-only preview: no descendant walk, so no preview-time refusal.
  // The engine builds absolutePath with its own platform path_guard for a LOCAL
  // node, so the expectation follows the host separator exactly (never a fixed
@@ -51,11 +52,11 @@ test('nested-repository preview remains bound to two exact path confirmations',a
   if(request.action==='batch-verify')return {ok:true,rootIdentity:{path:'/project'},targets:request.entries.map(e=>({...e,status:'gone'}))};
   assert.fail(request.action);
  }});
- const preview=await api.preview({node:{kind:'local',root:'/project'},action:'delete',authorizationMode:'confirmed_paths',targets:[{relativePath:'repos/cpsc',destination:'clean_dir/repos/cpsc',type:'directory'}]});
+ const preview=await api.preview({consumerRoot: __CONSUMER__, node:{kind:'local',root:'/project'},action:'delete',authorizationMode:'confirmed_paths',targets:[{relativePath:'repos/cpsc',destination:'clean_dir/repos/cpsc',type:'directory'}]});
  // v1.9 fast preview: entry-bound, no content hashing; nested-subtree scope
  // is confirmed by the whole-directory isolation row shown for approval.
  assert.equal(preview.safety.confirmedPathDeletion,1);assert.equal(preview.safety.entryIdentityBind,1);assert.equal(preview.safety.contentHash,0);
  assert.match(preview.targets[0].isolationAbsolutePath,/^\/project\/repos\/trepos-cpsc__iso_0123456789abcdef$/);
- for(const phase of [1,2]){await assert.rejects(api.execute({token:preview.token,digest:preview.digest,index:0}),/CONFIRM_REQUIRED/);await api.confirm({token:preview.token,digest:preview.digest,phase,confirm:true,exactTargets:['/project/repos/cpsc']});}
- assert.equal(mutations,0);await api.execute({token:preview.token,digest:preview.digest,index:0});assert.equal(mutations,1);
+ for(const phase of [1,2]){await assert.rejects(api.execute({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,index:0}),/CONFIRM_REQUIRED/);await api.confirm({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,phase,confirm:true,exactTargets:['/project/repos/cpsc']});}
+ assert.equal(mutations,0);await api.execute({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,index:0});assert.equal(mutations,1);
 });

@@ -1,4 +1,5 @@
 const test = require('node:test');
+const __CONSUMER__ = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'consumer-root-'));
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -130,12 +131,12 @@ test('file API freezes a declared archive batch in its read-only preview and rej
     } });
   const batch = 'job-' + 'a'.repeat(48), target = { relativePath: f.owner.outputDir, type: 'directory', archiveBatch: batch,
     destination: 'clean_dir/' + batch + '/' + f.owner.outputDir, expectedOwner: f.owner };
-  const params = { node: { id: 'local', kind: 'local', root: f.root }, targets: [target] };
+  const params = { consumerRoot: __CONSUMER__, node: { id: 'local', kind: 'local', root: f.root }, targets: [target] };
   const preview = await api.preview(params);
   assert.equal(preview.targets[0].archiveBatch, batch);
   assert.equal(preview.targets[0].destination, target.destination);
   assert.equal(preview.safety.immutableArchiveBatch, true);
-  await assert.rejects(api.preview({ ...params, targets: [{ ...target, archiveBatch: '../escape' }] }), /UNSAFE_ARCHIVE_BATCH/);
-  await assert.rejects(api.preview({ ...params, targets: [{ ...target, destination: 'clean_dir/other/' + target.relativePath }] }), /UNSAFE_DESTINATION/);
+  await assert.rejects(api.preview({consumerRoot: __CONSUMER__,  ...params, targets: [{ ...target, archiveBatch: '../escape' }] }), /UNSAFE_ARCHIVE_BATCH/);
+  await assert.rejects(api.preview({consumerRoot: __CONSUMER__,  ...params, targets: [{ ...target, destination: 'clean_dir/other/' + target.relativePath }] }), /UNSAFE_DESTINATION/);
   assert.equal(fs.existsSync(path.join(f.root, 'clean_dir')), false);
 });

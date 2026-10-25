@@ -277,6 +277,38 @@ function fail(code, message = code, details = {}) { const error = new Error(mess
   if (typeof details.mutationStarted === "boolean") error.mutationStarted = details.mutationStarted;
   throw error; }
 
+// r17-D consumerRoot: a cleanup token is an authorized-mutation batch and its ledger now lives
+// INSIDE the consuming local project (the project that issued the cleanup), never in a shared
+// global folder. row.node.root is the REMOTE target root and is never the local consumer. Every
+// token read/write must carry the local absolute consumer root; memory previews, project files
+// and legacy imports are all bound to it. The digest field set stays exactly as before —
+// consumerRoot is ownership metadata, never a business field.
+function requireConsumerRoot(value) {
+  const root = String(value || "");
+  if (!root || !path.isAbsolute(root) || /[\x00\r\n]/.test(root)) fail("CONSUMER_ROOT_INVALID");
+  return root;
+}
+// Same managed-segment semantics as the companion plugin: every simple_cluster segment is a
+// REAL directory created level by level (a linked managed tree would write THIS project's
+// authorization ledger into another project), POSIX write-bit rule only — Windows st_mode
+// carries no NTFS ACL semantics.
+async function ensureManagedSegment(dir) {
+  try { await fs.mkdir(dir, { mode: 0o700 }); }
+  catch (error) { if (error?.code !== "EEXIST") throw error; }
+  const stat = await fs.lstat(dir);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) fail("MANAGED_DIR_UNSAFE", "项目受管目录不得为链接或非目录：" + dir);
+  if (process.platform !== "win32" && (stat.mode & 0o022) !== 0) fail("MANAGED_DIR_UNSAFE", "项目受管目录允许组/其他用户写入：" + dir);
+}
+async function ensureConsumerCleanupDir(consumerRoot) {
+  let current = path.join(consumerRoot, "simple_cluster");
+  await ensureManagedSegment(current);
+  for (const part of ["state", "simple-sftp", "cleanup-operations"]) {
+    current = path.join(current, part);
+    await ensureManagedSegment(current);
+  }
+  return current;
+}
+
 // Discriminating identity fields of a CleanupNode; tokens bind to exactly one
 // node, so an observation request must agree on every field both sides carry.
 // When both sides carry a stable worker id it must match too: two tunnels can
@@ -288,6 +320,10 @@ const sameNode = (a, b) => Boolean(a && b) && ["kind", "root", "host", "port", "
 
 /** A path capability authorizes one frozen batch, never a later or remembered path. */
 class CleanupFileApi {
+  /** ONE instance per window stays the design: observe slots, busy set and leases are global
+   * read/mutation guards and must not be split into per-project instances. storageRoot is the
+   * LEGACY global folder, kept ONLY as the read-only byte source for exact digest-verified
+   * imports; every new record lives under the consuming project's managed tree. */
   constructor({ storageRoot, transport, activity, lease }) {
     this.storageRoot = storageRoot; this.transport = transport; this.activity = activity; this.lease = lease;
     this.previews = new Map(); this.busy = new Set(); this.localExecutions = new Map();
@@ -310,15 +346,65 @@ class CleanupFileApi {
     if (!value?.ok) fail(value?.error?.code || "UNVERIFIED_RESPONSE", value?.error?.message, value?.error || {});
     return value;
   }
-  async read(token) {
+  /** Read a token's row bound to ONE verified local consumer root. An in-memory preview must
+   * belong to the same project; the project location is the only writable source. A missing
+   * project record may be restored from the untouched legacy global folder ONLY with the
+   * caller's exact frozen digest reference (backendDigest byte-match), never by scanning or
+   * guessing; a corrupt project record never falls back to legacy. */
+  async read(token, consumerRoot, expectedDigest) {
     if (!/^[a-f0-9]{48}$/.test(String(token))) fail("INVALID_TOKEN");
+    const root = requireConsumerRoot(consumerRoot);
     const memory = this.previews.get(token);
-    if (memory) return copy(memory);
-    try { return JSON.parse(await fs.readFile(path.join(this.storageRoot, token + ".json"), "utf8")); }
-    catch { fail("PREVIEW_EXPIRED"); }
+    if (memory) {
+      if (memory.consumerRoot !== undefined && memory.consumerRoot !== root) fail("CONSUMER_ROOT_MISMATCH");
+      return copy(memory);
+    }
+    const target = path.join(await ensureConsumerCleanupDir(root), token + ".json");
+    let text;
+    try { text = await fs.readFile(target, "utf8"); }
+    catch (error) {
+      if (error?.code !== "ENOENT") fail("PREVIEW_EXPIRED");
+      // No project record yet. The legacy global folder is mixed and read-only: import happens
+      // only for a token this project can prove with its frozen backend digest. No reference,
+      // no import — the caller surfaces this stop code instead of the api guessing an owner.
+      if (typeof expectedDigest !== "string") fail("LEGACY_IMPORT_UNBOUND");
+      let legacyText;
+      try { legacyText = await fs.readFile(path.join(this.storageRoot, token + ".json"), "utf8"); }
+      catch { fail("PREVIEW_EXPIRED"); }
+      let legacyRow;
+      try { legacyRow = JSON.parse(legacyText); } catch { fail("TOKEN_DIGEST_MISMATCH"); }
+      if (legacyRow?.token !== token || legacyRow?.digest !== expectedDigest) fail("TOKEN_DIGEST_MISMATCH");
+      // Exact evidence established: publish the legacy BYTES at the project location. A record
+      // that raced ahead at the target keeps its NEW value (link EEXIST), it is never clobbered.
+      const temp = path.join(path.dirname(target), `.migrating-${process.pid}-${crypto.randomBytes(4).toString("hex")}.tmp`);
+      let created = false;
+      try {
+        await fs.writeFile(temp, legacyText, { flag: "wx" }); // exclusive: never reuse any surviving temp
+        created = true;
+        try { await fs.link(temp, target); }
+        catch (linkError) { if (linkError?.code !== "EEXIST") throw linkError; }
+      } finally {
+        if (created) await fs.rm(temp, { force: true }); // release only a temp THIS call created
+      }
+      try { text = await fs.readFile(target, "utf8"); }
+      catch { fail("PREVIEW_EXPIRED"); } // raced release: re-preview re-establishes the ledger
+    }
+    let row;
+    try { row = JSON.parse(text); } catch { fail("PREVIEW_CORRUPT"); } // corrupt project record: NO legacy fallback
+    if (!row || row.token !== token) fail("PREVIEW_CORRUPT");
+    if (row.consumerRoot !== undefined && row.consumerRoot !== root) fail("CONSUMER_ROOT_MISMATCH");
+    row.consumerRoot = root;
+    return copy(row);
   }
-  async save(row) { await atomicWriteText(path.join(this.storageRoot, row.token + ".json"), JSON.stringify(row)); this.previews.set(row.token, copy(row)); }
+  /** Ownership is mandatory: a record without a verified consumer root is never written, and
+   * the shared legacy folder is never a write target again. */
+  async save(row) {
+    const root = requireConsumerRoot(row.consumerRoot);
+    await atomicWriteText(path.join(await ensureConsumerCleanupDir(root), row.token + ".json"), JSON.stringify(row));
+    this.previews.set(row.token, copy(row));
+  }
   async preview(params) {
+    const consumerRoot = requireConsumerRoot(params.consumerRoot); // the LOCAL consuming project, never node.root
     const tmuxSessionPrefix = String(params.tmuxSessionPrefix || "simple").trim();
     if (!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(tmuxSessionPrefix)) fail("INVALID_TMUX_SESSION_PREFIX");
     for (const [token, preview] of this.previews) if (Date.now() > preview.expiresAt) this.previews.delete(token);
@@ -333,7 +419,7 @@ class CleanupFileApi {
     // batched fast chain and accepts the full engine FAST_BATCH_LIMIT of 5000
     // targets; move/restore/isolate keep their own per-target 500 limit.
     if (!node?.root || !["move", "delete", "restore", "isolate"].includes(action) || !Array.isArray(targets) || !targets.length || targets.length > (pathOnly ? 5000 : 500)) fail("INVALID_REQUEST");
-    if (pathOnly) return await this.previewFast(node, targets, tmuxSessionPrefix);
+    if (pathOnly) return await this.previewFast(node, targets, tmuxSessionPrefix, consumerRoot);
     if (!pathOnly) await this.activity(node);
     const rows = []; let identity;
     for (const original of targets) {
@@ -363,7 +449,7 @@ class CleanupFileApi {
       identity = result.rootIdentity;
       rows.push({ ...copy(target), ...result.target, destination: target.destination });
     }
-    const row = { token: crypto.randomBytes(24).toString("hex"), operationId: "cleanup-" + crypto.randomBytes(16).toString("hex"), node: copy(node), rootIdentity: identity,
+    const row = { token: crypto.randomBytes(24).toString("hex"), operationId: "cleanup-" + crypto.randomBytes(16).toString("hex"), consumerRoot, node: copy(node), rootIdentity: identity,
       action, observationMode, authorizationMode: pathOnly ? "confirmed_paths" : undefined, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, managedObservation: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: action === "isolate" ? 1 : undefined, requiredInputGuard: action === "isolate" ? 1 : undefined, registeredIsolationDeletion: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1, chunkedFrozenManifest: 1, pinnedRuntimeProgram: 1, handleScan: pathOnly ? "confirmed_paths" : observationMode ? "managed_tmux" : "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
     row.tmuxSessionPrefix = tmuxSessionPrefix;
     row.targetDigests = rows.map(targetHash);
@@ -374,7 +460,7 @@ class CleanupFileApi {
   /** v1.9 confirmed selection: entry identity binds, one batched read-only
    * metadata transfer per chunk, bounded parallel reads; mutation stays one
    * serial delete-fast call. Directories isolate by non-overwriting rename. */
-  async previewFast(node, targets, tmuxSessionPrefix) {
+  async previewFast(node, targets, tmuxSessionPrefix, consumerRoot) {
     for (const target of targets) {
       if (!target || !["file", "directory"].includes(target.type)) fail("UNCERTAIN_TYPE");
       const rel = target.relativePath;
@@ -407,7 +493,7 @@ class CleanupFileApi {
           ...(entry.isolationName ? { isolationAbsolutePath: entry.absolutePath.slice(0, entry.absolutePath.length - leaf.length) + entry.isolationName } : {}) });
       }
     }
-    const row = { token: crypto.randomBytes(24).toString("hex"), operationId, node: copy(node), rootIdentity: identity,
+    const row = { token: crypto.randomBytes(24).toString("hex"), operationId, consumerRoot, node: copy(node), rootIdentity: identity,
       action: "delete", authorizationMode: "confirmed_paths", targets: rows,
       safety: { batchPreviewCapacity: 4096, confirmedPathDeletion: 1, entryIdentityBind: 1, batchedFastDelete: 1,
         directoryTreeIsolateDelete: 1, isolationRenameNoReplace: 1, registeredIsolationDeletion: 1, subtreeSingleWriter: 1,
@@ -428,10 +514,13 @@ class CleanupFileApi {
     const result = await this.checked({ node: params.node, root: params.node.root, action: "inventory", target: params.target,
       manifestOnly: params.manifestOnly === true, presenceOnly: params.presenceOnly === true,
       allowMissing: params.allowMissing === true, observeExecutors: params.observeExecutors === true });
+    // An executor fact from another consumer's preview never answers for this project.
+    const filterRoot = params.consumerRoot === undefined ? undefined : requireConsumerRoot(params.consumerRoot);
     if (params.observeExecutors === true && params.node.kind === "local") {
       result.executorsChecked = true; result.executors = [];
       for (const [key] of this.localExecutions) {
         const [token, index] = key.split(":"), row = this.previews.get(token), target = row?.targets[Number(index)];
+        if (filterRoot !== undefined && row?.consumerRoot !== filterRoot) continue;
         if (row && hash(row.rootIdentity) === hash(result.rootIdentity) && target?.relativePath === params.target.relativePath)
           result.executors.push({ kind: "active_local_transfer" });
       }
@@ -566,6 +655,10 @@ class CleanupFileApi {
     // The next public call reads again: no cross-round cache, read()'s own
     // semantics for other callers stay exactly as they were.
     const rowSnapshots = new Map(), ROW_READ_FAILED = Symbol("row-read-failed");
+    // Every token read inside the round binds the caller's local consumer root; a round that
+    // carries backend references without one is refused at REQUEST level, not per target.
+    const consumerRoot = targets.some(target => target?.backendToken !== undefined || target?.backendIndex !== undefined)
+      ? requireConsumerRoot(params.consumerRoot) : undefined;
     for (const target of targets) {
       const key = target?.key, rel = target?.relativePath, type = target?.type;
       if (typeof key !== "string" || !key || seen.has(key) || !["file", "directory"].includes(type)) fail("INVALID_REQUEST");
@@ -577,14 +670,20 @@ class CleanupFileApi {
       let isolationRelativePath = target.isolationRelativePath, rootIdentity = params.rootIdentity;
       if (target.backendToken !== undefined || target.backendIndex !== undefined) {
         if (typeof target.backendToken !== "string" || !Number.isInteger(target.backendIndex) || target.backendIndex < 0
-            || isolationRelativePath !== undefined && typeof isolationRelativePath !== "string") fail("INVALID_REQUEST");
+            || isolationRelativePath !== undefined && typeof isolationRelativePath !== "string"
+            || target.backendDigest !== undefined && typeof target.backendDigest !== "string") fail("INVALID_REQUEST");
         const unknown = code => { early.set(key, { key, relativePath: rel, type, state: "unknown", executors: [], executorsChecked: false,
           ...(isolationRelativePath !== undefined ? { isolationChecked: false } : {}), error: { code, message: code } }); };
         const snapshot = rowSnapshots.get(target.backendToken);
         if (snapshot === ROW_READ_FAILED) { unknown("TOKEN_UNAVAILABLE"); continue; }
         if (snapshot !== undefined) row = snapshot;
-        else try { row = await this.read(target.backendToken); rowSnapshots.set(target.backendToken, row); }
-        catch { rowSnapshots.set(target.backendToken, ROW_READ_FAILED); unknown("TOKEN_UNAVAILABLE"); continue; }
+        // The round's stop codes (attribution, unbound legacy, corrupt) surface per target as
+        // that target's honest unknown instead of being flattened into TOKEN_UNAVAILABLE.
+        else try { row = await this.read(target.backendToken, consumerRoot, typeof target.backendDigest === "string" ? target.backendDigest : undefined); rowSnapshots.set(target.backendToken, row); }
+        catch (error) { rowSnapshots.set(target.backendToken, ROW_READ_FAILED); unknown(String(error?.code || "TOKEN_UNAVAILABLE")); continue; }
+        // A raced-in project record keeps its own value; if it no longer matches THIS target's
+        // frozen reference, the target answers unknown rather than borrowing foreign facts.
+        if (typeof target.backendDigest === "string" && row.digest !== target.backendDigest) { unknown("TOKEN_DIGEST_MISMATCH"); continue; }
         // Cross-node or cross-root token reuse is refused per target, never
         // answered with the wrong root's facts.
         if (!sameNode(row.node, node) || rootIdentity !== undefined && hash(row.rootIdentity) !== hash(rootIdentity)) { unknown("TOKEN_NODE_MISMATCH"); continue; }
@@ -699,7 +798,7 @@ class CleanupFileApi {
       ...(roundIdentity === undefined ? {} : { rootIdentity: roundIdentity }), observations };
   }
   async check(params) {
-    const row = await this.read(params.token), index = params.index;
+    const row = await this.read(params.token, params.consumerRoot, typeof params.backendDigest === "string" ? params.backendDigest : undefined), index = params.index;
     if (!Number.isInteger(index) || !row.targets[index]) fail("INVALID_TARGET");
     if (isFastDeleteRow(row)) return this.fastVerify(row, index);
     if (row.observationMode) return this.observe(row, index);
@@ -707,7 +806,7 @@ class CleanupFileApi {
       action: "check", deleted: row.action === "delete", receiptCompleted: row.states[index] === "completed" });
   }
   async confirm(params) {
-    const row = await this.read(params.token);
+    const row = await this.read(params.token, params.consumerRoot, typeof params.digest === "string" ? params.digest : undefined);
     if (Date.now() > row.expiresAt) fail("PREVIEW_EXPIRED");
     if (params.confirm !== true || params.digest !== row.digest || hash(params.exactTargets) !== hash(row.targets.filter(t => !t.missing).map(t => t.absolutePath))) fail("CONFIRM_REQUIRED");
     if (params.phase !== row.confirmations + 1 || params.phase > (row.action === "delete" ? 2 : 1)) fail("CONFIRM_REQUIRED");
@@ -715,7 +814,7 @@ class CleanupFileApi {
     return { ok: true, token: row.token, digest: row.digest, confirmations: row.confirmations };
   }
   async execute(params) {
-    const row = await this.read(params.token);
+    const row = await this.read(params.token, params.consumerRoot, typeof params.digest === "string" ? params.digest : undefined);
     if (params.digest !== row.digest || row.confirmations !== (row.action === "delete" ? 2 : 1)) fail("CONFIRM_REQUIRED");
     const index = params.index;
     if (!Number.isInteger(index) || !row.targets[index]) fail("INVALID_TARGET");
@@ -840,7 +939,7 @@ class CleanupFileApi {
       ...(compact ? { frozenTargetDigest: row.targetDigests?.[index] || targetHash(frozen) } : {}) });
   }
   async status(params) {
-    const row = await this.read(params.token);
+    const row = await this.read(params.token, params.consumerRoot, typeof params.backendDigest === "string" ? params.backendDigest : undefined);
     if (isFastDeleteRow(row)) {
       // Batched active queries refresh the whole selection in bounded
       // read-only RPCs (fastVerify chunks by expanded entries), never per file.
@@ -890,7 +989,7 @@ class CleanupFileApi {
   }
   /** Settle an already-authorized receipt before coordinator preflight. Never starts a new move. */
   async settle(params) {
-    const row = await this.read(params.token), index = params.index, target = row.targets[index];
+    const row = await this.read(params.token, params.consumerRoot, typeof params.digest === "string" ? params.digest : undefined), index = params.index, target = row.targets[index];
     if (params.digest !== row.digest || !Number.isInteger(index) || !target || row.confirmations !== (row.action === "delete" ? 2 : 1)) fail("CONFIRM_REQUIRED");
     if (isFastDeleteRow(row)) return this.fastVerify(row, index);
     if (row.observationMode) return this.observe(row, index);
@@ -918,7 +1017,7 @@ class CleanupFileApi {
     } finally { this.busy.delete(row.token); }
   }
   async verify(params) {
-    const row = await this.read(params.token), target = row.targets[params.index];
+    const row = await this.read(params.token, params.consumerRoot, typeof params.backendDigest === "string" ? params.backendDigest : undefined), target = row.targets[params.index];
     if (isFastDeleteRow(row) && target) {
       const proof = await this.fastVerify(row, params.index);
       if (proof.state !== "completed") fail("CLEANUP_NOT_VERIFIED");

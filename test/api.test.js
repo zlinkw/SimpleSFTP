@@ -6,6 +6,7 @@ const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const vm = require("node:vm");
 const { HostOperationLeaseManager } = require("../host-operation-lease");
 
 const {
@@ -441,10 +442,49 @@ test("SimpleSFTP target and upload helpers support explicit servers without sftp
   assert.match(extensionSource, /apiTransferSftp\(params\)/);
 });
 
+// r33#1：从唯一的 module.exports 声明式对象提取完整对象字面量——按括号配平找到真正的闭合括号
+// （跳过 // 行注释、块注释与引号段），不用固定字面距离或无闭合边界的 .* 正则。
+function exportedObjectText(source) {
+  const anchor = "\nmodule.exports = {";
+  assert.equal(source.split(anchor).length - 1, 1, "module.exports 声明式对象必须唯一");
+  const start = source.indexOf(anchor) + anchor.length - 1;
+  let depth = 0;
+  let quote = null;
+  let escaped = false;
+  for (let i = start; i < source.length; i += 1) {
+    const ch = source[i];
+    const next = source[i + 1];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "/" && next === "/") { i += 1; continue; }
+    if (ch === "/" && next === "*") { const end = source.indexOf("*/", i + 2); assert.notEqual(end, -1, "块注释必须闭合"); i = end + 1; continue; }
+    if (ch === '"' || ch === "'" || ch === "`") { quote = ch; continue; }
+    if (ch === "{" || ch === "(" || ch === "[") depth += 1;
+    else if (ch === "}" || ch === ")" || ch === "]") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, i + 1);
+    }
+  }
+  assert.fail("module.exports 对象字面量缺少闭合括号");
+}
+
 test("SimpleSFTP showCurrentTarget uses explicit server + remotePath", () => {
   assert.match(extensionSource, /async function showCurrentTarget[\s\S]{0,700}apiTransferSftp/);
   assert.match(extensionSource, /hasExplicitTarget = Boolean/);
-  assert.match(extensionSource, /module\.exports[\s\S]{0,200}apiTransferSftp/);
+  // r33#1：原 /module\.exports[\s\S]{0,200}apiTransferSftp/ 只是"存在于导出块"的字面布局代理，
+  // __test 内新增 hooks 后距离被推到 826>200 即同因复发。改为在 vm 中仅求值导出声明式对象
+  // （不跑整个扩展），自由标识符全部绑定为同名哨兵值，验证真实 module.exports.__test 的
+  // apiTransferSftp own 成员及绑定；apiTransferSftp 被移除、移入其它嵌套或改名别名时转败。
+  const sentinels = new Proxy({}, { has: () => true, get: (_target, name) => (typeof name === "string" ? `sentinel:${name}` : undefined) });
+  const evaluate = vm.runInNewContext(`(sentinels) => { with (sentinels) { return (${exportedObjectText(extensionSource)}); } }`, {});
+  const exported = evaluate(sentinels);
+  assert.ok(Object.hasOwn(exported, "__test"), "module.exports 必须含 __test 导出成员");
+  assert.ok(Object.hasOwn(exported.__test, "apiTransferSftp"), "apiTransferSftp 必须是 __test 导出块的直接成员");
+  assert.equal(exported.__test.apiTransferSftp, "sentinel:apiTransferSftp", "__test.apiTransferSftp 必须绑定同名模块级实现，不得别名指向其它标识符");
 });
 
 test("SimpleSFTP config and server API helpers are defined and validate types", () => {

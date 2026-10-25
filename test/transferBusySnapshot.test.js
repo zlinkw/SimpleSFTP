@@ -203,7 +203,7 @@ test('真实 CleanupFileApi 守卫经真实 API 封套抵达调用方，零租�
       req.on('error', reject); req.end(body);
     });
     const refused = await request({ jsonrpc: '2.0', id: 1, method: 'files.cleanup.preview',
-      params: { node: { kind: 'remote', root: '/mnt/nwpu3/zlk/MultiModal', host: 'h', port: 22, user: 'u' }, action: 'isolate',
+      params: { consumerRoot: require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'consumer-root-')), node: { kind: 'remote', root: '/mnt/nwpu3/zlk/MultiModal', host: 'h', port: 22, user: 'u' }, action: 'isolate',
         targets: [{ relativePath: 'work/job0', type: 'directory', destination: 'clean_dir/work/job0' }] } });
     assert.equal(refused.error.data.code, 'ACTIVE_TRANSFER');
     assert.equal(refused.error.code, 2010);

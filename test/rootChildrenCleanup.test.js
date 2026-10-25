@@ -1,4 +1,5 @@
 const test=require('node:test'),assert=require('node:assert/strict'),path=require('node:path'),os=require('node:os'),fs=require('node:fs');
+const __CONSUMER__ = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'consumer-root-'));
 const {spawnSync}=require('node:child_process');
 const {CleanupFileApi}=require('../cleanup-file-api');
 const engine=path.resolve(__dirname,'../cleanup-files.py');
@@ -26,13 +27,13 @@ test('root-file API inspection and preview use the real engine and keep two exac
   const child=spawnSync(process.platform==='win32'?'python':'python3',['-B','-X','utf8',engine],{input:JSON.stringify(request),encoding:'utf8',timeout:10000,windowsHide:true});
   assert.equal(child.status,0,child.stderr||child.error?.message);return JSON.parse(child.stdout);
  }});
- const presence=await api.inspect({node,target,presenceOnly:true,allowMissing:true,observeExecutors:true});assert.equal(presence.target.missing,false);
- const preview=await api.preview({node,action:'delete',authorizationMode:'confirmed_paths',targets:[target]});
- const approved={token:preview.token,digest:preview.digest,index:0};
+ const presence=await api.inspect({consumerRoot: __CONSUMER__, node,target,presenceOnly:true,allowMissing:true,observeExecutors:true});assert.equal(presence.target.missing,false);
+ const preview=await api.preview({consumerRoot: __CONSUMER__, node,action:'delete',authorizationMode:'confirmed_paths',targets:[target]});
+ const approved={token:preview.token,digest:preview.digest,index:0,consumerRoot:__CONSUMER__};
  for(const phase of [1,2]){
   await assert.rejects(api.execute(approved),/CONFIRM_REQUIRED/);
-  await assert.rejects(api.confirm({...approved,phase,confirm:true,exactTargets:[path.join(root,'other.json')]}),/CONFIRM_REQUIRED/);
-  await api.confirm({...approved,phase,confirm:true,exactTargets:preview.targets.map(row=>row.absolutePath)});
+  await assert.rejects(api.confirm({consumerRoot: __CONSUMER__, ...approved,phase,confirm:true,exactTargets:[path.join(root,'other.json')]}),/CONFIRM_REQUIRED/);
+  await api.confirm({consumerRoot: __CONSUMER__, ...approved,phase,confirm:true,exactTargets:preview.targets.map(row=>row.absolutePath)});
  }
  assert.equal(fs.readFileSync(path.join(root,relativePath),'utf8'),'fixture only');
  assert.equal(api.previews.get(preview.token).confirmations,2);

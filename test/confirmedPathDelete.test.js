@@ -1,4 +1,5 @@
 const test=require('node:test'),assert=require('node:assert/strict'),path=require('node:path'),os=require('node:os');
+const __CONSUMER__ = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'consumer-root-'));
 const {spawnSync}=require('node:child_process');
 const {CleanupFileApi}=require('../cleanup-file-api');
 test('confirmed paths unlink hardlinked backups across frozen job batches without touching other aliases',()=>{
@@ -34,15 +35,15 @@ test('confirmed-path deletion ignores task/owner activity gates but still requir
       if(request.action==='batch-verify')return {ok:true,rootIdentity:{path:'/fixture'},targets:request.entries.map(entry=>({...entry,status:'gone'}))};
       assert.fail(request.action);
     }});
-  const p=await api.preview({node:{kind:'local',root:'/fixture'},action:'delete',authorizationMode:'confirmed_paths',targets:[{
+  const p=await api.preview({consumerRoot: __CONSUMER__, node:{kind:'local',root:'/fixture'},action:'delete',authorizationMode:'confirmed_paths',targets:[{
     relativePath:'output/job',type:'directory',expectedOwner:{obsolete:true},expectedSha256:'old-hash'}]});
   assert.equal(p.safety.confirmedPathDeletion,1);
-  await assert.rejects(api.execute({token:p.token,digest:p.digest,index:0}),/CONFIRM_REQUIRED/);
-  await api.confirm({token:p.token,digest:p.digest,phase:1,confirm:true,exactTargets:['/fixture/output/job']});
-  await assert.rejects(api.execute({token:p.token,digest:p.digest,index:0}),/CONFIRM_REQUIRED/);
-  await assert.rejects(api.confirm({token:p.token,digest:p.digest,phase:2,confirm:true,exactTargets:['/fixture/other']}),/CONFIRM_REQUIRED/);
-  await api.confirm({token:p.token,digest:p.digest,phase:2,confirm:true,exactTargets:['/fixture/output/job']});
-  await api.execute({token:p.token,digest:p.digest,index:0});assert.equal(mutations,1);assert.equal(removed,true);assert.equal(leases,1);
+  await assert.rejects(api.execute({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,index:0}),/CONFIRM_REQUIRED/);
+  await api.confirm({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,phase:1,confirm:true,exactTargets:['/fixture/output/job']});
+  await assert.rejects(api.execute({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,index:0}),/CONFIRM_REQUIRED/);
+  await assert.rejects(api.confirm({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,phase:2,confirm:true,exactTargets:['/fixture/other']}),/CONFIRM_REQUIRED/);
+  await api.confirm({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,phase:2,confirm:true,exactTargets:['/fixture/output/job']});
+  await api.execute({consumerRoot: __CONSUMER__, token:p.token,digest:p.digest,index:0});assert.equal(mutations,1);assert.equal(removed,true);assert.equal(leases,1);
 });
 test('real executor keeps canonical-parent/type/link/content guards while ignoring stale metadata for explicit deletion',()=>{
   const fixture=path.resolve(__dirname,'confirmedPathDelete.fixture.py'),engine=path.resolve(__dirname,'../cleanup-files.py');

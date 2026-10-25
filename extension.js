@@ -4957,34 +4957,111 @@ function formatBytes(bytes) {
   return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
+// r26: session records (plugin action/time/device/remote-path facts) WRITES land in the consuming
+// project's managed tree, same single-source pattern as upload-state; the old .vscode file stays a
+// READ-ONLY source, never migrated, rewritten or deleted, and no old project directories are ever
+// enumerated. One fixed file per project is overwritten with the current value — no per-session history.
+function projectSessionPath(localPath) {
+  return path.join(localPath, "simple_cluster", "state", "simple-sftp", "session.json");
+}
 function writeLocalSessionRecord(localPath, record) {
-  const vscodeDir = path.join(localPath, ".vscode");
-  fs.mkdirSync(vscodeDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(vscodeDir, "simple-sftp-session.json"),
-    `${JSON.stringify(record, null, 2)}\n`,
-    "utf8"
-  );
+  const file = projectSessionPath(localPath);
+  let current = path.join(localPath, "simple_cluster");
+  const segments = [current];
+  for (const part of ["state", "simple-sftp"]) { current = path.join(current, part); segments.push(current); }
+  ensureManagedSegmentsSync(segments);
+  fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+}
+
+// r28: handoff markers are written to the remote project's managed state tree instead of the
+// remote root. The legacy root-level path stays a read-only source; a broken, empty or unusual
+// new marker never falls back to it, so a stale legacy handoff can never resurrect.
+const REMOTE_HANDOFF_MANAGED_SEGMENTS = ["simple_cluster", "state", "simple-sftp", "handoff"];
+
+function requireRemoteRoot(remotePath) {
+  const root = String(remotePath === undefined || remotePath === null ? "" : remotePath).replace(/\/+$/, "");
+  if (!root.startsWith("/")) {
+    throw new Error("远端项目根缺失或无效：必须是远端服务器上的 POSIX 绝对路径（不允许相对路径、空值或仅根目录），交接标记只能落在该项目的管理目录下。");
+  }
+  return root;
+}
+
+function safeHandoffMarkerName(markerName) {
+  const safeMarkerName = path.posix.basename(String(markerName || DEFAULT_HANDOFF_MARKER));
+  if (!safeMarkerName || safeMarkerName === "." || safeMarkerName === "..") {
+    throw new Error(`交接标记名称无效：${String(markerName)}`);
+  }
+  return safeMarkerName;
+}
+
+function getRemoteMarkerPath(remotePath, markerName) {
+  const root = requireRemoteRoot(remotePath);
+  return `${root}/${REMOTE_HANDOFF_MANAGED_SEGMENTS.join("/")}/${safeHandoffMarkerName(markerName)}`;
+}
+
+function legacyRemoteMarkerPath(remotePath, markerName) {
+  const root = requireRemoteRoot(remotePath);
+  return `${root}/${safeHandoffMarkerName(markerName)}`;
+}
+
+// r29: the sentinel is only trustworthy when the shell proved every parent step. A bare
+// `[ -e ]` on the marker returns false even under a parent that exists but is not searchable,
+// and a managed parent that is a symlink could read another project's marker. So the single
+// read-only command first proves the project root is a searchable directory, then walks each
+// managed parent: symlink, non-directory or non-searchable parents fail closed (exit 62/63/64
+// with stderr), and a missing parent under an already-proved searchable chain exits right away
+// with M. Only then may the marker itself emit U / R<payload> / M.
+function createRemoteHandoffReadCommand(root, markerPath) {
+  const steps = [`{ [ -d ${shellQuote(root)} ] && [ -x ${shellQuote(root)} ] || { printf %s 'remote root is not a searchable directory' >&2; exit 61; }; }`];
+  let parent = root;
+  for (const segment of REMOTE_HANDOFF_MANAGED_SEGMENTS) {
+    parent = `${parent}/${segment}`;
+    const quotedParent = shellQuote(parent);
+    steps.push(`{ if [ -L ${quotedParent} ]; then printf %s 'managed parent is a symlink' >&2; exit 62; fi; if [ -e ${quotedParent} ]; then [ -d ${quotedParent} ] || { printf %s 'managed parent is not a directory' >&2; exit 63; }; [ -x ${quotedParent} ] || { printf %s 'managed parent is not searchable' >&2; exit 64; }; else printf %s M; exit 0; fi; }`);
+  }
+  const quoted = shellQuote(markerPath);
+  // r30 ordinary-file contract: only a regular file may be cat'ed (an existing-but-not-regular
+  // marker such as a FIFO/device would block cat under a bare -e, a real regression against the
+  // old `-f` reader). Symlink/dir/FIFO/device all report U; a regular-but-unreadable marker keeps
+  // the real cat error; M is emitted only when the entry genuinely does not exist.
+  steps.push(`{ if [ -L ${quoted} ] || [ -d ${quoted} ]; then printf %s U; elif [ -f ${quoted} ]; then printf %s R; cat ${quoted}; elif [ -e ${quoted} ]; then printf %s U; else printf %s M; fi; }`);
+  return steps.join("; ");
 }
 
 async function readRemoteHandoffMarker(sftp, markerName) {
   const markerPath = getRemoteMarkerPath(sftp.remotePath, markerName);
-  const command = `if [ -f ${shellQuote(markerPath)} ]; then cat ${shellQuote(markerPath)}; fi`;
+  const command = createRemoteHandoffReadCommand(requireRemoteRoot(sftp.remotePath), markerPath);
   const stdout = await runSsh(sftp, command, 15000);
-  const text = stdout.trim();
-  return text ? JSON.parse(text) : null;
+  const text = String(stdout);
+  if (text === "M") {
+    const legacyPath = legacyRemoteMarkerPath(sftp.remotePath, markerName);
+    const legacyCommand = `if [ -f ${shellQuote(legacyPath)} ]; then cat ${shellQuote(legacyPath)}; fi`;
+    const legacyStdout = await runSsh(sftp, legacyCommand, 15000);
+    const legacyText = legacyStdout.trim();
+    return legacyText ? JSON.parse(legacyText) : null;
+  }
+  if (text === "U") throw new Error(`远端交接标记不可读（符号链接或目录），禁止读取旧路径内容：${markerPath}`);
+  if (text.startsWith("R")) {
+    const payload = text.slice(1).trim();
+    return payload ? JSON.parse(payload) : null;
+  }
+  throw new Error(`无法判定远端交接标记状态：${markerPath}`);
 }
 
 async function writeRemoteHandoffMarker(sftp, markerName, marker) {
   const markerPath = getRemoteMarkerPath(sftp.remotePath, markerName);
   const json = `${JSON.stringify(marker, null, 2)}\n`;
-  const command = `printf %s ${shellQuote(json)} > ${shellQuote(markerPath)}`;
+  const steps = [];
+  let managedPath = requireRemoteRoot(sftp.remotePath);
+  for (const segment of REMOTE_HANDOFF_MANAGED_SEGMENTS) {
+    managedPath = `${managedPath}/${segment}`;
+    const quotedDir = shellQuote(managedPath);
+    steps.push(`{ if [ -L ${quotedDir} ]; then exit 65; fi; mkdir -p -m 0700 ${quotedDir}; }`);
+  }
+  const quotedMarker = shellQuote(markerPath);
+  steps.push(`{ if [ -L ${quotedMarker} ]; then exit 66; fi; printf %s ${shellQuote(json)} > ${quotedMarker}; }`);
+  const command = steps.join(" && ");
   await withFileResourceLease("写入交接标记", sftp.remotePath, [markerPath], remoteResourceServer(sftp), () => runSsh(sftp, command, 15000));
-}
-
-function getRemoteMarkerPath(remotePath, markerName) {
-  const safeMarkerName = path.posix.basename(markerName || DEFAULT_HANDOFF_MARKER);
-  return `${String(remotePath).replace(/\/+$/, "")}/${safeMarkerName}`;
 }
 
 
@@ -5406,7 +5483,29 @@ function getUploadBaselineMs(localPath) {
   return now.getTime();
 }
 
+// r17-D: upload-state WRITES land in the project's managed tree; the old .vscode location stays
+// a READ-ONLY source (the new value always wins; the old file is never moved, rewritten or
+// deleted). A corrupt new file never falls back to the old timestamp — re-initializing is the
+// fail-closed reading of an unreadable own record.
+function ensureManagedSegmentsSync(roots) {
+  for (const dir of roots) {
+    try { fs.mkdirSync(dir, { mode: 0o700 }); }
+    catch (error) { if (error?.code !== "EEXIST") throw error; }
+    const stat = fs.lstatSync(dir);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("项目受管目录不得为链接或非目录：" + dir);
+    // Windows st_mode carries no NTFS ACL semantics; the write-bit rule is POSIX-only.
+    if (process.platform !== "win32" && (stat.mode & 0o022) !== 0) throw new Error("项目受管目录允许组/其他用户写入：" + dir);
+  }
+}
+function projectUploadStatePath(localPath) {
+  return path.join(localPath, "simple_cluster", "state", "simple-sftp", "upload-state.json");
+}
 function readUploadState(localPath) {
+  const newPath = projectUploadStatePath(localPath);
+  if (fs.existsSync(newPath)) {
+    try { return JSON.parse(fs.readFileSync(newPath, "utf8")); }
+    catch { return null; }
+  }
   const statePath = path.join(localPath, ".vscode", SAVE_UPLOAD_STATE);
   if (!fs.existsSync(statePath)) return null;
   try {
@@ -5417,16 +5516,23 @@ function readUploadState(localPath) {
 }
 
 function writeUploadState(localPath, state) {
-  const vscodeDir = path.join(localPath, ".vscode");
-  fs.mkdirSync(vscodeDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(vscodeDir, SAVE_UPLOAD_STATE),
-    `${JSON.stringify(state, null, 2)}\n`,
-    "utf8"
-  );
+  const file = projectUploadStatePath(localPath);
+  let current = path.join(localPath, "simple_cluster");
+  const segments = [current];
+  for (const part of ["state", "simple-sftp"]) { current = path.join(current, part); segments.push(current); }
+  ensureManagedSegmentsSync(segments);
+  fs.writeFileSync(file, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 }
 
 function readLocalSessionRecord(localPath) {
+  // r26: the managed-tree record wins whenever it exists; a corrupt new record never resurrects the
+  // old .vscode value (fail-closed on our own unreadable record). Only a missing new file consults
+  // the exact legacy path, read-only.
+  const newPath = projectSessionPath(localPath);
+  if (fs.existsSync(newPath)) {
+    try { return JSON.parse(fs.readFileSync(newPath, "utf8")); }
+    catch { return null; }
+  }
   const sessionPath = path.join(localPath, ".vscode", "simple-sftp-session.json");
   if (!fs.existsSync(sessionPath)) return null;
   try {
@@ -6616,6 +6722,9 @@ function getTarExcludeArgs(ignorePatterns) {
   }
   addTarExcludePattern(excludes, ".vscode");
   addTarExcludePattern(excludes, DEFAULT_HANDOFF_MARKER);
+  // r28: the managed handoff tree lives under the remote root; a custom marker basename must
+  // never ride the plain root tar. simple_cluster/results and other kept prefixes are untouched.
+  addTarExcludePattern(excludes, "simple_cluster/state/simple-sftp");
   return Array.from(excludes).map((pattern) => `--exclude=${pattern}`);
 }
 
@@ -6933,6 +7042,15 @@ module.exports = {
   deactivate,
   __test: {
     addTarExcludePattern,
+    // r17-D test hooks: upload-state moved into the project managed tree with the legacy
+    // .vscode file kept as a read-only source; tests pin the new/old precedence.
+    readUploadState, writeUploadState, projectUploadStatePath,
+    // r26: session records use the same managed-tree pattern; tests pin precedence and the
+    // getUploadBaselineMs priority chain (upload-state → session → initial) on top of it.
+    readLocalSessionRecord, writeLocalSessionRecord, projectSessionPath, getUploadBaselineMs,
+    // r28: remote handoff marker placement — pure path derivations for tests; read/write are
+    // exercised at source level with a scripted runSsh transport (workspaceIntegration pattern).
+    getRemoteMarkerPath, legacyRemoteMarkerPath,
     apiTransferSftp,
     createListRemoteDirsSshArgs,
     createRemoteExtractCommand,

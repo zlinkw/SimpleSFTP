@@ -1,4 +1,5 @@
 const test=require('node:test'),assert=require('node:assert/strict'),path=require('node:path'),os=require('node:os');
+const __CONSUMER__ = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'consumer-root-'));
 const {spawnSync}=require('node:child_process');
 const {CleanupFileApi}=require('../cleanup-file-api');
 const linux=p=>'/mnt/'+p[0].toLowerCase()+p.slice(2).replace(/\\/g,'/');
@@ -21,13 +22,13 @@ const isolateTarget={relativePath:'outputs/run1',type:'directory',archiveBatch:B
 
 test('controlled isolation previews only through the fast top-level inspect and keeps the rerun batch identity',async()=>{
   const {api,requests}=makeApi();
-  const preview=await api.preview({node:{kind:'remote',root:'/scope'},action:'isolate',observationMode:'managed_tmux',tmuxSessionPrefix:'research',targets:[{...isolateTarget}]});
+  const preview=await api.preview({consumerRoot: __CONSUMER__, node:{kind:'remote',root:'/scope'},action:'isolate',observationMode:'managed_tmux',tmuxSessionPrefix:'research',targets:[{...isolateTarget}]});
   const inspected=requests.filter(request=>request.action==='inspect');
   assert.equal(inspected.length,1);assert.equal(inspected[0].isolate,true);
   assert.equal(preview.targets[0].fingerprintMode,'top_level');assert.equal(preview.targets[0].destination,isolateTarget.destination);
   assert.equal(preview.safety.isolateFast,1);assert.equal(preview.safety.requiredInputGuard,1);
-  await api.confirm({token:preview.token,digest:preview.digest,phase:1,confirm:true,exactTargets:['/scope/outputs/run1']});
-  await api.execute({token:preview.token,digest:preview.digest,index:0});
+  await api.confirm({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,phase:1,confirm:true,exactTargets:['/scope/outputs/run1']});
+  await api.execute({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,index:0});
   const start=requests.find(request=>request.action==='managed-start');
   assert.equal(start.cleanupAction,'isolate');assert.equal(start.target.fingerprintMode,'top_level');
   assert.equal(start.target.destination,isolateTarget.destination);assert.equal(start.tmuxSessionPrefix,'research');
@@ -35,29 +36,29 @@ test('controlled isolation previews only through the fast top-level inspect and 
 
 test('isolation gates reject a missing batch, a foreign destination, and unsafe required-input shapes',async()=>{
   const {api}=makeApi();
-  await assert.rejects(api.preview({node:{kind:'remote',root:'/scope'},action:'isolate',targets:[{relativePath:'outputs/a',type:'directory',destination:'clean_dir/outputs/a'}]}),/UNSAFE_ARCHIVE_BATCH/);
-  await assert.rejects(api.preview({node:{kind:'remote',root:'/scope'},action:'isolate',targets:[{relativePath:'outputs/a',type:'directory',archiveBatch:BATCH,destination:'clean_dir/outputs/a'}]}),/UNSAFE_DESTINATION/);
-  await assert.rejects(api.preview({node:{kind:'remote',root:'/scope'},action:'isolate',targets:[{...isolateTarget,requiredInputs:['outputs/../etc/passwd']}]}),/INVALID_REQUEST/);
-  await assert.rejects(api.preview({node:{kind:'remote',root:'/scope'},action:'isolate',targets:[{...isolateTarget,requiredInputs:'outputs/ckpt.bin'}]}),/INVALID_REQUEST/);
+  await assert.rejects(api.preview({consumerRoot: __CONSUMER__, node:{kind:'remote',root:'/scope'},action:'isolate',targets:[{relativePath:'outputs/a',type:'directory',destination:'clean_dir/outputs/a'}]}),/UNSAFE_ARCHIVE_BATCH/);
+  await assert.rejects(api.preview({consumerRoot: __CONSUMER__, node:{kind:'remote',root:'/scope'},action:'isolate',targets:[{relativePath:'outputs/a',type:'directory',archiveBatch:BATCH,destination:'clean_dir/outputs/a'}]}),/UNSAFE_DESTINATION/);
+  await assert.rejects(api.preview({consumerRoot: __CONSUMER__, node:{kind:'remote',root:'/scope'},action:'isolate',targets:[{...isolateTarget,requiredInputs:['outputs/../etc/passwd']}]}),/INVALID_REQUEST/);
+  await assert.rejects(api.preview({consumerRoot: __CONSUMER__, node:{kind:'remote',root:'/scope'},action:'isolate',targets:[{...isolateTarget,requiredInputs:'outputs/ckpt.bin'}]}),/INVALID_REQUEST/);
 });
 
 test('confirmed-path permanent deletion is confined to registered isolated artifact subtrees',async()=>{
   const {api,requests}=makeApi();
   for(const rel of ['clean_dir','clean_dir/MANIFEST.md','clean_dir/.operations/isolation','clean_dir/'+BATCH,'clean_dir/outputs/run1'])
-    await assert.rejects(api.preview({node:{kind:'remote',root:'/scope'},action:'delete',authorizationMode:'confirmed_paths',targets:[{relativePath:rel,type:'directory',destination:rel}]}),/UNSAFE_DESTINATION/,rel);
+    await assert.rejects(api.preview({consumerRoot: __CONSUMER__, node:{kind:'remote',root:'/scope'},action:'delete',authorizationMode:'confirmed_paths',targets:[{relativePath:rel,type:'directory',destination:rel}]}),/UNSAFE_DESTINATION/,rel);
   const rel='clean_dir/'+BATCH+'/outputs/run1';
   // A registered-shaped path must arrive with destination equal to itself.
-  await assert.rejects(api.preview({node:{kind:'remote',root:'/scope'},action:'delete',authorizationMode:'confirmed_paths',
+  await assert.rejects(api.preview({consumerRoot: __CONSUMER__, node:{kind:'remote',root:'/scope'},action:'delete',authorizationMode:'confirmed_paths',
     targets:[{relativePath:rel,type:'directory',destination:'clean_dir/'+BATCH+'/outputs/other'}]}),/UNSAFE_DESTINATION/);
   assert.equal(requests.length,0);
 });
 
 test('confirmed isolated subtree preview demands the destination equal the registered path and advertises the guard',async()=>{
   const {api,requests}=makeApi();
-  await assert.rejects(api.preview({node:{kind:'remote',root:'/scope'},action:'delete',authorizationMode:'confirmed_paths',
+  await assert.rejects(api.preview({consumerRoot: __CONSUMER__, node:{kind:'remote',root:'/scope'},action:'delete',authorizationMode:'confirmed_paths',
     targets:[{relativePath:'clean_dir/'+BATCH+'/outputs/run1',type:'directory',destination:'outputs/run1'}]}),/UNSAFE_DESTINATION/);
   const rel='clean_dir/'+BATCH+'/outputs/run1';
-  const preview=await api.preview({node:{kind:'remote',root:'/scope'},action:'delete',authorizationMode:'confirmed_paths',
+  const preview=await api.preview({consumerRoot: __CONSUMER__, node:{kind:'remote',root:'/scope'},action:'delete',authorizationMode:'confirmed_paths',
     targets:[{relativePath:rel,type:'directory',destination:rel}]});
   assert.equal(preview.safety.registeredIsolationDeletion,1);assert.equal(preview.safety.isolateFast,undefined);
   const inspected=requests.find(request=>request.action==='batch-inspect');
@@ -65,9 +66,9 @@ test('confirmed isolated subtree preview demands the destination equal the regis
   assert.equal(preview.targets[0].destination,rel);
   assert.equal(preview.safety.entryIdentityBind,1);assert.equal(preview.safety.batchedFastDelete,1);
   // Permanent deletion still needs the two exact confirmations.
-  await api.confirm({token:preview.token,digest:preview.digest,phase:1,confirm:true,exactTargets:['/scope/'+rel]});
-  await assert.rejects(api.execute({token:preview.token,digest:preview.digest,index:0}),/CONFIRM_REQUIRED/);
-  await api.confirm({token:preview.token,digest:preview.digest,phase:2,confirm:true,exactTargets:['/scope/'+rel]});
+  await api.confirm({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,phase:1,confirm:true,exactTargets:['/scope/'+rel]});
+  await assert.rejects(api.execute({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,index:0}),/CONFIRM_REQUIRED/);
+  await api.confirm({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,phase:2,confirm:true,exactTargets:['/scope/'+rel]});
 });
 
 test('observation of a frozen isolation carries the compact top-level identity and never the full inventory',async()=>{
@@ -75,10 +76,10 @@ test('observation of a frozen isolation carries the compact top-level identity a
   const {api,requests}=makeApi({observe:()=>{observations++;return observations===1
     ? {ok:true,state:'pending',rootIdentity:{path:'/scope'}}
     : {ok:true,state:'completed',verifiedBy:'completion_receipt',rootIdentity:{path:'/scope'}};}});
-  const preview=await api.preview({node:{kind:'remote',root:'/scope'},action:'isolate',observationMode:'managed_tmux',targets:[{...isolateTarget}]});
-  await api.confirm({token:preview.token,digest:preview.digest,phase:1,confirm:true,exactTargets:['/scope/outputs/run1']});
-  await api.execute({token:preview.token,digest:preview.digest,index:0});
-  const settled=await api.check({token:preview.token,digest:preview.digest,index:0});
+  const preview=await api.preview({consumerRoot: __CONSUMER__, node:{kind:'remote',root:'/scope'},action:'isolate',observationMode:'managed_tmux',targets:[{...isolateTarget}]});
+  await api.confirm({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,phase:1,confirm:true,exactTargets:['/scope/outputs/run1']});
+  await api.execute({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,index:0});
+  const settled=await api.check({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,index:0});
   assert.equal(settled.state,'completed');assert.equal(settled.verifiedBy,'completion_receipt');
   const observed=requests.filter(request=>request.action==='managed-observe');
   const compact=observed[observed.length-1];
@@ -93,10 +94,10 @@ test('a lost isolation response settles, re-preflights only on the fast inspect,
     isolate:()=>{if(phase==='first'){phase='lost';return {ok:false,error:{code:'REQUEST_TIMEOUT',message:'the mutation response was lost'}};}return {ok:true,rootIdentity:{path:'/scope'},receipt:{phase:'completed'}};},
     settle:()=>{if(phase==='lost'){phase='retry';return {ok:false,error:{code:'SOURCE_RECREATED_OR_NOT_MOVED',message:'the remote lock has not settled yet'}};}return {ok:true,rootIdentity:{path:'/scope'},receipt:{fingerprintMode:'top_level'}};}
   });
-  const preview=await api.preview({node:{kind:'remote',root:'/scope'},action:'isolate',targets:[{...isolateTarget}]});
-  await api.confirm({token:preview.token,digest:preview.digest,phase:1,confirm:true,exactTargets:['/scope/outputs/run1']});
-  await assert.rejects(api.execute({token:preview.token,digest:preview.digest,index:0}),error=>error.code==='REQUEST_TIMEOUT');
-  const retry=await api.execute({token:preview.token,digest:preview.digest,index:0});
+  const preview=await api.preview({consumerRoot: __CONSUMER__, node:{kind:'remote',root:'/scope'},action:'isolate',targets:[{...isolateTarget}]});
+  await api.confirm({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,phase:1,confirm:true,exactTargets:['/scope/outputs/run1']});
+  await assert.rejects(api.execute({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,index:0}),error=>error.code==='REQUEST_TIMEOUT');
+  const retry=await api.execute({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,index:0});
   assert.equal(retry.ok,true);assert.equal(retry.receipt.phase,'completed');
   const mutates=requests.filter(request=>request.action==='isolate');
   assert.equal(mutates.length,2);
