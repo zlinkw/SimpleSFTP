@@ -48,6 +48,9 @@ test("staged slots keep two generations end to end: preview, fail-closed third, 
         userReleaseNonTerminalRefused: true, userReleaseFreshCommitRefused: true,
         userReleaseMalformedTimeRefused: true, userReleaseFutureTimeRefused: true,
         userReleaseCreatedContradictionRefused: true, userReleaseJournalRemovedRefused: true,
+        userReleaseJournalRemovedDefaultRefused: true, userReleaseJournalCorruptRefused: true,
+        userReleaseJournalCorruptDefaultRefused: true, userReleaseJournalNonObjectRefused: true,
+        userReleaseJournalNonObjectDefaultRefused: true,
         userReleaseInspectProof: true, userReleaseInspectAnswers: true } });
 });
 
@@ -110,7 +113,7 @@ test("production archive builder keeps the scope across changed selections and r
 test("expiry defaults are registered and can never fall below the ruled one-day floor", () => {
   const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../package.json"), "utf8"));
   const props = pkg.contributes.configuration.properties;
-  assert.equal(pkg.version, "0.2.113");
+  assert.equal(pkg.version, "0.2.114");
   assert.equal(props["simpleSftp.autoReclaimExpiredCommittedSlots"].type, "boolean");
   assert.equal(props["simpleSftp.autoReclaimExpiredCommittedSlots"].default, true);
   assert.equal(props["simpleSftp.stagedSlotCommittedExpiryMs"].default, 86400000);

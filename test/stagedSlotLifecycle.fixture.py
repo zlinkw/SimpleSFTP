@@ -693,7 +693,8 @@ assert (reclaimBindingNonTerminalRefused and reclaimBindingGenerationChangedRefu
 # --- and it passes while every remaining rule still denies. Success/refusal is asserted against
 # --- the REAL filesystem: the source slot directory is really gone, the isolated copy really
 # --- exists — never a simulated boolean standing in for directory state.
-def user_release_case(name, require_expired=False, mutate=None, future_terminal=False, remove_journal=False):
+def user_release_case(name, require_expired=False, mutate=None, future_terminal=False, remove_journal=False,
+                      journal_bytes=None):
     case_root = os.path.join(project, "released-" + name)
     os.makedirs(case_root)
     land(GEN_B1, payload_bytes("R1"), root=case_root, identity=KEY_B)
@@ -705,8 +706,12 @@ def user_release_case(name, require_expired=False, mutate=None, future_terminal=
     # The receiver itself must call this slot NOT expired BEFORE any tampering: only the user-
     # confirmed mode can ever unlock it (asserted pre-mutation, like the binding race cases).
     assert edited_leaving(recv.stale_report(case_root, KEY_B, "c8" * 32, EXPIRY_MS))["expiredCommitted"] is False, name
+    journal_path = os.path.join(case_root, STAGING, "d-" + KEY_B[:24], "0", "manifest.json")
     if remove_journal:
-        os.remove(os.path.join(case_root, STAGING, "d-" + KEY_B[:24], "0", "manifest.json"))
+        os.remove(journal_path)
+    elif journal_bytes is not None:
+        with open(journal_path, "wb") as handle:
+            handle.write(journal_bytes)
     if mutate is not None:
         edit_journal(case_root, KEY_B, "0", mutate)
     slot_rel = STAGING + "/d-" + KEY_B[:24] + "/0"
@@ -723,9 +728,9 @@ def user_release_case(name, require_expired=False, mutate=None, future_terminal=
         os.path.join(case_root, "clean_dir", batch, slot_rel)
 
 
-def user_release_refused(name, **kwargs):
+def user_release_refused(name, accepted_codes=("STAGED_JOURNAL_MISMATCH",), **kwargs):
     isolate, slot_dir, _ = user_release_case(name, **kwargs)
-    return (isolate["ok"] is False and isolate["error"]["code"] == "STAGED_JOURNAL_MISMATCH"
+    return (isolate["ok"] is False and isolate["error"]["code"] in accepted_codes
             and os.path.exists(slot_dir))
 
 
@@ -749,7 +754,20 @@ userReleaseMalformedTimeRefused = user_release_refused("nullupdate", mutate=lamb
 userReleaseFutureTimeRefused = user_release_refused("future", future_terminal=True)  # binding carries the SAME future moment
 userReleaseCreatedContradictionRefused = user_release_refused(
     "contradict", mutate=lambda row: row.update(createdAt=(int(time.time()) + 3600) * 1_000_000_000))
-userReleaseJournalRemovedRefused = user_release_refused("nojournal", remove_journal=True)
+# --- G2 RED round定性: a REMOVED journal was always refused — path_guard's own MISSING_TARGET
+# --- gate (cleanup-files.py:177-179, called at :1110 BEFORE the binding recheck and the rename)
+# --- denies fail-closed; only the old fixture key wrongly demanded STAGED_JOURNAL_MISMATCH and
+# --- scored a legitimate refusal as a failure. Both fail-closed codes are accepted here and the
+# --- untouched-slot assertion stays: the "missing ledger must refuse" protection is unchanged.
+userReleaseJournalRemovedRefused = user_release_refused("nojournal", remove_journal=True,
+                                                        accepted_codes=("MISSING_TARGET", "STAGED_JOURNAL_MISMATCH"))
+# Journal missing / corrupt / non-object must refuse under BOTH modes, on the real files.
+userReleaseJournalRemovedDefaultRefused = user_release_refused("nojournal-default", require_expired=None, remove_journal=True,
+                                                               accepted_codes=("MISSING_TARGET", "STAGED_JOURNAL_MISMATCH"))
+userReleaseJournalCorruptRefused = user_release_refused("journal-corrupt", journal_bytes=b"{not-json")
+userReleaseJournalCorruptDefaultRefused = user_release_refused("journal-corrupt-default", require_expired=None, journal_bytes=b"{not-json")
+userReleaseJournalNonObjectRefused = user_release_refused("journal-array", journal_bytes=b"[7]")
+userReleaseJournalNonObjectDefaultRefused = user_release_refused("journal-array-default", require_expired=None, journal_bytes=b"[7]")
 # --- capability truth at the engine door: staged-slot isolate inspects answer the mode;
 # --- non-staged targets (and therefore every older engine) stay silent.
 os.makedirs(os.path.join(project, "plaindir"), exist_ok=True)
@@ -770,6 +788,9 @@ assert (userReleaseYoungAccepted and userReleaseAbsentStillRefused and userRelea
         and userReleaseNonTerminalRefused and userReleaseFreshCommitRefused
         and userReleaseMalformedTimeRefused and userReleaseFutureTimeRefused
         and userReleaseCreatedContradictionRefused and userReleaseJournalRemovedRefused
+        and userReleaseJournalRemovedDefaultRefused and userReleaseJournalCorruptRefused
+        and userReleaseJournalCorruptDefaultRefused and userReleaseJournalNonObjectRefused
+        and userReleaseJournalNonObjectDefaultRefused
         and userReleaseInspectProof and userReleaseInspectAnswers), {
         "young": release_iso, "absent": userReleaseAbsentStillRefused, "true": userReleaseTrueStillRefused,
         "shape": mode_shape_isolate, "gswap": userReleaseGenerationSwapRefused,
@@ -819,6 +840,11 @@ print(json.dumps({"ok": True, "pendingBlocked": True, "leaving": leaving, "third
                                     "userReleaseFutureTimeRefused": userReleaseFutureTimeRefused,
                                     "userReleaseCreatedContradictionRefused": userReleaseCreatedContradictionRefused,
                                     "userReleaseJournalRemovedRefused": userReleaseJournalRemovedRefused,
+                                    "userReleaseJournalRemovedDefaultRefused": userReleaseJournalRemovedDefaultRefused,
+                                    "userReleaseJournalCorruptRefused": userReleaseJournalCorruptRefused,
+                                    "userReleaseJournalCorruptDefaultRefused": userReleaseJournalCorruptDefaultRefused,
+                                    "userReleaseJournalNonObjectRefused": userReleaseJournalNonObjectRefused,
+                                    "userReleaseJournalNonObjectDefaultRefused": userReleaseJournalNonObjectDefaultRefused,
                                     "userReleaseInspectProof": userReleaseInspectProof,
                                     "userReleaseInspectAnswers": userReleaseInspectAnswers,
                                     "slotLockHeldBlocksIsolate": slotLockHeldBlocksIsolate,
