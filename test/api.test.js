@@ -496,3 +496,29 @@ test("SimpleSFTP config and server API helpers are defined and validate types", 
   assert.match(extensionSource, /servers\.save.*sanitizeServerProfile/s);
   assert.match(extensionSource, /target\.update.*updateWorkspaceTarget/s);
 });
+
+test("r118 capability descriptors advertise claim-scoped expiry reclaim and structured stage blocks", () => {
+  // The API descriptor map in extension.js is the single capability authority for this repo
+  // (there is no separate generated capabilities file); SE gates its release button on exactly
+  // these fields PLUS the existing backgroundIsolatedDelete/isolationCompletionReceipt proofs.
+  assert.match(extensionSource, /"files\.cleanup\.stagedSlots": \{ readOnly: true, incomingGenerationPreview: true, retainedGenerations: 2, expiredCommittedReclaim: 1, defaultExpiryMs: 86400000, virtualRetentionWindow: 2, structuredBlockEvidence: 1, releaseConfirmationCount: 1 \}/);
+  assert.match(extensionSource, /"sync\.serverToServerFpsync": \{ retentionKey: "stable-logical-source", generation: "stable-run-id", retainedGenerations: 2, claimScopedExpiredReclaim: 1, stageBlockEvidence: 1/);
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "../package.json"), "utf8"));
+  assert.equal(pkg.version, "0.2.113");
+  const props = pkg.contributes.configuration.properties;
+  assert.equal(props["simpleSftp.autoReclaimExpiredCommittedSlots"].default, true);
+  assert.equal(props["simpleSftp.stagedSlotCommittedExpiryMs"].default, 86400000);
+  assert.equal(props["simpleSftp.stagedSlotCommittedExpiryMs"].minimum, 86400000);
+  // Stage-block transport: the structured block must travel with the RPC error payload, and the
+  // automatic reclaim chain must bind its authorization source to the frozen isolate ledger.
+  assert.match(extensionSource, /error\.apiData = \{ \.\.\.\(error\.apiData[\s\S]*stageBlock/);
+  assert.match(extensionSource, /authorizationSource: "auto_expiry_reclaim"/);
+  const apiSource = fs.readFileSync(path.join(__dirname, "../cleanup-file-api.js"), "utf8");
+  assert.match(apiSource, /INVALID_AUTHORIZATION_SOURCE/);
+  assert.match(apiSource, /"auto_expiry_reclaim", "single_confirmation_release"/);
+  assert.match(apiSource, /reclaimAuthorizationSource: row\.reclaimAuthorizationSource/);
+  // r118 final review: reclaim previews validate the journal binding EXPLICITLY and execute
+  // hands the frozen binding to the engine isolate (which re-proves it under the slot lock).
+  assert.match(apiSource, /INVALID_STAGED_JOURNAL_BINDING/);
+  assert.match(apiSource, /\.\.\.\(row\.stagedJournal \? \{ stagedJournal: copy\(row\.stagedJournal\) \} : \{\}\)/);
+});

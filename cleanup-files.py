@@ -991,6 +991,161 @@ def mutation_lock(root):
 # traversals hold only the exact isolation subtree chain. ---
 ARCHIVED_BATCH_RE = re.compile(r"^clean_dir/(job-[a-f0-9]{48})/(.+)$")
 
+# Staging two-generation slot layout owned by the pinned receiver (identity dir
+# d-<hex>, fixed slots 0/1, sibling <slot>.lock held non-blockingly by claim).
+STAGED_SLOT_REL_RE = re.compile(r"^simple_cluster/\.simple-sftp-staging/d-[0-9a-f]{8,64}/([01])$")
+
+
+def staged_slot_lock(root, target):
+    """Isolation-moment verification of one staged slot's lock.
+
+    A receiver claim holds <slot>.lock (flock LOCK_EX|LOCK_NB) across admission and
+    streaming, so a lock check done only at earlier preview time cannot prove the slot
+    is unheld AT the rename. An ABSENT lock file means no holder (claim creates the file
+    before locking and never removes it); a lock that is held, unopenable or whose
+    check capability is missing refuses the isolation — fail closed, never a weaker path.
+    The returned handle must stay open across the rename and is closed by the caller.
+    """
+    rel = str(target.get("relativePath") or "")
+    if not STAGED_SLOT_REL_RE.match(rel):
+        return None
+    parent_rel, leaf = rel.rsplit("/", 1)
+    leaf += ".lock"
+    parent_full = path_guard(root, parent_rel)
+    if os.name == "nt":
+        try:
+            stream = open(os.path.join(parent_full, leaf), "r+b")
+        except FileNotFoundError:
+            return None
+        except OSError:
+            deny("SLOT_LOCK_UNCERTAIN", os.path.join(parent_full, leaf), "槽锁文件无法打开，拒绝隔离")
+        try:
+            import msvcrt
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            stream.close()
+            deny("SLOT_LOCK_HELD", os.path.join(parent_full, leaf), "槽锁被持有，拒绝隔离")
+        return stream
+    try:
+        parent_fd = os.open(parent_full, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        deny("SLOT_LOCK_UNCERTAIN", parent_full, "无法钉住槽锁所在目录，拒绝隔离")
+    # Same-source capability probe: the symbols checked here are EXACTLY the ones called below
+    # (fcntl.flock / fcntl.LOCK_EX / fcntl.LOCK_NB). Probing os.flock instead once misjudged the
+    # real WSL 3.12 interpreter — where os.flock is absent but fcntl.flock is the working,
+    # receiver-side lock — as "no verification capability" and failed every released isolate
+    # closed forever. A missing probe symbol still refuses: fail closed, never a weaker path.
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    if not getattr(os, "O_NOFOLLOW", 0) or not hasattr(os, "O_DIRECTORY") \
+            or fcntl is None or not hasattr(fcntl, "flock") or not hasattr(fcntl, "LOCK_EX") or not hasattr(fcntl, "LOCK_NB"):
+        try:
+            os.close(parent_fd)
+        finally:
+            deny("SLOT_LOCK_UNCERTAIN", parent_full, "运行环境缺少槽锁核验能力，拒绝隔离")
+    try:
+        try:
+            fd = os.open(leaf, os.O_RDWR | os.O_NOFOLLOW, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            deny("SLOT_LOCK_UNCERTAIN", leaf, "槽锁文件无法打开，拒绝隔离")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            deny("SLOT_LOCK_HELD", leaf, "槽锁被持有，拒绝隔离")
+        return fd
+    finally:
+        os.close(parent_fd)
+
+
+def release_staged_slot_lock(handle):
+    if handle is None:
+        return
+    try:
+        handle.close() if not isinstance(handle, int) else os.close(handle)
+    except OSError:
+        pass
+
+
+def verify_staged_journal_binding(root, target, binding):
+    """P1-3 ruling: re-prove the expiry-reclaim eligibility against the CURRENT journal WHILE the
+    slot lock is held. A free lock only proves no receiver is streaming — it does NOT prove the
+    journal is still the committed, expired row the reclaim was authorized against; the same
+    generation may have resumed, changed or freshly re-committed after the report. Every missing,
+    corrupt, future, contradictory or simply different fact denies the rename; the earlier
+    committed/expired verdict is never trusted across that window."""
+    identity = binding.get("identity") if isinstance(binding, dict) else None
+    generation = binding.get("generation") if isinstance(binding, dict) else None
+    expiry_ms = binding.get("expiryMs") if isinstance(binding, dict) else None
+    expected_terminal = binding.get("terminalAt") if isinstance(binding, dict) else None
+    if not (isinstance(identity, str) and re.fullmatch(r"[0-9a-f]{64}", identity)
+            and isinstance(generation, str) and re.fullmatch(r"[0-9a-f]{64}", generation)
+            and isinstance(expiry_ms, int) and not isinstance(expiry_ms, bool) and expiry_ms > 0
+            and (expected_terminal is None or (isinstance(expected_terminal, int) and not isinstance(expected_terminal, bool) and expected_terminal > 0))):
+        deny("INVALID_STAGED_JOURNAL_BINDING")
+    rel = str(target.get("relativePath") or "")
+    if not STAGED_SLOT_REL_RE.match(rel):
+        deny("INVALID_STAGED_JOURNAL_BINDING")
+    reason = "锁内复检发现暂存槽 journal 不再符合过期回收资格，拒绝隔离"
+
+    def trusted_int(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+    # Same path-guard discipline the engine's own manifest readers use (the slot lock, already
+    # held by the caller, keeps a racing receiver from rewriting between read and rename).
+    journal_full = path_guard(root, rel + "/manifest.json")
+    try:
+        with open(journal_full, "rb") as handle:
+            payload = handle.read(262144)
+        manifest_mtime = os.stat(journal_full, follow_symlinks=False).st_mtime
+    except OSError:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    try:
+        row = json.loads(payload)
+    except ValueError:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    if not isinstance(row, dict) or row.get("identity") != identity or row.get("generation") != generation \
+            or row.get("status") != "committed":
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    # FINAL REVIEW P1-A: presence/format of EVERY field is enforced before any basis is chosen —
+    # a written-but-null updatedAt or terminalAt is malformed, never a slip to older evidence —
+    # and a binding that froze the terminal moment demands it back: a journal that LOST terminalAt
+    # after the report is a different journal, no fallback.
+    created = trusted_int(row.get("createdAt"))
+    if "createdAt" in row and created is None:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    created_s = created / 1_000_000_000 if created and created > 1_000_000_000_000 else float(created or 0)
+    terminal = row.get("terminalAt")
+    if "terminalAt" in row and trusted_int(terminal) is None:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    updated = row.get("updatedAt")
+    if "updatedAt" in row and trusted_int(updated) is None:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    if terminal is None and expected_terminal is not None:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    if terminal is not None:
+        # A binding carrying the terminal moment binds it EXACTLY: a fresh re-commit (new or
+        # missing terminalAt) is a different journal, whatever else still matches.
+        if expected_terminal is not None and terminal != expected_terminal:
+            deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+        basis = float(terminal)
+    elif updated is not None:
+        basis = float(updated)
+    else:
+        basis = manifest_mtime
+    # The three consistency rules (malformed above, future, createdAt-contradiction) apply to
+    # EVERY basis actually used under the lock — not only to the mtime fallback branch.
+    now = time.time()
+    if basis > now or (created_s and basis < created_s - 1):
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    if (now - basis) * 1000 < expiry_ms:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+
 
 def archived_control_rel(target):
     """Exact confirmed-path deletion target for one registered isolated subtree."""
@@ -2154,16 +2309,30 @@ def main(request):
         os.makedirs(os.path.dirname(value["destination"]), exist_ok=True)
         path_guard(root, target["destination"], True, True)
         child = parent_cd(root, value["absolutePath"])
-        # Exactly one atomic rename; a missing no-replace primitive or a
-        # cross-filesystem target fails closed, never degrades to a copy.
-        no_replace(child, value["destination"])
-        # Completion proof for this move: the atomic no-replace rename
-        # committed, the source name is absent in this very move, the
-        # registration lands, and the durable completion audit line below
-        # closes the record. The isolated copy itself is NOT re-read here;
-        # this receipt never claims the isolated content was re-verified.
-        if os.path.lexists(value["absolutePath"]):
-            deny("SOURCE_STILL_EXISTS")
+        # Staged slots additionally prove the slot lock is FREE at THIS rename moment
+        # (held across the rename until the source name is gone), closing the window
+        # between an earlier preview and the mutation; a racing claim keeps its flock
+        # and this isolation refuses instead of moving an active checkpoint.
+        slot_lock = staged_slot_lock(root, target)
+        try:
+            # Reclaim-bound isolations re-prove the FULL expiry eligibility here — identity,
+            # generation, committed status, terminal moment and age against the CURRENT journal,
+            # under the held slot lock and before the rename (a free lock alone proves nothing
+            # about the journal); an unbound isolate keeps exactly the previous lock-only gate.
+            if request.get("stagedJournal") is not None:
+                verify_staged_journal_binding(root, target, request["stagedJournal"])
+            # Exactly one atomic rename; a missing no-replace primitive or a
+            # cross-filesystem target fails closed, never degrades to a copy.
+            no_replace(child, value["destination"])
+            # Completion proof for this move: the atomic no-replace rename
+            # committed, the source name is absent in this very move, the
+            # registration lands, and the durable completion audit line below
+            # closes the record. The isolated copy itself is NOT re-read here;
+            # this receipt never claims the isolated content was re-verified.
+            if os.path.lexists(value["absolutePath"]):
+                deny("SOURCE_STILL_EXISTS")
+        finally:
+            release_staged_slot_lock(slot_lock)
         destination_rel = os.path.relpath(value["destination"], root).replace(os.sep, "/")
         completion = {"isolationCompletionProtocol": 1, "archiveBatch": batch,
                       "sourceRelativePath": target["relativePath"], "destinationRelativePath": target["destination"],

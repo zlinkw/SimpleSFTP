@@ -492,6 +492,29 @@ class CleanupFileApi {
     if (this.previews.size >= 4096) fail("CLEANUP_PREVIEW_CAPACITY_EXCEEDED");
     const { node, action = "move", targets } = params;
     if (params.authorizationMode !== undefined && params.authorizationMode !== "confirmed_paths") fail("INVALID_AUTHORIZATION_MODE");
+    // Staged-slot reclaim authorizations are recorded EXPLICITLY and travel with the frozen ledger
+    // row: "auto_expiry_reclaim" is the automatic claim-scoped policy, "single_confirmation_release"
+    // is the exact-preview user-confirmed release. Both are isolate-only; nothing else accepts them
+    // and they never change the confirmation counts, digests or delete rules of any other chain.
+    const reclaimAuthorizationSource = params.authorizationSource;
+    if (reclaimAuthorizationSource !== undefined
+      && (action !== "isolate" || !["auto_expiry_reclaim", "single_confirmation_release"].includes(reclaimAuthorizationSource))) fail("INVALID_AUTHORIZATION_SOURCE");
+    // P1-3 ruling: an expiry/single-confirmation reclaim may only ride an EXPLICIT journal
+    // binding — identity + committed generation + terminal moment + expiry threshold for the
+    // exact slot. The binding is ownership metadata on the frozen row (outside the digest
+    // preimage, like reclaimAuthorizationSource) and is handed to the engine's isolate so the
+    // eligibility can be re-proven UNDER the slot lock at rename time. Malformed or unrelated
+    // bindings are refused outright; nothing implicit is ever inferred.
+    const stagedJournal = params.stagedJournal;
+    if (stagedJournal !== undefined) {
+      if (action !== "isolate" || !reclaimAuthorizationSource
+        || !stagedJournal || typeof stagedJournal !== "object" || Array.isArray(stagedJournal)
+        || !/^[0-9a-f]{64}$/.test(String(stagedJournal.identity || ""))
+        || !/^[0-9a-f]{64}$/.test(String(stagedJournal.generation || ""))
+        || stagedJournal.status !== "committed"
+        || !(Number.isInteger(stagedJournal.expiryMs) && stagedJournal.expiryMs > 0)
+        || !(stagedJournal.terminalAt === null || (Number.isInteger(stagedJournal.terminalAt) && stagedJournal.terminalAt > 0))) fail("INVALID_STAGED_JOURNAL_BINDING");
+    }
     const pathOnly = params.authorizationMode === "confirmed_paths";
     // Confirmed paths only ever authorize permanent deletion; a move/restore
     if (pathOnly && action !== "delete") fail("INVALID_ACTION");
@@ -541,7 +564,8 @@ class CleanupFileApi {
     const backgroundIsolatedDelete = action === "isolate" && isolateEngineProof.length === rows.length
       && isolateEngineProof.every(Boolean) ? 1 : undefined;
     const row = { token: crypto.randomBytes(24).toString("hex"), operationId: "cleanup-" + crypto.randomBytes(16).toString("hex"), consumerRoot, node: copy(node), rootIdentity: identity,
-      action, observationMode, authorizationMode: pathOnly ? "confirmed_paths" : undefined, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, managedObservation: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: action === "isolate" ? 1 : undefined, requiredInputGuard: action === "isolate" ? 1 : undefined, isolationCompletionReceipt: backgroundIsolatedDelete, backgroundIsolatedDelete, registeredIsolationDeletion: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1, chunkedFrozenManifest: 1, pinnedRuntimeProgram: 1, handleScan: pathOnly ? "confirmed_paths" : observationMode ? "managed_tmux" : "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
+      action, observationMode, authorizationMode: pathOnly ? "confirmed_paths" : undefined, reclaimAuthorizationSource,
+      stagedJournal: stagedJournal ? copy(stagedJournal) : undefined, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, managedObservation: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: action === "isolate" ? 1 : undefined, requiredInputGuard: action === "isolate" ? 1 : undefined, isolationCompletionReceipt: backgroundIsolatedDelete, backgroundIsolatedDelete, registeredIsolationDeletion: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1, chunkedFrozenManifest: 1, pinnedRuntimeProgram: 1, handleScan: pathOnly ? "confirmed_paths" : observationMode ? "managed_tmux" : "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
     row.tmuxSessionPrefix = tmuxSessionPrefix;
     row.targetDigests = rows.map(targetHash);
     row.digest = hash({ node: row.node, rootIdentity: identity, action, targets: rows, safety: row.safety, tmuxSessionPrefix });
@@ -1030,7 +1054,10 @@ class CleanupFileApi {
         await this.activity(row.node);
         if (row.states[index] === "completed") return { ok: true, alreadyCompleted: true, receipt: row.receipts[index] };
         const request = { node: row.node, root: row.node.root, rootIdentity: row.rootIdentity, action: row.action,
-          operationId: row.operationId, target: row.targets[index] };
+          operationId: row.operationId, target: row.targets[index],
+          // The engine re-proves the reclaim eligibility from THIS binding under the slot lock
+          // immediately before the rename (settle never re-moves, so it needs nothing).
+          ...(row.stagedJournal ? { stagedJournal: copy(row.stagedJournal) } : {}) };
         if (row.states[index] === "executing") {
           if (row.action === "delete") fail("DELETE_RECEIPT_UNCERTAIN");
           try {
@@ -1284,6 +1311,7 @@ class CleanupFileApi {
         }
         row.isolatedDelete = { capability: "isolationBackgroundDelete", protocol: 1, phase: "accepted", operationId: row.operationId,
           acceptedAt: new Date().toISOString(), alreadyDeleted: alreadyDone,
+          ...(row.reclaimAuthorizationSource ? { reclaimAuthorizationSource: row.reclaimAuthorizationSource } : {}),
           targets: entries.map(entry => ({ destinationRelativePath: entry.relativePath, type: entry.type })) };
         await this.saveIsolatedDelete(row); // durable acceptance BEFORE any mutation
         if (!entries.length) {

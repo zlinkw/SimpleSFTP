@@ -79,10 +79,16 @@ def read_journal(slot_fd):
 
 def journal(slot_fd, data):
     # updatedAt orders failed-slot reclamation; journal writes are the only mutation point for slot state.
+    # terminalAt is the terminal moment: written when a row ENTERS committed and carried verbatim while the
+    # same committed row is rewritten; any non-terminal rewrite drops it (a resumed run is not terminal).
     previous = read_journal(slot_fd)
     same_generation = previous and previous.get("identity") == data.get("identity") and journal_generation(previous) == journal_generation(data)
     created_at = previous.get("createdAt", previous.get("updatedAt", 0)) if same_generation else 0
-    encoded = json.dumps(dict(data, createdAt=created_at or time.time_ns(), updatedAt=int(time.time())), separators=(",", ":")).encode("utf-8")
+    payload = dict(data)
+    if data.get("status") == "committed":
+        carried = previous.get("terminalAt") if same_generation and previous.get("status") == "committed" else None
+        payload["terminalAt"] = carried if isinstance(carried, int) and not isinstance(carried, bool) and carried > 0 else int(time.time())
+    encoded = json.dumps(dict(payload, createdAt=created_at or time.time_ns(), updatedAt=int(time.time())), separators=(",", ":")).encode("utf-8")
     if len(encoded) > MAX_JOURNAL:
         raise ValueError("staging journal too large")
     fd = open_file(slot_fd, "manifest.writing", os.O_WRONLY | os.O_CREAT)
@@ -135,16 +141,85 @@ def identity_parent(stage_fd, logical_key):
     leaf = "d-" + logical_key[:24]
     return folder(stage_fd, leaf), leaf
 
-def slot_report(did, leaf, journal_row):
-    # Read-only checkpoint facts used by the confirmed managed-deletion preview; nothing is mutated here.
+def as_int(value):
+    # JSON ints only: bools, floats and strings never count as a timestamp (fail toward "no time").
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+def created_seconds(row):
+    # createdAt is written in ns (time_ns); a plausible pre-ns second value is accepted, anything else is 0.
+    created = as_int(row.get("createdAt"))
+    if not created or created <= 0:
+        return 0
+    return created / 1_000_000_000 if created > 1_000_000_000_000 else float(created)
+
+def time_field(row, field):
+    # (present, parsed) — rules out the ruled confusion: a LEGACY row simply lacks the field and may
+    # fall back; a row that CARRIES the field with an unusable value (string, bool, float, null,
+    # non-positive or non-integer) is malformed and must NEVER fall through to older evidence.
+    if field not in row:
+        return False, None
+    value = row[field]
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return True, value
+    return True, None
+
+def time_facts(row, slot_fd):
+    # Expiry-age basis facts, remote clock only, never mutated here. Preference: terminalAt (new
+    # journals), legacy fallback updatedAt, and ONLY when a valid journal carries no usable
+    # timestamp at all, the NON-FOLLOWING manifest.json mtime. Slot-directory, lock-file and
+    # data-file mtimes are never trusted. PRESENT-but-MALFORMED yields time-format immediately —
+    # never an older basis; a future or createdAt-contradictory basis yields its problem
+    # (callers never expire), and the manifest-mtime fallback is contradiction-checked too.
+    now = time.time()
+    created_s = created_seconds(row)
+    def basis(source, seconds):
+        if seconds > now:
+            return {"timeSource": source, "ageMs": None, "expiryProblem": "time-future"}
+        if created_s and seconds < created_s - 1:
+            return {"timeSource": source, "ageMs": None, "expiryProblem": "time-contradiction"}
+        return {"timeSource": source, "ageMs": int((now - seconds) * 1000), "expiryProblem": None}
+    malformed = {"timeSource": None, "ageMs": None, "expiryProblem": "time-format"}
+    # FINAL REVIEW P1-B: EVERY present field is format-checked BEFORE any age basis is chosen.
+    # A legally old terminalAt next to a written-but-unusable updatedAt is still a journal nobody
+    # can vouch for — selecting around a malformed field was the bug.
+    created_present, created_parsed = time_field(row, "createdAt")
+    if created_present and created_parsed is None:
+        return malformed
+    terminal_present, terminal = time_field(row, "terminalAt")
+    if terminal_present and terminal is None:
+        return malformed  # a written-but-unusable commit time outranks every older fallback
+    updated_present, updated = time_field(row, "updatedAt")
+    if updated_present and updated is None:
+        return malformed
+    if terminal_present:
+        return basis("terminalAt", float(terminal))
+    if updated_present:
+        return basis("updatedAt", float(updated))
+    try:
+        # Valid journal without any timestamp: only the journal manifest's own non-followed mtime may answer.
+        moment = os.stat("manifest.json", dir_fd=slot_fd, follow_symlinks=False).st_mtime
+    except OSError:
+        return {"timeSource": None, "ageMs": None, "expiryProblem": "mtime-unreadable"}
+    if moment > now:
+        return {"timeSource": "manifestMtime", "ageMs": None, "expiryProblem": "time-future"}
+    if created_s and moment < created_s - 1:
+        return {"timeSource": "manifestMtime", "ageMs": None, "expiryProblem": "time-contradiction"}
+    return {"timeSource": "manifestMtime", "ageMs": int((now - moment) * 1000), "expiryProblem": None}
+
+def slot_report(did, leaf, journal_row, locked=False):
+    # Read-only checkpoint facts used by the confirmed managed-deletion preview and the structured
+    # TRANSFER_STAGE_PENDING stage block; nothing is mutated here. Times travel as stored (never derived).
     row = journal_row if isinstance(journal_row, dict) else None
     return {"path": STAGING_CONTAINER + "/" + STAGING_DIRECTORY + "/" + did + "/" + leaf,
             "status": (row or {}).get("status") or "unresolved",
             "identity": (row or {}).get("identity") or "",
             "generation": journal_generation(row or {}),
-            "updatedAt": int((row or {}).get("updatedAt") or 0)}
+            "createdAt": as_int((row or {}).get("createdAt")) or 0,
+            "terminalAt": as_int((row or {}).get("terminalAt")) or 0,
+            "updatedAt": as_int((row or {}).get("updatedAt")) or 0,
+            "locked": bool(locked)}
 
-def stale_report(root, logical_key, generation=None):
+def stale_report(root, logical_key, generation=None, expiry_ms=None):
     # STRICT read-only classification: nothing is created (no staging subtree, no lock files) and
     # nothing is mutated. WITH an incoming generation this is an admission preview: virtual join
     # puts the incoming generation into a free or own-generation slot; only when both slots hold
@@ -153,6 +228,11 @@ def stale_report(root, logical_key, generation=None):
     # WITHOUT a generation this is pure inventory: current and previous generations are inside the
     # retention window and are NEVER proposed for deletion; corrupt or actively locked slots report
     # as held so nothing can be proposed over them.
+    # With an integer expiry_ms the leaving row additionally carries the REMOTE-clock expiry verdict
+    # (expiredCommitted): only a fully readable, identity-matching, committed, unlocked slot whose
+    # trusted terminal basis is at least expiry_ms old can ever say true; every time problem
+    # (missing/format/future/contradiction) keeps the slot protected. Verdicts never authorize a
+    # deletion by themselves — the confirmed managed executor and its isolation-moment checks stay.
     if os.path.realpath(root) != root or root in ("/", ""):
         raise ValueError("PARENT_CD_FAILED: invalid root")
     if not IDENTITY_TOKEN.fullmatch(logical_key or ""):
@@ -160,6 +240,8 @@ def stale_report(root, logical_key, generation=None):
     admission = generation is not None
     if admission and not IDENTITY_TOKEN.fullmatch(str(generation)):
         raise ValueError("invalid transfer scope")
+    if expiry_ms is not None and (not isinstance(expiry_ms, int) or isinstance(expiry_ms, bool) or expiry_ms < 0):
+        expiry_ms = None
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     stage_fd = did_fd = None
     try:
@@ -179,7 +261,7 @@ def stale_report(root, logical_key, generation=None):
             did_fd = os.open(did, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=stage_fd)
         except FileNotFoundError:
             return {"stale": [], "held": []}
-        stale, held = [], []
+        stale, held, all_slots = [], [], []
         occupied, empty_slots, own_generation_seen, busy = [], 0, False, 0
         for leaf in IDENTITY_SLOTS:
             try:
@@ -207,34 +289,41 @@ def stale_report(root, logical_key, generation=None):
                 if locked or unreadable:
                     busy += 1
                     try:
-                        base = slot_report(did, leaf, read_journal(slot_fd))
+                        base = slot_report(did, leaf, read_journal(slot_fd), locked=locked)
                     except (ValueError, OSError):
-                        base = slot_report(did, leaf, None)
-                    held.append(dict(base, status="locked" if locked else "unresolved"))
+                        base = slot_report(did, leaf, None, locked=locked)
+                    row = dict(base, status="locked" if locked else "unresolved",
+                               protectedReason="slot-locked" if locked else "lock-unreadable")
+                    held.append(row)
+                    all_slots.append(row)
                     continue
                 journal_row = slot_journal(slot_fd)
+                facts = time_facts(journal_row, slot_fd) if isinstance(journal_row, dict) else {}
             finally:
                 os.close(slot_fd)
             if journal_row == "unresolved":
-                held.append(dict(slot_report(did, leaf, None), status="unresolved"))
+                row = dict(slot_report(did, leaf, None), status="unresolved", protectedReason="journal-unresolved")
+                held.append(row)
+                all_slots.append(row)
                 continue
             if journal_row is None:
                 empty_slots += 1
                 continue
-            occupied.append((leaf, journal_row))
+            occupied.append((leaf, journal_row, facts))
         terminal_rows = []
-        for leaf, journal_row in occupied:
-            report = slot_report(did, leaf, journal_row)
+        for leaf, journal_row, facts in occupied:
+            report = dict(slot_report(did, leaf, journal_row), **facts)
+            all_slots.append(report)
             if journal_row.get("identity") != logical_key:
-                held.append(dict(report, status="unresolved"))
+                held.append(dict(report, status="unresolved", protectedReason="identity-mismatch"))
             elif admission and journal_generation(journal_row) == generation:
                 own_generation_seen = True
             elif journal_row.get("status") not in TERMINAL_JOURNAL_STATES:
-                held.append(report)
+                held.append(dict(report, protectedReason="journal-non-terminal"))
             elif not admission:
                 # Inventory: current/previous terminal generations are the retained window —
                 # reported as held so callers see the full truth, never as stale.
-                held.append(report)
+                held.append(dict(report, protectedReason="within-retention-window"))
             else:
                 terminal_rows.append((leaf, journal_row, report))
         # Eviction is proposed ONLY when EVERY slot is one of our own valid terminal generations
@@ -245,10 +334,25 @@ def stale_report(root, logical_key, generation=None):
             # OLDEST leaves the window as the single confirmed-deletion candidate, while the newest
             # stays protected. Any busy/protected slot fails closed with no candidate at all.
             terminal_rows.sort(key=lambda row: (int(row[1].get("createdAt") or row[1].get("updatedAt") or 0), row[0]))
-            stale.append(dict(terminal_rows[0][2], type="directory"))
-            held.extend(row[2] for row in terminal_rows[1:])
+            leaving = dict(terminal_rows[0][2], type="directory")
+            if expiry_ms is not None:
+                # Remote-clock expiry verdict over the trusted basis only. Anything but a committed,
+                # timestamp-trusted row older than the threshold says "not expired" — never the reverse.
+                basis_age = leaving.get("ageMs")
+                is_committed = leaving.get("status") == "committed"
+                verdict = bool(is_committed and leaving.get("expiryProblem") is None
+                               and isinstance(basis_age, int) and basis_age >= expiry_ms)
+                leaving["expiredCommitted"] = verdict
+                leaving["expiryReason"] = ("expired" if verdict
+                                           else "not-committed" if not is_committed
+                                                else str(leaving.get("expiryProblem") or "within-threshold"))
+            stale.append(leaving)
+            held.extend(dict(row[2], protectedReason="within-retention-window") for row in terminal_rows[1:])
         # Inventory mode (no incoming generation) never proposes retained current/previous copies.
-        return {"stale": stale, "held": held}
+        leaving_paths = {row["path"] for row in stale}
+        for row in all_slots:
+            row["role"] = "leaving" if row["path"] in leaving_paths else "held"
+        return {"stale": stale, "held": held, "slots": all_slots}
     finally:
         for fd in (did_fd, stage_fd, root_fd):
             if fd is not None:
@@ -343,6 +447,19 @@ def claim(stage_fd, logical_key, generation):
     finally:
         os.close(did_fd)
 
+def emit_pending_stage_facts(root, logical_key, generation):
+    # Machine-readable snapshot of WHY admission is blocked, emitted on stderr right before the
+    # unchanged TRANSFER_STAGE_PENDING text: slot facts come from the same strict read-only
+    # classification, never from parsing error strings. A diagnostic failure never masks the error.
+    try:
+        report = stale_report(root, logical_key, generation)
+        facts = {"schemaVersion": 1, "code": "TRANSFER_STAGE_PENDING", "identity": logical_key,
+                 "incomingGeneration": generation, "slots": report["slots"]}
+        sys.stderr.write("SIMPLE_STAGE_PENDING " + json.dumps(facts, separators=(",", ":")) + "\n")
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+
 def exactly(stream, size):
     result = bytearray()
     while len(result) < size:
@@ -373,7 +490,12 @@ def receive(root, request, stream):
     state = {"identity": logical_key, "generation": generation, "status": "preparing", "entries": entries}
     try:
         stage_fd = staging_directory(root_fd)
-        slot_fd, lock_fd, leaf = claim(stage_fd, logical_key, generation)
+        try:
+            slot_fd, lock_fd, leaf = claim(stage_fd, logical_key, generation)
+        except ValueError as admission_error:
+            if str(admission_error).startswith("TRANSFER_STAGE_PENDING"):
+                emit_pending_stage_facts(root, logical_key, generation)
+            raise
         journal(slot_fd, state)
         seen = set()
         long_name = None
@@ -535,7 +657,12 @@ def chunk_state(request, stream=None):
     try:
         stage_fd = staging_directory(root_fd)
         logical_key, generation = request_scope(request)
-        slot_fd, lock_fd, leaf = claim(stage_fd, logical_key, generation)
+        try:
+            slot_fd, lock_fd, leaf = claim(stage_fd, logical_key, generation)
+        except ValueError as admission_error:
+            if str(admission_error).startswith("TRANSFER_STAGE_PENDING"):
+                emit_pending_stage_facts(root, logical_key, generation)
+            raise
         state = read_journal(slot_fd)
         # A same-generation checkpoint restarts from scratch whenever it is not mid-chunked: committed
         # re-runs, failed retries, and crashed preparing/publishing states all legally reuse the slot.
@@ -656,8 +783,12 @@ if __name__ == "__main__":
     elif request.get("mode") == "staleReport":
         # Read-only: with `generation` this is an incoming-admission preview (which slot would have
         # to leave the two-generation window); without it a pure inventory that never proposes the
-        # retained current/previous generations for deletion.
+        # retained current/previous generations for deletion. An optional `expiry` object carrying
+        # an integer `ms` adds the remote-clock expiry verdict to the leaving row only.
+        expiry = request.get("expiry")
+        expiry_ms = expiry.get("ms") if isinstance(expiry, dict) else None
         print(json.dumps(stale_report(request["root"], str(request.get("logicalKey") or request.get("identity") or ""),
-                                      str(request["generation"]) if request.get("generation") is not None else None)))
+                                      str(request["generation"]) if request.get("generation") is not None else None,
+                                      expiry_ms)))
     else:
         receive(request["root"], request, sys.stdin.buffer)
