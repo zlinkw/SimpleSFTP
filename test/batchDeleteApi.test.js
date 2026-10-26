@@ -679,9 +679,9 @@ test('r110b a rollback during a running background delete keeps the maintenance 
     entryRow: target => target.relativePath.startsWith('clean_dir/' + ISO_BATCH + '/') ? isolatedProbe(target) : null,
     managedObserve: () => (++rounds === 1 ? MANAGED_PENDING : MANAGED_COMPLETED),
     managedStart: () => { startArrived(); return startGate.then(() => { const error = new Error('mutation window busy'); error.code = 'OPERATION_BUSY'; throw error; }); },
-    deleteFast: request => deleteGate.then(() => ({ ok: true,
+    deleteFast: request => { deleteArrived(); return deleteGate.then(() => ({ ok: true,
       receipt: { operationId: request.operationId, metrics: { groups: 1, unlinkedFiles: 2, renames: 1, treeDirsRemoved: 1 },
-        receipts: request.entries.map(entry => ({ relativePath: entry.relativePath, mode: 'removed' })) } })) });
+        receipts: request.entries.map(entry => ({ relativePath: entry.relativePath, mode: 'removed' })) } })); } });
   const preview = await managedIsolateToken(h, [
     { relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST },
     { relativePath: 'out/run2', type: 'directory', archiveBatch: ISO_BATCH, destination: 'clean_dir/' + ISO_BATCH + '/out/run2' }]);
