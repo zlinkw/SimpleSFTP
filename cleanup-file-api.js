@@ -368,7 +368,7 @@ class CleanupFileApi {
   constructor({ storageRoot, transport, activity, lease }) {
     this.storageRoot = storageRoot; this.transport = transport; this.activity = activity; this.lease = lease;
     this.previews = new Map(); this.busy = new Set(); this.localExecutions = new Map();
-    this.observeInFlight = 0; this.observeWaiters = [];
+    this.observeInFlight = 0; this.observeWaiters = []; this.ledgerChains = new Map();
   }
   /** Shared read-only in-flight budget for the whole API instance: exactly two
    *  engine reads at once, independent of any request's readConcurrency. Each
@@ -443,6 +443,46 @@ class CleanupFileApi {
     const root = requireConsumerRoot(row.consumerRoot);
     await atomicWriteText(path.join(await ensureConsumerCleanupDir(root), row.token + ".json"), JSON.stringify(row));
     this.previews.set(row.token, copy(row));
+  }
+  /** r110 review round 2 (P1-2): ONE per-token serialization boundary for every related
+   * ledger write - observation merges AND maintenance lifecycle saves. read() hands out an
+   * independent copy and save() writes the whole row with no CAS, so two flows that each
+   * read-mutate-save can erase each other even when each reloads just before saving: a reload
+   * cannot protect the window in which the OTHER flow's save lands after this reload but
+   * before this save completes. Queuing each token's read-mutate-save critical sections on
+   * one promise chain (in this process, precedent: the localExecutions map) restores an
+   * atomic update boundary with no cross-process lock. A settled chain entry removes itself,
+   * and only while the map still points at it, so tokens never accumulate. */
+  withLedgerWrite(token, task) {
+    const previous = this.ledgerChains.get(token) || Promise.resolve();
+    const step = previous.then(task);
+    const guard = step.then(() => undefined, () => undefined);
+    this.ledgerChains.set(token, guard);
+    guard.then(() => { if (this.ledgerChains.get(token) === guard) this.ledgerChains.delete(token); });
+    return step;
+  }
+  async persistObservationProgress(row, mutations, observations) {
+    return this.withLedgerWrite(row.token, async () => {
+      const fresh = await this.read(row.token, row.consumerRoot);
+      for (const mutation of mutations) {
+        if (!Number.isInteger(mutation.index) || fresh.states[mutation.index] === undefined) continue;
+        if (fresh.states[mutation.index] === "completed") continue; // completed only advances from a completed proof
+        fresh.states[mutation.index] = mutation.state;
+      }
+      if (observations !== undefined) fresh.observations = copy(observations);
+      await this.save(fresh);
+    });
+  }
+  /** r110b: the maintenance flow's isolatedDelete object is the authority for the lifecycle
+   * field only; everything else (target states, observations) is taken from the current row
+   * inside the same token boundary - the lifecycle never vanishes under an observer's stale
+   * write, and a maintenance save never rewrites a fresher observation state. */
+  async saveIsolatedDelete(row) {
+    return this.withLedgerWrite(row.token, async () => {
+      const fresh = await this.read(row.token, row.consumerRoot);
+      fresh.isolatedDelete = copy(row.isolatedDelete);
+      await this.save(fresh);
+    });
   }
   async preview(params) {
     const consumerRoot = requireConsumerRoot(params.consumerRoot); // the LOCAL consuming project, never node.root
@@ -877,7 +917,14 @@ class CleanupFileApi {
     const row = await this.read(params.token, params.consumerRoot, typeof params.backendDigest === "string" ? params.backendDigest : undefined), index = params.index;
     if (!Number.isInteger(index) || !row.targets[index]) fail("INVALID_TARGET");
     if (isFastDeleteRow(row)) return this.fastVerify(row, index);
-    if (row.observationMode) return this.observe(row, index);
+    if (row.observationMode) {
+      // r108: a completed observation is durable before the answer returns. The
+      // ledger must never keep saying "executing" after the engine proved the
+      // move completed; a background delete reads ONLY persisted states.
+      const proof = await this.observe(row, index);
+      if (proof && proof.state === "completed" && row.states[index] !== "completed") { row.states[index] = "completed"; await this.persistObservationProgress(row, [{ index, state: "completed" }]); }
+      return proof;
+    }
     return this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity, target: row.targets[index],
       action: "check", deleted: row.action === "delete", receiptCompleted: row.states[index] === "completed" });
   }
@@ -938,7 +985,13 @@ class CleanupFileApi {
       const key = row.token + ":" + index;
       if (row.observationMode === "filesystem" && this.localExecutions.has(key)) return { ok: true, state: "executing" };
       const proof = await this.observe(row, index);
-      if (["completed", "executing"].includes(proof.state)) return proof;
+      if (["completed", "executing"].includes(proof.state)) {
+        // r108: completion proved at execute-time lands in the ledger before the
+        // return; only a completed proof may write completed, and an already
+        // completed row is never rewritten. The returned proof is untouched.
+        if (proof.state === "completed" && row.states[index] !== "completed") { row.states[index] = "completed"; await this.persistObservationProgress(row, [{ index, state: "completed" }]); }
+        return proof;
+      }
       if (proof.state !== "pending") fail("CLEANUP_TARGET_CHANGED");
       if (row.authorizationMode !== "confirmed_paths") await this.activity(row.node);
       const request = { node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
@@ -946,7 +999,9 @@ class CleanupFileApi {
         cleanupAction: row.action, operationId: row.operationId, target: row.targets[index],
         tmuxSessionPrefix: row.tmuxSessionPrefix || params.tmuxSessionPrefix || "simple" };
       // A lost response cannot leave a local busy flag that blocks later observations.
-      row.states[index] = "executing"; await this.save(row);
+      // r110: this write must also merge (never whole-copy), or a stale round could erase a
+      // sibling target's completed written while this observation was in flight.
+      row.states[index] = "executing"; await this.persistObservationProgress(row, [{ index, state: "executing" }]);
       if (row.observationMode === "filesystem") {
         if (this.localExecutions.has(key)) return { ok: true, state: "executing" };
         const execution = this.checked(request); this.localExecutions.set(key, execution);
@@ -958,7 +1013,11 @@ class CleanupFileApi {
         // created. The client may retry this same confirmed request, while
         // lifecycle checks continue reading actual tmux/filesystem evidence.
         if (row.observationMode === "tmux" && error.code === "OPERATION_BUSY") {
-          row.states[index] = "pending"; await this.save(row);
+          // r110b (P1-1): this rollback copy predates the managed-start attempt, so a sibling
+          // completion or a maintenance lifecycle persisted during that window must survive;
+          // the rollback advances only its own target, and a target already proved completed
+          // is never rolled back.
+          row.states[index] = "pending"; await this.persistObservationProgress(row, [{ index, state: "pending" }]);
           return { ok: true, state: "waiting", reason: "CLEANUP_MUTATION_BUSY", notStarted: true };
         }
         throw error;
@@ -1054,12 +1113,23 @@ class CleanupFileApi {
     }
     if (row.observationMode) {
       row.observations = [];
+      const progress = [];
       for (let index = 0; index < row.targets.length; index++) {
         try {
           const proof = await this.observe(row, index);
-          row.observations.push(proof); row.states[index] = proof.state;
-        } catch(error) { row.observations.push({ state: "unknown", queryError: error.message }); row.states[index] = "unknown"; }
+          row.observations.push(proof);
+          // r108 accounting (mirrors the batched fast-delete rules): completed is reached
+          // only through a completed proof, and missing or degraded evidence can never
+          // erase an already-persisted completion.
+          if (!(row.states[index] === "completed" && proof.state !== "completed")) row.states[index] = proof.state;
+        } catch(error) { row.observations.push({ state: "unknown", queryError: error.message }); if (row.states[index] !== "completed") row.states[index] = "unknown"; }
+        progress.push({ index, state: row.states[index] });
       }
+      // The ledger is durable after every full status round: a reader that never
+      // calls status (or a later background-delete admission) sees the same truth.
+      // r110: merged per-index against the current row (completed is sticky there too),
+      // so a slow round cannot erase completions or lifecycle written mid-round.
+      await this.persistObservationProgress(row, progress, row.observations);
     }
     return row;
   }
@@ -1186,7 +1256,7 @@ class CleanupFileApi {
       if (!resolved) return { ok: true, state: "unknown", operationId: row.operationId, isolatedDelete: copy(lifecycle),
         reason: "上一次后台删除结果未知：只读复检显示尚未全部删除，稍后再查即可，绝不重复执行删除" };
       row.isolatedDelete = { ...copy(lifecycle), phase: "completed", verifiedBy: "isolation_deleted", completedAt: new Date().toISOString() };
-      await this.save(row);
+      await this.saveIsolatedDelete(row);
       return { ok: true, state: "already_accepted", operationId: row.operationId, verifiedBy: "isolation_deleted", isolatedDelete: copy(row.isolatedDelete) };
     }
     this.busy.add(row.token);
@@ -1215,15 +1285,15 @@ class CleanupFileApi {
         row.isolatedDelete = { capability: "isolationBackgroundDelete", protocol: 1, phase: "accepted", operationId: row.operationId,
           acceptedAt: new Date().toISOString(), alreadyDeleted: alreadyDone,
           targets: entries.map(entry => ({ destinationRelativePath: entry.relativePath, type: entry.type })) };
-        await this.save(row); // durable acceptance BEFORE any mutation
+        await this.saveIsolatedDelete(row); // durable acceptance BEFORE any mutation
         if (!entries.length) {
           row.isolatedDelete.phase = "completed"; row.isolatedDelete.verifiedBy = "isolation_deleted";
           row.isolatedDelete.completedAt = new Date().toISOString();
-          await this.save(row);
+          await this.saveIsolatedDelete(row);
           return { ok: true, state: "already_accepted", verifiedBy: "isolation_deleted", operationId: row.operationId,
             isolatedDelete: copy(row.isolatedDelete) };
         }
-        row.isolatedDelete.phase = "executing"; await this.save(row);
+        row.isolatedDelete.phase = "executing"; await this.saveIsolatedDelete(row);
         let result;
         try {
           // One serial delete-fast RPC over the derived set; the engine is the
@@ -1239,7 +1309,7 @@ class CleanupFileApi {
           const zeroMutation = error.mutationStarted === false && FAST_ZERO_MUTATION_CODES.has(error.code);
           row.isolatedDelete.phase = zeroMutation ? "failed" : "unknown";
           row.isolatedDelete.error = { code: String(error && error.code || "UNVERIFIED_RESPONSE"), at: new Date().toISOString() };
-          await this.save(row);
+          await this.saveIsolatedDelete(row);
           return { ok: true, state: zeroMutation ? "failed" : "unknown", operationId: row.operationId,
             reason: String(error && error.code || "UNVERIFIED_RESPONSE") + (error && error.message ? ": " + String(error.message).slice(0, 200) : ""),
             isolatedDelete: copy(row.isolatedDelete) };
@@ -1251,7 +1321,7 @@ class CleanupFileApi {
         // engine-side truth (all destinations gone + persisted deleted markers)
         // lets the next call resolve to already_accepted; the engine refuses
         // any re-mutation of those entries anyway.
-        await this.save(row);
+        await this.saveIsolatedDelete(row);
         return { ok: true, state: "accepted", operationId: row.operationId,
           isolatedDelete: copy(row.isolatedDelete), receipt: result.receipt };
       });

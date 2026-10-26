@@ -48,6 +48,7 @@ function harness(options = {}) {
       return reply;
     }
     if (request.action === 'delete-fast') {
+      if (options.deleteFast) return options.deleteFast(request);
       const reply = deleteFastReplies.length ? deleteFastReplies.shift() : {
         ok: true,
         receipt: { operationId: request.operationId, metrics: { groups: 2, unlinkedFiles: 3, renames: 1, treeDirsRemoved: 1 },
@@ -77,6 +78,8 @@ function harness(options = {}) {
           status: typeof options.verifyStatus === 'function' ? options.verifyStatus(entry) : (options.verifyStatus || 'gone') })),
       };
     }
+    if (request.action === 'managed-start') return options.managedStart ? options.managedStart(request) : { ok: true, state: 'requested', rootIdentity: IDENTITY };
+    if (request.action === 'managed-observe') return options.managedObserve ? options.managedObserve(request) : { ok: true, state: 'pending', rootIdentity: IDENTITY };
     throw new Error('UNEXPECTED_ACTION:' + request.action);
   };
   const storageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'batch-delete-api-'));
@@ -499,4 +502,208 @@ test('concurrent calls for one token never create a second executor', async () =
   const finished = await first;
   assert.equal(finished.state, 'accepted');
   assert.equal(base.counts('delete-fast'), 1);
+});
+
+// ---------- r108: observation completion must reach the durable ledger ----------
+// Field defect (0.2.111): managed isolation rows stayed states:["executing"] forever
+// while the engine proved completion; isolatedMaintenanceDelete reads ONLY persisted
+// states, so the background delete refused NOT_ISOLATED_COMPLETE for ever.
+const MANAGED_COMPLETED = { ok: true, rootIdentity: IDENTITY, state: 'completed', verifiedBy: 'completion_receipt',
+  irreversible: false, finalizePending: false, executor: null };
+const MANAGED_PENDING = { ok: true, rootIdentity: IDENTITY, state: 'pending' };
+async function managedIsolateToken(h, targets) {
+  // The field rows are node.kind remote -> observationMode normalizes to "tmux"
+  // (cleanup-file-api.js:458); a local node would normalize to "filesystem" and
+  // execute would run the synchronous local isolate chain instead of managed-start.
+  const preview = await h.api.preview({ consumerRoot: __CONSUMER__, node: { kind: 'remote', host: 'h', port: 22, user: 'zlk', root: '/srv/proj' }, action: 'isolate',
+    observationMode: 'managed_tmux', targets });
+  await h.api.confirm({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, confirm: true, phase: 1,
+    exactTargets: targets.map(t => '/srv/proj/' + t.relativePath) });
+  return preview;
+}
+
+test('r108 a completed managed observation is durable before the answer returns and admits the background delete', async () => {
+  let rounds = 0;
+  const h = harness({ entryRow: target => target.relativePath === ISO_DEST ? isolatedProbe(target) : null,
+    managedObserve: () => (++rounds === 1 ? MANAGED_PENDING : MANAGED_COMPLETED) });
+  const preview = await managedIsolateToken(h, [{ relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST }]);
+  await h.api.execute({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
+  assert.equal(h.counts('managed-start'), 1, 'the pending round proceeds to the managed start exactly once');
+  assert.equal((await h.api.read(preview.token, __CONSUMER__)).states[0], 'executing', 'before any completion proof the ledger honestly says executing');
+  const returned = await h.api.status({ consumerRoot: __CONSUMER__, token: preview.token });
+  assert.equal(returned.states[0], 'completed'); assert.equal(returned.observations[0].verifiedBy, 'completion_receipt');
+  assert.equal((await h.api.read(preview.token, __CONSUMER__)).states[0], 'completed',
+    'the completion proof must be durable, not merely returned — this is the r108 field defect');
+  const ran = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  assert.equal(ran.state, 'accepted', 'a durable completed isolation token enters the background delete; NOT_ISOLATED_COMPLETE is gone');
+  assert.equal(h.counts('delete-fast'), 1);
+});
+
+test('r108 execute that re-observes a committed rename persists completed before returning, without re-mutating', async () => {
+  const h = harness({ managedObserve: () => MANAGED_COMPLETED });
+  const preview = await managedIsolateToken(h, [{ relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST }]);
+  const result = await h.api.execute({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
+  assert.equal(result.state, 'completed');
+  assert.equal(h.counts('managed-start'), 0, 'an already committed rename is never re-started');
+  assert.equal((await h.api.read(preview.token, __CONSUMER__)).states[0], 'completed');
+});
+
+test('r108 check persists a completed observation for observation-mode rows and still returns the engine proof verbatim', async () => {
+  const h = harness({ managedObserve: () => MANAGED_COMPLETED });
+  const preview = await managedIsolateToken(h, [{ relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST }]);
+  const proof = await h.api.check({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
+  assert.equal(proof.state, 'completed'); assert.equal(proof.verifiedBy, 'completion_receipt');
+  assert.equal((await h.api.read(preview.token, __CONSUMER__)).states[0], 'completed');
+});
+
+test('r108 protection lock: one completed target never releases the whole-token delete while a sibling stays pending', async () => {
+  const h = harness({ entryRow: target => target.relativePath.startsWith('clean_dir/' + ISO_BATCH + '/') ? isolatedProbe(target) : null,
+    managedObserve: request => (request.target.relativePath === ISO_SRC ? MANAGED_COMPLETED : MANAGED_PENDING) });
+  const preview = await managedIsolateToken(h, [
+    { relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST },
+    { relativePath: 'out/run2', type: 'directory', archiveBatch: ISO_BATCH, destination: 'clean_dir/' + ISO_BATCH + '/out/run2' }]);
+  const round = await h.api.status({ consumerRoot: __CONSUMER__, token: preview.token });
+  assert.deepEqual(round.states, ['completed', 'pending'], 'each target advances only on its own completed proof');
+  const stored = await h.api.read(preview.token, __CONSUMER__);
+  assert.deepEqual(stored.states, ['completed', 'pending']);
+  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest }),
+    error => error.code === 'NOT_ISOLATED_COMPLETE', 'an unfinished sibling blocks the whole token — the protection is not relaxed');
+  assert.equal(h.counts('delete-fast'), 0, 'refusal happens before any mutation');
+});
+
+// P2: api.read() prefers the in-memory previews copy, so every concurrency claim below is
+// ALSO checked against the ledger JSON file itself (the durable truth a restart would see).
+const readLedgerFile = token => JSON.parse(fs.readFileSync(
+  path.join(__CONSUMER__, 'simple_cluster', 'state', 'simple-sftp', 'cleanup-operations', token + '.json'), 'utf8'));
+
+// ---------- r110 (review blocker): concurrent rounds must merge, never write a stale copy back ----------
+// read() hands out an independent copy and save() writes the whole row with no CAS. The gate below
+// forces the interleave deterministically: both check() rounds capture their row copies (both
+// [pending, pending]) BEFORE either persists, so a whole-copy writeback loses one completion no
+// matter which save lands last; the per-token merge chain must keep both.
+test('r110 two concurrent observations of one token each persist their own completion; the disk keeps both', async () => {
+  let arrived = 0;
+  let releaseFirst;
+  const gate = new Promise(resolve => { releaseFirst = resolve; });
+  const h = harness({ entryRow: target => target.relativePath.startsWith('clean_dir/' + ISO_BATCH + '/') ? isolatedProbe(target) : null,
+    managedObserve: async () => {
+      arrived += 1;
+      // Hold the engine answer until BOTH rounds have passed their read() and wait in observe(),
+      // so both ledger copies are provably captured before either completion is persisted.
+      if (arrived === 1) await gate; else releaseFirst();
+      return MANAGED_COMPLETED;
+    } });
+  const preview = await managedIsolateToken(h, [
+    { relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST },
+    { relativePath: 'out/run2', type: 'directory', archiveBatch: ISO_BATCH, destination: 'clean_dir/' + ISO_BATCH + '/out/run2' }]);
+  const [proof0, proof1] = await Promise.all([
+    h.api.check({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 }),
+    h.api.check({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 1 })]);
+  assert.equal(proof0.state, 'completed'); assert.equal(proof1.state, 'completed');
+  assert.equal(arrived, 2, 'both observation rounds must overlap inside the engine call');
+  const stored = await h.api.read(preview.token, __CONSUMER__);
+  assert.deepEqual(stored.states, ['completed', 'completed'],
+    'each concurrent round may advance only its own target: neither completed may be erased by the other');
+  assert.deepEqual(readLedgerFile(preview.token).states, ['completed', 'completed'],
+    'P2: the durable ledger FILE must hold both completions, not only the memory preview');
+  const ran = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  assert.equal(ran.state, 'accepted', 'both completions are durable, so the background delete admits at the first attempt');
+  assert.equal(h.counts('delete-fast'), 1);
+});
+
+test('r110 a persisted completed never demotes: later pending answers and query failures keep the ledger completed', async () => {
+  let mode = 'completed';
+  const h = harness({ managedObserve: () => {
+    if (mode === 'completed') return MANAGED_COMPLETED;
+    if (mode === 'pending') return MANAGED_PENDING;
+    throw new Error('TRANSPORT_EXPLODED');
+  } });
+  const preview = await managedIsolateToken(h, [{ relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST }]);
+  await h.api.check({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
+  assert.equal((await h.api.read(preview.token, __CONSUMER__)).states[0], 'completed', 'baseline: the completion proof is durable');
+  assert.equal(readLedgerFile(preview.token).states[0], 'completed', 'P2: baseline completion is in the ledger file');
+  mode = 'pending';
+  const pendingCheck = await h.api.check({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
+  assert.equal(pendingCheck.state, 'pending', 'the engine answer is still returned verbatim while the ledger stays completed');
+  const pendingRound = await h.api.status({ consumerRoot: __CONSUMER__, token: preview.token });
+  assert.equal(pendingRound.states[0], 'completed');
+  assert.equal(readLedgerFile(preview.token).states[0], 'completed', 'a later pending round rewrites the file only with the same truth');
+  mode = 'error';
+  const failedRound = await h.api.status({ consumerRoot: __CONSUMER__, token: preview.token });
+  assert.equal(failedRound.states[0], 'completed');
+  assert.equal(failedRound.observations[0].state, 'unknown');
+  assert.equal(failedRound.observations[0].queryError, 'TRANSPORT_EXPLODED');
+  assert.equal((await h.api.read(preview.token, __CONSUMER__)).states[0], 'completed',
+    'missing or degraded evidence never erases the persisted completed, through check or status');
+  assert.equal(readLedgerFile(preview.token).states[0], 'completed',
+    'P2: the ledger file itself never demotes either');
+});
+
+// r110b (P1-1): the OPERATION_BUSY rollback happens on the row copy captured BEFORE the managed
+// start attempt. The gates below make the window deterministic: the sibling completion fully
+// persists while the start is held, so the rollback fires with a copy that cannot contain it.
+test('r110b a mutation-busy rollback keeps the sibling completion durable on disk and in memory', async () => {
+  let rounds = 0;
+  let releaseStart, startArrived;
+  const startGate = new Promise(resolve => { releaseStart = resolve; });
+  const started = new Promise(resolve => { startArrived = resolve; });
+  const h = harness({
+    managedObserve: () => (++rounds === 1 ? MANAGED_PENDING : MANAGED_COMPLETED),
+    managedStart: () => { startArrived(); return startGate.then(() => { const error = new Error('mutation window busy'); error.code = 'OPERATION_BUSY'; throw error; }); } });
+  const preview = await managedIsolateToken(h, [
+    { relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST },
+    { relativePath: 'out/run2', type: 'directory', archiveBatch: ISO_BATCH, destination: 'clean_dir/' + ISO_BATCH + '/out/run2' }]);
+  const running = h.api.execute({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
+  await started;
+  const sibling = await h.api.check({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 1 });
+  assert.equal(sibling.state, 'completed');
+  releaseStart();
+  const waited = await running;
+  assert.equal(waited.state, 'waiting'); assert.equal(waited.reason, 'CLEANUP_MUTATION_BUSY'); assert.equal(waited.notStarted, true);
+  assert.deepEqual(readLedgerFile(preview.token).states, ['pending', 'completed'],
+    'P1-1: the rollback advances only its own target on the CURRENT row; a whole-copy writeback would erase the sibling completion');
+  assert.deepEqual((await h.api.read(preview.token, __CONSUMER__)).states, ['pending', 'completed']);
+});
+
+// r110b (P1-2): the rollback races a RUNNING background delete. The engine call stays held, so
+// acceptance+executing lifecycle is durable while the stale-copy rollback fires; the file is
+// inspected at that instant (before the delete's own next save could mask any erasure).
+test('r110b a rollback during a running background delete keeps the maintenance lifecycle and completions durable', async () => {
+  let rounds = 0;
+  let releaseStart, releaseDelete, startArrived, deleteArrived;
+  const startGate = new Promise(resolve => { releaseStart = resolve; });
+  const deleteGate = new Promise(resolve => { releaseDelete = resolve; });
+  const started = new Promise(resolve => { startArrived = resolve; });
+  const deleting = new Promise(resolve => { deleteArrived = resolve; });
+  const h = harness({
+    entryRow: target => target.relativePath.startsWith('clean_dir/' + ISO_BATCH + '/') ? isolatedProbe(target) : null,
+    managedObserve: () => (++rounds === 1 ? MANAGED_PENDING : MANAGED_COMPLETED),
+    managedStart: () => { startArrived(); return startGate.then(() => { const error = new Error('mutation window busy'); error.code = 'OPERATION_BUSY'; throw error; }); },
+    deleteFast: request => { deleteArrived(); return deleteGate.then(() => ({ ok: true,
+      receipt: { operationId: request.operationId, metrics: { groups: 1, unlinkedFiles: 2, renames: 1, treeDirsRemoved: 1 },
+        receipts: request.entries.map(entry => ({ relativePath: entry.relativePath, mode: 'removed' })) } })); } });
+  const preview = await managedIsolateToken(h, [
+    { relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST },
+    { relativePath: 'out/run2', type: 'directory', archiveBatch: ISO_BATCH, destination: 'clean_dir/' + ISO_BATCH + '/out/run2' }]);
+  const running = h.api.execute({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
+  await started; // the pending observation and the held managed-start are in flight
+  await h.api.check({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
+  await h.api.check({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 1 });
+  const maintenance = h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  await deleting; // acceptance and executing lifecycle are saved; the engine is still running
+  releaseStart();
+  const waited = await running;
+  assert.equal(waited.state, 'waiting');
+  const mid = readLedgerFile(preview.token);
+  assert.deepEqual(mid.states, ['completed', 'completed'],
+    'P1-1: a target already proved completed is never rolled back by the busy path');
+  assert.equal(mid.isolatedDelete && mid.isolatedDelete.phase, 'executing',
+    'P1-2: the in-flight maintenance lifecycle must still be on disk after the rollback; a stale-copy writeback erases it');
+  releaseDelete();
+  const finished = await maintenance;
+  assert.equal(finished.state, 'accepted');
+  const done = readLedgerFile(preview.token);
+  assert.equal(done.isolatedDelete.phase, 'completed');
+  assert.deepEqual(done.states, ['completed', 'completed'], 'the maintenance saves keep the persisted completions');
+  assert.deepEqual((await h.api.read(preview.token, __CONSUMER__)).states, ['completed', 'completed']);
 });
