@@ -179,17 +179,20 @@ def time_facts(row, slot_fd):
             return {"timeSource": source, "ageMs": None, "expiryProblem": "time-contradiction"}
         return {"timeSource": source, "ageMs": int((now - seconds) * 1000), "expiryProblem": None}
     malformed = {"timeSource": None, "ageMs": None, "expiryProblem": "time-format"}
+    # FINAL REVIEW P1-B: EVERY present field is format-checked BEFORE any age basis is chosen.
+    # A legally old terminalAt next to a written-but-unusable updatedAt is still a journal nobody
+    # can vouch for — selecting around a malformed field was the bug.
     created_present, created_parsed = time_field(row, "createdAt")
     if created_present and created_parsed is None:
         return malformed
     terminal_present, terminal = time_field(row, "terminalAt")
     if terminal_present and terminal is None:
         return malformed  # a written-but-unusable commit time outranks every older fallback
-    if terminal_present:
-        return basis("terminalAt", float(terminal))
     updated_present, updated = time_field(row, "updatedAt")
     if updated_present and updated is None:
         return malformed
+    if terminal_present:
+        return basis("terminalAt", float(terminal))
     if updated_present:
         return basis("updatedAt", float(updated))
     try:

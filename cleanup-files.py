@@ -1112,12 +1112,21 @@ def verify_staged_journal_binding(root, target, binding):
     if not isinstance(row, dict) or row.get("identity") != identity or row.get("generation") != generation \
             or row.get("status") != "committed":
         deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    # FINAL REVIEW P1-A: presence/format of EVERY field is enforced before any basis is chosen —
+    # a written-but-null updatedAt or terminalAt is malformed, never a slip to older evidence —
+    # and a binding that froze the terminal moment demands it back: a journal that LOST terminalAt
+    # after the report is a different journal, no fallback.
     created = trusted_int(row.get("createdAt"))
     if "createdAt" in row and created is None:
         deny("STAGED_JOURNAL_MISMATCH", rel, reason)
     created_s = created / 1_000_000_000 if created and created > 1_000_000_000_000 else float(created or 0)
     terminal = row.get("terminalAt")
-    if "terminalAt" in row and terminal is not None and trusted_int(terminal) is None:
+    if "terminalAt" in row and trusted_int(terminal) is None:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    updated = row.get("updatedAt")
+    if "updatedAt" in row and trusted_int(updated) is None:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    if terminal is None and expected_terminal is not None:
         deny("STAGED_JOURNAL_MISMATCH", rel, reason)
     if terminal is not None:
         # A binding carrying the terminal moment binds it EXACTLY: a fresh re-commit (new or
@@ -1125,16 +1134,16 @@ def verify_staged_journal_binding(root, target, binding):
         if expected_terminal is not None and terminal != expected_terminal:
             deny("STAGED_JOURNAL_MISMATCH", rel, reason)
         basis = float(terminal)
-    elif "terminalAt" in row and row["terminalAt"] is None:
-        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    elif updated is not None:
+        basis = float(updated)
     else:
-        updated = row.get("updatedAt")
-        if "updatedAt" in row and updated is not None and trusted_int(updated) is None:
-            deny("STAGED_JOURNAL_MISMATCH", rel, reason)
-        basis = float(updated) if updated is not None else manifest_mtime
-        if created_s and basis < created_s - 1:
-            deny("STAGED_JOURNAL_MISMATCH", rel, reason)
-    if (time.time() - basis) * 1000 < expiry_ms:
+        basis = manifest_mtime
+    # The three consistency rules (malformed above, future, createdAt-contradiction) apply to
+    # EVERY basis actually used under the lock — not only to the mtime fallback branch.
+    now = time.time()
+    if basis > now or (created_s and basis < created_s - 1):
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    if (now - basis) * 1000 < expiry_ms:
         deny("STAGED_JOURNAL_MISMATCH", rel, reason)
 
 

@@ -38,7 +38,8 @@ test("staged slots keep two generations end to end: preview, fail-closed third, 
         malformedTimeProtected: true, malformedNoOlderFallback: true, mtimeContradictionProtected: true,
         legacyFallbackStillWorks: true, reclaimBindingNonTerminalRefused: true,
         reclaimBindingGenerationChangedRefused: true, reclaimBindingFreshCommitRefused: true,
-        reclaimBindingUnchangedAccepted: true } });
+        reclaimBindingTerminalRemovedRefused: true, reclaimBindingCreatedAfterTerminalRefused: true,
+        reclaimBindingLegacyNullUpdateRefused: true, reclaimBindingUnchangedAccepted: true } });
 });
 
 // The extension-side production request builder must encode the SAME read-only protocol the
