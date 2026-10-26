@@ -877,7 +877,14 @@ class CleanupFileApi {
     const row = await this.read(params.token, params.consumerRoot, typeof params.backendDigest === "string" ? params.backendDigest : undefined), index = params.index;
     if (!Number.isInteger(index) || !row.targets[index]) fail("INVALID_TARGET");
     if (isFastDeleteRow(row)) return this.fastVerify(row, index);
-    if (row.observationMode) return this.observe(row, index);
+    if (row.observationMode) {
+      // r108: a completed observation is durable before the answer returns. The
+      // ledger must never keep saying "executing" after the engine proved the
+      // move completed; a background delete reads ONLY persisted states.
+      const proof = await this.observe(row, index);
+      if (proof && proof.state === "completed" && row.states[index] !== "completed") { row.states[index] = "completed"; await this.save(row); }
+      return proof;
+    }
     return this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity, target: row.targets[index],
       action: "check", deleted: row.action === "delete", receiptCompleted: row.states[index] === "completed" });
   }
@@ -938,7 +945,13 @@ class CleanupFileApi {
       const key = row.token + ":" + index;
       if (row.observationMode === "filesystem" && this.localExecutions.has(key)) return { ok: true, state: "executing" };
       const proof = await this.observe(row, index);
-      if (["completed", "executing"].includes(proof.state)) return proof;
+      if (["completed", "executing"].includes(proof.state)) {
+        // r108: completion proved at execute-time lands in the ledger before the
+        // return; only a completed proof may write completed, and an already
+        // completed row is never rewritten. The returned proof is untouched.
+        if (proof.state === "completed" && row.states[index] !== "completed") { row.states[index] = "completed"; await this.save(row); }
+        return proof;
+      }
       if (proof.state !== "pending") fail("CLEANUP_TARGET_CHANGED");
       if (row.authorizationMode !== "confirmed_paths") await this.activity(row.node);
       const request = { node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
@@ -1057,9 +1070,16 @@ class CleanupFileApi {
       for (let index = 0; index < row.targets.length; index++) {
         try {
           const proof = await this.observe(row, index);
-          row.observations.push(proof); row.states[index] = proof.state;
-        } catch(error) { row.observations.push({ state: "unknown", queryError: error.message }); row.states[index] = "unknown"; }
+          row.observations.push(proof);
+          // r108 accounting (mirrors the batched fast-delete rules): completed is reached
+          // only through a completed proof, and missing or degraded evidence can never
+          // erase an already-persisted completion.
+          if (!(row.states[index] === "completed" && proof.state !== "completed")) row.states[index] = proof.state;
+        } catch(error) { row.observations.push({ state: "unknown", queryError: error.message }); if (row.states[index] !== "completed") row.states[index] = "unknown"; }
       }
+      // The ledger is durable after every full status round: a reader that never
+      // calls status (or a later background-delete admission) sees the same truth.
+      await this.save(row);
     }
     return row;
   }

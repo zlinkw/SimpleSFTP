@@ -77,6 +77,8 @@ function harness(options = {}) {
           status: typeof options.verifyStatus === 'function' ? options.verifyStatus(entry) : (options.verifyStatus || 'gone') })),
       };
     }
+    if (request.action === 'managed-start') return options.managedStart ? options.managedStart(request) : { ok: true, state: 'requested', rootIdentity: IDENTITY };
+    if (request.action === 'managed-observe') return options.managedObserve ? options.managedObserve(request) : { ok: true, state: 'pending', rootIdentity: IDENTITY };
     throw new Error('UNEXPECTED_ACTION:' + request.action);
   };
   const storageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'batch-delete-api-'));
@@ -499,4 +501,68 @@ test('concurrent calls for one token never create a second executor', async () =
   const finished = await first;
   assert.equal(finished.state, 'accepted');
   assert.equal(base.counts('delete-fast'), 1);
+});
+
+// ---------- r108: observation completion must reach the durable ledger ----------
+// Field defect (0.2.111): managed isolation rows stayed states:["executing"] forever
+// while the engine proved completion; isolatedMaintenanceDelete reads ONLY persisted
+// states, so the background delete refused NOT_ISOLATED_COMPLETE for ever.
+const MANAGED_COMPLETED = { ok: true, rootIdentity: IDENTITY, state: 'completed', verifiedBy: 'completion_receipt',
+  irreversible: false, finalizePending: false, executor: null };
+const MANAGED_PENDING = { ok: true, rootIdentity: IDENTITY, state: 'pending' };
+async function managedIsolateToken(h, targets) {
+  const preview = await h.api.preview({ consumerRoot: __CONSUMER__, node: { kind: 'local', root: '/srv/proj' }, action: 'isolate',
+    observationMode: 'managed_tmux', targets });
+  await h.api.confirm({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, confirm: true, phase: 1,
+    exactTargets: targets.map(t => '/srv/proj/' + t.relativePath) });
+  return preview;
+}
+
+test('r108 a completed managed observation is durable before the answer returns and admits the background delete', async () => {
+  let rounds = 0;
+  const h = harness({ entryRow: target => target.relativePath === ISO_DEST ? isolatedProbe(target) : null,
+    managedObserve: () => (++rounds === 1 ? MANAGED_PENDING : MANAGED_COMPLETED) });
+  const preview = await managedIsolateToken(h, [{ relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST }]);
+  await h.api.execute({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
+  assert.equal(h.counts('managed-start'), 1, 'the pending round proceeds to the managed start exactly once');
+  assert.equal((await h.api.read(preview.token, __CONSUMER__)).states[0], 'executing', 'before any completion proof the ledger honestly says executing');
+  const returned = await h.api.status({ consumerRoot: __CONSUMER__, token: preview.token });
+  assert.equal(returned.states[0], 'completed'); assert.equal(returned.observations[0].verifiedBy, 'completion_receipt');
+  assert.equal((await h.api.read(preview.token, __CONSUMER__)).states[0], 'completed',
+    'the completion proof must be durable, not merely returned — this is the r108 field defect');
+  const ran = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  assert.equal(ran.state, 'accepted', 'a durable completed isolation token enters the background delete; NOT_ISOLATED_COMPLETE is gone');
+  assert.equal(h.counts('delete-fast'), 1);
+});
+
+test('r108 execute that re-observes a committed rename persists completed before returning, without re-mutating', async () => {
+  const h = harness({ managedObserve: () => MANAGED_COMPLETED });
+  const preview = await managedIsolateToken(h, [{ relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST }]);
+  const result = await h.api.execute({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
+  assert.equal(result.state, 'completed');
+  assert.equal(h.counts('managed-start'), 0, 'an already committed rename is never re-started');
+  assert.equal((await h.api.read(preview.token, __CONSUMER__)).states[0], 'completed');
+});
+
+test('r108 check persists a completed observation for observation-mode rows and still returns the engine proof verbatim', async () => {
+  const h = harness({ managedObserve: () => MANAGED_COMPLETED });
+  const preview = await managedIsolateToken(h, [{ relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST }]);
+  const proof = await h.api.check({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
+  assert.equal(proof.state, 'completed'); assert.equal(proof.verifiedBy, 'completion_receipt');
+  assert.equal((await h.api.read(preview.token, __CONSUMER__)).states[0], 'completed');
+});
+
+test('r108 protection lock: one completed target never releases the whole-token delete while a sibling stays pending', async () => {
+  const h = harness({ entryRow: target => target.relativePath.startsWith('clean_dir/' + ISO_BATCH + '/') ? isolatedProbe(target) : null,
+    managedObserve: request => (request.target.relativePath === ISO_SRC ? MANAGED_COMPLETED : MANAGED_PENDING) });
+  const preview = await managedIsolateToken(h, [
+    { relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST },
+    { relativePath: 'out/run2', type: 'directory', archiveBatch: ISO_BATCH, destination: 'clean_dir/' + ISO_BATCH + '/out/run2' }]);
+  const round = await h.api.status({ consumerRoot: __CONSUMER__, token: preview.token });
+  assert.deepEqual(round.states, ['completed', 'pending'], 'each target advances only on its own completed proof');
+  const stored = await h.api.read(preview.token, __CONSUMER__);
+  assert.deepEqual(stored.states, ['completed', 'pending']);
+  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest }),
+    error => error.code === 'NOT_ISOLATED_COMPLETE', 'an unfinished sibling blocks the whole token — the protection is not relaxed');
+  assert.equal(h.counts('delete-fast'), 0, 'refusal happens before any mutation');
 });
