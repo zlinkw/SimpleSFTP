@@ -1,4 +1,4 @@
-const test=require('node:test'),assert=require('node:assert/strict'),path=require('node:path'),os=require('node:os');
+const test=require('node:test'),assert=require('node:assert/strict'),path=require('node:path'),os=require('node:os'),fs=require('node:fs');
 const __CONSUMER__ = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'consumer-root-'));
 const {spawnSync}=require('node:child_process');
 const {CleanupFileApi}=require('../cleanup-file-api');
@@ -11,7 +11,7 @@ const BATCH='job-'+'a'.repeat(48);
 function makeApi(overrides={}){const requests=[];const api=new CleanupFileApi({storageRoot:path.join(os.tmpdir(),'plan-isolate-'+process.pid+'-'+Math.random().toString(36).slice(2)),activity:async()=>{},lease:async(_node,_targets,fn)=>fn(),transport:async request=>{requests.push(JSON.parse(JSON.stringify(request)));
   if(request.action==='batch-inspect')return {ok:true,rootIdentity:{path:'/scope'},capabilities:{confirmedPathFastDelete:1,batchEntryInspect:1},targets:request.targets.map(t=>({...t,absolutePath:'/scope/'+t.relativePath,archived:true,device:'1',inode:'7'}))};
   if(request.action==='inspect'){if(overrides.inspect)return overrides.inspect(request);
-    return {ok:true,rootIdentity:{path:'/scope'},target:{type:request.target.type,absolutePath:'/scope/'+request.target.relativePath,fingerprint:'top-'+request.target.relativePath,inode:'7',device:'1',fingerprintMode:'top_level',inventory:[]}};}
+    return {ok:true,rootIdentity:{path:'/scope'},backgroundIsolatedDelete:1,target:{type:request.target.type,absolutePath:'/scope/'+request.target.relativePath,fingerprint:'top-'+request.target.relativePath,inode:'7',device:'1',fingerprintMode:'top_level',inventory:[]}};}
   if(request.action==='managed-start')return overrides.start?overrides.start(request):{ok:true,state:'requested',rootIdentity:{path:'/scope'}};
   if(request.action==='managed-observe')return overrides.observe?overrides.observe(request):{ok:true,state:'pending',rootIdentity:{path:'/scope'}};
   if(request.action==='settle')return overrides.settle?overrides.settle(request):{ok:true,rootIdentity:{path:'/scope'},receipt:{fingerprintMode:'top_level'}};
@@ -109,4 +109,68 @@ test('a lost isolation response settles, re-preflights only on the fast inspect,
 
 test('controlled fast isolation, subtree single-writer locks and registered permanent deletion hold against the real engine',()=>{
   assert.deepEqual(runFixture('planIsolate.fixture.py',10000),{ok:true,fastIsolate:true,subtreeLocks:true,registeredDeletion:true});
+});
+
+test('the isolate hot path runs one live inspect, one rename and no post-rename re-check of the isolated copy',()=>{
+  const source=fs.readFileSync(path.resolve(__dirname,'../cleanup-files.py'),'utf8');
+  const start=source.indexOf('    if action == "isolate":\n');
+  const end=source.indexOf('    archived_control = archived_control_rel(target)',start);
+  assert.ok(start>0&&end>start,'isolate branch anchors missing');
+  const branch=source.slice(start,end);
+  assert.equal((branch.match(/isolate_inspect\(/g)||[]).length,1,'exactly one live inspect inside the isolate branch');
+  assert.ok(!branch.includes('checked["fingerprint"] != value["fingerprint"]'),'the retired second full inspect comparison must stay gone');
+  assert.equal((branch.match(/no_replace\(/g)||[]).length,1,'exactly one non-overwriting atomic rename');
+  assert.ok(!branch.includes('top_identity(value["destination"]'),'the isolated copy must not be re-stat-ed after the rename');
+  // The structural pre-rename checks stay: destination non-overwrite, path_guard, verified direct parent.
+  assert.ok(branch.includes('deny("DESTINATION_EXISTS", value["destination"])'),'destination non-overwrite stays immediately before the rename');
+  assert.equal((branch.match(/path_guard\(root, target\["destination"\], True, True\)/g)||[]).length,2,'path_guard re-runs around the destination creation');
+  assert.match(branch,/child = parent_cd\(root, value\["absolutePath"\]\)/,'the rename runs from the verified direct parent');
+  assert.match(branch,/deny\("SOURCE_STILL_EXISTS"\)/,'source absence is confirmed at the moment of the move');
+  assert.ok(branch.indexOf('register_isolation(')<branch.indexOf('{**record, "phase": "completed"}'),'registration lands before the completed audit line');
+  for(const key of ['"isolationCompletionProtocol": 1','"renameCommitted": True','"sourceMissingAtMove": True','"registered": True','"executorsChecked": True','"executors": value["executors"]'])
+    assert.ok(branch.includes(key),'completion receipt must carry '+key);
+  // Honest wording: the receipt must never claim the isolated content was re-verified.
+  assert.match(branch,/NOT re-read here/,'completion comment must state the copy is not re-read');
+});
+
+test('the isolation completion receipt binds token, batch and exact paths and is persisted with the ledger row',async()=>{
+  const completion={isolationCompletionProtocol:1,archiveBatch:BATCH,sourceRelativePath:isolateTarget.relativePath,destinationRelativePath:isolateTarget.destination,
+    renameCommitted:true,sourceMissingAtMove:true,registered:true,executorsChecked:true,executors:[]};
+  const {api,requests}=makeApi({isolate:()=>({ok:true,rootIdentity:{path:'/scope'},receipt:{operationId:'op',action:'isolate',phase:'completed',...completion}})});
+  const preview=await api.preview({consumerRoot: __CONSUMER__, node:{kind:'remote',root:'/scope'},action:'isolate',targets:[{...isolateTarget}]});
+  assert.equal(preview.safety.isolationCompletionReceipt,1,'the isolate preview must advertise the completion receipt');
+  assert.equal(preview.safety.backgroundIsolatedDelete,1,'the isolate preview must report the SE-published capability flag verbatim');
+  await api.confirm({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,phase:1,confirm:true,exactTargets:['/scope/outputs/run1']});
+  const executed=await api.execute({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,index:0});
+  assert.equal(executed.ok,true);
+  const stored=await api.read(preview.token, __CONSUMER__);
+  const receipt=stored.receipts[0];
+  assert.equal(receipt.phase,'completed');assert.equal(receipt.isolationCompletionProtocol,1);
+  assert.equal(receipt.archiveBatch,BATCH);
+  assert.equal(receipt.sourceRelativePath,'outputs/run1');assert.equal(receipt.destinationRelativePath,isolateTarget.destination);
+  assert.equal(receipt.renameCommitted,true);assert.equal(receipt.sourceMissingAtMove,true);assert.equal(receipt.registered,true);
+  assert.equal(receipt.executorsChecked,true);assert.deepEqual(receipt.executors,[]);
+  assert.equal(requests.filter(request=>request.action==='isolate').length,1);
+});
+
+test('a registration refusal after the rename stays unknown: the retry settles once and never re-sends the rename',async()=>{
+  let phase='first';
+  const {api,requests}=makeApi({
+    isolate:()=>{if(phase==='first'){phase='registered';return {ok:false,error:{code:'CLEANUP_CONTROL_CHANGED',message:'登记在 rename 之后失败'}};}return {ok:true,rootIdentity:{path:'/scope'},receipt:{phase:'completed'}};},
+    settle:()=>({ok:true,rootIdentity:{path:'/scope'},receipt:{phase:'completed',settledBy:'frozen_binding',fingerprintMode:'top_level'}})
+  });
+  const preview=await api.preview({consumerRoot: __CONSUMER__, node:{kind:'remote',root:'/scope'},action:'isolate',targets:[{...isolateTarget}]});
+  await api.confirm({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,phase:1,confirm:true,exactTargets:['/scope/outputs/run1']});
+  await assert.rejects(api.execute({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,index:0}),error=>error.code==='CLEANUP_CONTROL_CHANGED');
+  const mid=await api.read(preview.token, __CONSUMER__);
+  assert.equal(mid.states[0],'executing','a failed registration after the rename is unknown, never pending-completed');
+  const retry=await api.execute({consumerRoot: __CONSUMER__, token:preview.token,digest:preview.digest,index:0});
+  assert.equal(retry.ok,true);assert.equal(retry.settled,true);
+  assert.equal(requests.filter(request=>request.action==='isolate').length,1,'settlement must never re-send the committed rename');
+  assert.equal(requests.filter(request=>request.action==='settle').length,1);
+  const stored=await api.read(preview.token, __CONSUMER__);
+  assert.equal(stored.states[0],'completed');
+  // Honesty: a settle-repaired receipt carries no fabricated move-time completion facts.
+  assert.equal(stored.receipts[0].isolationCompletionProtocol,undefined);
+  assert.equal(stored.receipts[0].renameCommitted,undefined);
 });

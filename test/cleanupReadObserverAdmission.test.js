@@ -137,6 +137,33 @@ test("只读身份不能由客户端参数伪造：自称只读的删除执行�
   release(); await running;
 });
 
+test("维护删除走真实路由登记：在途不计传输忙，但绝不伪装成只读身份", async () => {
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const methods = harness({ isolatedMaintenanceDelete: async () => { await gate; return { ok: true, state: "accepted", operationId: "cleanup-m" }; } });
+  const running = methods["files.cleanup.isolatedMaintenanceDelete"]({ localPath: "/fixture/root", node: { host: "h", port: 22 }, token: "a".repeat(48) });
+  await settle();
+  const snap = await busyNow();
+  assert.equal(snap.busy, false, "维护通道的后台删除不得计传输忙（不得阻断派发/上传准入）");
+  assert.equal(snap.activeTransferCount, 1, "维护任务确实注册在途");
+  assert.equal(snap.blockingTransferCount, 0);
+  assert.equal(snap.maintenanceTransferCount, 1);
+  assert.deepEqual(flags(snap), ["files.cleanup.isolatedMaintenanceDelete:write"], "维护豁免不伪造只读身份：该行仍按写入披露");
+  release(); await running;
+});
+
+test("客户端参数伪造不出维护豁免：带 maintenanceCleanup 的普通执行仍计忙", async () => {
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const methods = harness({ execute: async () => { await gate; return { ok: true }; } });
+  const running = methods["files.cleanup.execute"]({ localPath: "/fixture/root", targets: ["./a"], maintenanceCleanup: true });
+  await settle();
+  const snap = await busyNow();
+  assert.equal(snap.busy, true, "维护事实只由服务端路由登记，客户端参数一律无效（fail closed）");
+  assert.equal(snap.blockingTransferCount, 1);
+  assert.equal(snap.maintenanceTransferCount, 0);
+  assert.deepEqual(flags(snap), ["files.cleanup.execute:write"]);
+  release(); await running;
+});
+
 test("只读方法的身份也不随对抗参数下降：参数里写 remoteMutation 仍是只读观测", async () => {
   let release; const gate = new Promise(resolve => { release = resolve; });
   const methods = harness({ preview: async () => { await gate; return { ok: true }; } });

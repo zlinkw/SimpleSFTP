@@ -47,3 +47,32 @@ test('v1.9 fast chain isolates directories by non-overwriting rename and only re
     'virtual-paths-stay-posix-ntpath-control'])
     assert.match(result.stdout, new RegExp('^ok ' + name + '$', 'm'), 'fake-OS scenario ' + name + ' missing');
 });
+test('0.2.111 维护入口复用唯一删除执行器：无第二 mutation 路径，参数只来自登记 destination', () => {
+  const source = fs.readFileSync(guard, 'utf8');
+  // 引擎侧：main() 仍只把 delete-fast 路由给唯一生产执行器，新入口没有添加第二条链。
+  assert.match(source, /if action == "delete-fast":\s*\n\s*return delete_fast\(root, identity, request\)/,
+    'delete-fast 必须继续且仅继续接到唯一 delete_fast 执行器');
+  assert.equal((source.match(/def delete_fast\(/g) || []).length, 1, '生产删除执行器必须恰好一个');
+  assert.match(source, /NOT_REGISTERED_ISOLATION/, '未登记归档路径的拒绝仍由执行器把守（维护入口共用同一道门）');
+  // JS 侧：维护入口只发一条只读复检与一条 delete-fast；从不发出 move/restore/isolate/settle。
+  const js = fs.readFileSync(path.resolve(__dirname, '../cleanup-file-api.js'), 'utf8');
+  const start = js.indexOf('async isolatedMaintenanceDelete(params)');
+  const end = js.indexOf('async verify(params)', start);
+  assert.ok(start > 0 && end > start, 'isolatedMaintenanceDelete 缺失');
+  const body = js.slice(start, end);
+  assert.match(body, /action: "batch-inspect"/, '删除集合先做一次批量只读复检');
+  assert.match(body, /action: "delete-fast"/, 'mutation 只走既有 delete-fast 单链');
+  assert.ok(!/action:\s*"(managed-start|move|restore|isolate|settle)"/.test(body),
+    '维护通道绝不发出移动/恢复/隔离/settle RPC');
+  assert.match(body, /target\.destination !== "clean_dir\/" \+ target\.archiveBatch \+ "\/" \+ target\.relativePath/,
+    'destination 与批次派生路径必须逐条等值，否则整批拒删');
+  assert.match(body, /row\.states\[index\] !== "completed"/, '存在未完成隔离目标时整批不启动删除');
+  assert.equal((body.match(/entries\.push\(/g) || []).length, 1, 'mutation 条目构造点必须唯一');
+  const entryBuild = body.match(/entries\.push\([^;]*\);/)[0];
+  assert.ok(entryBuild.includes('relativePath: target.destination') && !entryBuild.includes('binding'),
+    '删除条目只取登记 destination；调用方绑定只做校验，永不进入 mutation');
+  // 调用方参数名与 SE 契约逐字一致：只有 token/digest/targets(index, relativePath, destination)。
+  assert.match(body, /Number\.isInteger\(binding\.index\)[\s\S]{0,400}binding\.relativePath[\s\S]{0,400}binding\.destination/,
+    '绑定校验只核 index/relativePath/destination');
+  assert.ok(!/params\.(targets|digest|token)[^;]*\bdelete\b/.test(body), '调用方参数不直接构成删除集');
+});

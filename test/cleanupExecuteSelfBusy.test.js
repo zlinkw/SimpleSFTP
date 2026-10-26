@@ -226,6 +226,48 @@ test("非观测链的普通移动同样不自阻断（第二处 activity 调用�
   assert.equal(state.maxLeaseConcurrency, 1, "同一 root 的写入租约不得重入");
 });
 
+test("维护后台删除不计传输忙；真实上传仍计忙；伪造维护标记一律无效", async () => {
+  const maintenance = { id: "files.cleanup.isolatedMaintenanceDelete#m", operation: "files.cleanup.isolatedMaintenanceDelete", remoteMutation: true, maintenanceCleanup: true };
+  const snap = transferBusySnapshot({ transfers: [maintenance], uploadOperations: [], uploadQueueKeys: [] }, { observedAt: "x" });
+  assert.equal(snap.busy, false, "维护通道不得阻断派发/上传准入");
+  assert.equal(snap.activeTransferCount, 1, "维护那一条仍作为事实在证据里原样保留");
+  assert.equal(snap.blockingTransferCount, 0);
+  assert.equal(snap.maintenanceTransferCount, 1);
+  const upload = { id: "upload.files#u", operation: "upload.files", remoteMutation: true };
+  const both = transferBusySnapshot({ transfers: [maintenance, upload], uploadOperations: [], uploadQueueKeys: [] }, { observedAt: "x" });
+  assert.equal(both.busy, true, "只要存在一条真实上传就必须计忙");
+  assert.equal(both.blockingTransferCount, 1, "阻断计数只点名真实上传");
+  assert.equal(both.maintenanceTransferCount, 1);
+  for (const [label, row] of [
+    ["缺维护标记", { id: "x", operation: "files.cleanup.isolatedMaintenanceDelete", remoteMutation: true }],
+    ["标记非布尔", { id: "x", operation: "files.cleanup.isolatedMaintenanceDelete", remoteMutation: true, maintenanceCleanup: "yes" }],
+    ["不是远端变更", { id: "x", operation: "files.cleanup.isolatedMaintenanceDelete", remoteMutation: false, maintenanceCleanup: true }],
+    ["自相矛盾声明只读观测", { id: "x", operation: "files.cleanup.isolatedMaintenanceDelete", remoteMutation: true, maintenanceCleanup: true, readObserver: true }],
+  ]) {
+    const s = transferBusySnapshot({ transfers: [row], uploadOperations: [], uploadQueueKeys: [] }, { observedAt: "x" });
+    assert.equal(s.busy, true, label + "：缺事实或自相矛盾仍按写入计忙（fail closed）");
+    assert.equal(s.blockingTransferCount, 1);
+    assert.equal(s.maintenanceTransferCount, 0);
+  }
+  // 真实守卫：仅维护行在途时，其他清理准入不得被挡；真实上传在维护结束后必须仍然挡。
+  fixture(); // 与既有测试一致的注册上下文（instanceId 等），保证守卫走同一生产投影
+  const maint = __test.createTransferController({ id: "maint-fixture-1", operation: "files.cleanup.isolatedMaintenanceDelete",
+    localPath: "", remotePath: "", host: NODES.nwpu3.host, remoteMutation: true, maintenanceCleanup: true });
+  const passthrough = await Promise.resolve().then(() => { __test.cleanupActivityGuard({ id: "other-context" }); return null; }).catch(error => error);
+  assert.equal(passthrough, null, "维护删除在途时清理准入不得被挡（维护通道语义）");
+  const uploadController = __test.createTransferController({ id: "upload-fixture-1", operation: "upload.files",
+    localPath: "", remotePath: "/srv/x", host: NODES.nwpu3.host, remoteMutation: true });
+  const blocked = await Promise.resolve().then(() => { __test.cleanupActivityGuard({ id: "other-context-2" }); return null; }).catch(error => error);
+  assert.equal(String(blocked && blocked.code), "ACTIVE_TRANSFER", "真实上传那一条必须仍被计忙");
+  assert.equal(blocked.apiData.busy.blockingTransferCount, 1);
+  assert.equal(blocked.apiData.busy.maintenanceTransferCount, 1, "拒绝证据完整披露两条事实：维护 1、阻断 1");
+  maint.dispose();
+  const stillBlocked = await Promise.resolve().then(() => { __test.cleanupActivityGuard({ id: "other-context-3" }); return null; }).catch(error => error);
+  assert.equal(String(stillBlocked && stillBlocked.code), "ACTIVE_TRANSFER", "维护任务结束不得释放别的上下文的真实传输");
+  assert.equal(stillBlocked.apiData.busy.maintenanceTransferCount, 0);
+  uploadController.dispose();
+});
+
 test("自身豁免只来自服务端登记的控制器，纯投影缺 self 时保守按阻断计", async () => {
   const controller = { id: "transfer-9-9-files.cleanup.execute", operation: "files.cleanup.execute", remoteMutation: true };
   const withSelf = transferBusySnapshot({ self: controller, transfers: [controller], uploadOperations: [], uploadQueueKeys: [] }, { observedAt: "x" });

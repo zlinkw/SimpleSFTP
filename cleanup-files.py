@@ -1052,12 +1052,28 @@ def isolation_state(root, destination_rel):
     return record
 
 
-def register_isolation(root, destination_rel, source_rel, operation_id, value, moment):
+ISOLATION_COMPLETION_KEYS = ("isolationCompletionProtocol", "archiveBatch", "sourceRelativePath",
+                             "destinationRelativePath", "renameCommitted", "sourceMissingAtMove",
+                             "registered", "executorsChecked", "executors")
+
+
+def register_isolation(root, destination_rel, source_rel, operation_id, value, moment, completion=None):
     # The pending isolation mapping survives a lost response; it is removed
     # only by a user-confirmed permanent deletion or a completed restore.
-    write_control_json(root, isolation_control_rel(destination_rel), {
-        "schemaVersion": 1, "state": "isolated", "operationId": operation_id, "destination": destination_rel,
-        "source": source_rel, "type": value["type"], "inode": value["inode"], "isolatedAt": moment})
+    # Optional completion facts are the move-moment facts THIS call observed
+    # (atomic rename committed, source name absent during the move, the
+    # node-local managed-window sweep found no overlapping cleanup executor).
+    # A settlement repair passes no completion dict on purpose: a later repair
+    # cannot re-observe the move moment and must never fabricate these fields.
+    record = {"schemaVersion": 1, "state": "isolated", "operationId": operation_id, "destination": destination_rel,
+              "source": source_rel, "type": value["type"], "inode": value["inode"], "isolatedAt": moment}
+    if value.get("device") is not None:
+        record["device"] = value["device"]
+    if isinstance(completion, dict):
+        for key in ISOLATION_COMPLETION_KEYS:
+            if key in completion:
+                record[key] = completion[key]
+    write_control_json(root, isolation_control_rel(destination_rel), record)
 
 
 # ---------------------------------------------------------------------------
@@ -1106,7 +1122,13 @@ def fast_entry_check(root, item, operation_id):
     archived = bool(ARCHIVED_BATCH_RE.match(rel))
     full = path_guard(root, rel, allow_clean=archived, missing=True)
     if not os.path.lexists(full):
-        return {"relativePath": rel, "type": item["type"], "missing": True, "absolutePath": full, "archived": archived}
+        row = {"relativePath": rel, "type": item["type"], "missing": True, "absolutePath": full, "archived": archived}
+        if archived:
+            # A missing archived entry still answers from its registration, so
+            # a finished permanent deletion stays distinguishable from an
+            # unexplained absence; nothing is created or touched here.
+            row["isolationState"] = (isolation_state(root, rel) or {}).get("state")
+        return row
     st = os.lstat(full)
     actual = "directory" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "unknown"
     if actual != item["type"]:
@@ -1118,6 +1140,11 @@ def fast_entry_check(root, item, operation_id):
     if archived:
         state = isolation_state(root, rel)
         row["isolationState"] = (state or {}).get("state")
+        # Move-moment facts persisted with the registration at rename time,
+        # whitelisted verbatim; an older record simply carries no such keys.
+        completion = {name: state[name] for name in ISOLATION_COMPLETION_KEYS if isinstance(state, dict) and name in state}
+        if completion:
+            row["isolationCompletion"] = completion
     elif actual == "directory":
         row["isolationName"] = isolation_name(operation_id, rel, os.path.basename(full))
     for key in ("device", "inode"):
@@ -1510,8 +1537,14 @@ def isolate_inspect(root, target, operation_id=None):
         value["fingerprint"] = digest({"target": value["fingerprint"], "formalOwnerSha256": owner_hash})
     if target.get("activityEvidenceMode") == "managed_tmux":
         managed_active(root, target, full, value)
-    for executor in current_cleanup_executors(root, full, operation_id):
-        deny("ACTIVE_CLEANUP_EXECUTOR", executor["windowId"], "已有清理执行器正在处理重叠目标")
+    executors = current_cleanup_executors(root, full, operation_id)
+    if executors:
+        deny("ACTIVE_CLEANUP_EXECUTOR", executors[0]["windowId"], "已有清理执行器正在处理重叠目标")
+    # Node-local move-stage fact: THIS inspect swept the managed cleanup
+    # windows and found none overlapping the target. It proves only this
+    # instant on this node and is never re-presented as a later check.
+    value["executorsChecked"] = True
+    value["executors"] = []
     for name in target.get("requiredInputs") or ():
         input_full = path_guard(root, relative(name), True, True)
         if os.path.lexists(input_full) and (input_full == full or below(full, input_full)):
@@ -1598,17 +1631,23 @@ def acquire_target_locks(root, rels):
     return opened
 
 
-def finalize_managed_window(root, request):
+def finalize_managed_window(root, request, completion=None):
     """C3 server-side self close: persist the minimal anti-replay completion
     identity first, then release exactly this request's bound pane — proven
     live, matching @sftp_cleanup and still marked remain-on-exit — by turning
     the flag off and destroying that single pane. A wrapper that exits without
     closing (tmux 3.0a/3.2a/3.3a keep a remain-on-exit window through a later
     flag change and shell teardown) must not leave a dead window behind.
-    Failures keep the window for inspection; never re-delete."""
+    Failures keep the window for inspection; never re-delete.
+    For an isolation move, the completion record additionally persists the
+    move-moment facts this very process observed (the whitelisted completion
+    dict); they describe the move, never a later deletion-time check."""
     key = managed_key({**request, "cleanupAction": request["action"]})
-    write_control_json(root, completion_control_rel(key), {"schemaVersion": 1, "state": "completed", "cleanupKey": key,
-                                                           "operationId": request["operationId"], "action": request["action"], "completedAt": time.time()})
+    completion_record = {"schemaVersion": 1, "state": "completed", "cleanupKey": key,
+                         "operationId": request["operationId"], "action": request["action"], "completedAt": time.time()}
+    if isinstance(completion, dict):
+        completion_record["completion"] = {name: completion[name] for name in ISOLATION_COMPLETION_KEYS if name in completion}
+    write_control_json(root, completion_control_rel(key), completion_record)
     try:
         pane = os.environ.get("TMUX_PANE", "")
         if not pane:
@@ -1790,8 +1829,15 @@ def managed_observe(request):
                 or receipt.get("state") != "completed"):
             deny("CLEANUP_INPUT_CHANGED")
         if receipt is not None:
-            return {"ok": True, "state": "completed", "verifiedBy": "completion_receipt", "irreversible": request["cleanupAction"] == "delete",
-                    "finalizePending": bool(executor and not executor["dead"]), "rootIdentity": identity, "executor": executor}
+            answer = {"ok": True, "state": "completed", "verifiedBy": "completion_receipt", "irreversible": request["cleanupAction"] == "delete",
+                      "finalizePending": bool(executor and not executor["dead"]), "rootIdentity": identity, "executor": executor}
+            completion = receipt.get("completion")
+            if isinstance(completion, dict) and request.get("cleanupAction") == "isolate":
+                # The persisted move-moment facts, echoed verbatim through the
+                # whitelist. They describe THIS node at move time and are
+                # never re-derived from the current filesystem here.
+                answer["completion"] = {name: completion[name] for name in ISOLATION_COMPLETION_KEYS if name in completion}
+            return answer
     if request.get("frozenTargetDigest") and (executor and not executor["dead"] or os.path.lexists(source)):
         frozen = frozen_observation_target(root, request, key)
         if frozen is None:
@@ -2077,36 +2123,56 @@ def main(request):
     if request.get("isolate") is True:
         if action != "inspect":
             deny("INVALID_REQUEST")
-        return {"ok": True, "rootIdentity": identity, "target": isolate_inspect(root, target, request.get("operationId"))}
+        # Per-backend version fact for the background-delete chain: the JS
+        # side only advertises safety.backgroundIsolatedDelete when EVERY
+        # isolate inspect of this backend answered with this flag. An older
+        # engine keeps the old downgrade chain honest.
+        return {"ok": True, "rootIdentity": identity, "backgroundIsolatedDelete": 1,
+                "target": isolate_inspect(root, target, request.get("operationId"))}
     if action == "isolate":
         batch = target.get("archiveBatch")
         if batch is None or not isinstance(batch, str) or not re.fullmatch(r"job-[a-f0-9]{48}", batch):
             deny("UNSAFE_ARCHIVE_BATCH")
         if target.get("destination") != "clean_dir/" + batch + "/" + target["relativePath"]:
             deny("UNSAFE_DESTINATION")
+        # ONE live pre-write authorization (top-level identity, ownership,
+        # required inputs, node-local executor sweep). The former second full
+        # isolate_inspect sat a few syscalls before the rename, re-read the
+        # same fixed-name manifests and the same git status, and added no
+        # protection a racing writer could not bypass anyway; it is removed.
+        # What still re-runs immediately before the mutation is exactly the
+        # structural set: destination non-overwrite, path_guard and the
+        # verified direct parent. A lost response stays unknown: the caller
+        # settles through the frozen binding and never re-sends this rename.
         value = isolate_inspect(root, target, request.get("operationId"))
         record = {"operationId": request["operationId"], "action": "isolate", "source": value["absolutePath"], "destination": value["destination"],
                   "type": target["type"], "fingerprint": value["fingerprint"], "sourceRelativePath": target["relativePath"], "time": time.time()}
         audit(root, {**record, "phase": "intent"})
-        checked = isolate_inspect(root, target, request.get("operationId"))
-        if checked["fingerprint"] != value["fingerprint"]:
-            deny("CONTENT_CHANGED")
         path_guard(root, target["destination"], True, True)
+        if os.path.lexists(value["destination"]):
+            deny("DESTINATION_EXISTS", value["destination"])
         os.makedirs(os.path.dirname(value["destination"]), exist_ok=True)
         path_guard(root, target["destination"], True, True)
         child = parent_cd(root, value["absolutePath"])
+        # Exactly one atomic rename; a missing no-replace primitive or a
+        # cross-filesystem target fails closed, never degrades to a copy.
         no_replace(child, value["destination"])
-        # Foreground proof is top-level identity plus the rename result, not a
-        # recursive content hash of the isolated tree.
-        after = top_identity(value["destination"], target["type"])
-        if after["inode"] != value["inode"] or after["device"] != value["device"] or after["mtime"] != value["mtime"]:
-            deny("MOVE_VERIFICATION_FAILED")
+        # Completion proof for this move: the atomic no-replace rename
+        # committed, the source name is absent in this very move, the
+        # registration lands, and the durable completion audit line below
+        # closes the record. The isolated copy itself is NOT re-read here;
+        # this receipt never claims the isolated content was re-verified.
         if os.path.lexists(value["absolutePath"]):
             deny("SOURCE_STILL_EXISTS")
-        register_isolation(root, os.path.relpath(value["destination"], root).replace(os.sep, "/"), relative(target["relativePath"]),
-                           request["operationId"], value, time.time())
+        destination_rel = os.path.relpath(value["destination"], root).replace(os.sep, "/")
+        completion = {"isolationCompletionProtocol": 1, "archiveBatch": batch,
+                      "sourceRelativePath": target["relativePath"], "destinationRelativePath": target["destination"],
+                      "renameCommitted": True, "sourceMissingAtMove": True, "registered": True,
+                      "executorsChecked": True, "executors": value["executors"]}
+        register_isolation(root, destination_rel, relative(target["relativePath"]),
+                           request["operationId"], value, time.time(), completion)
         audit(root, {**record, "phase": "completed"})
-        return {"ok": True, "rootIdentity": identity, "receipt": {**record, "phase": "completed"}}
+        return {"ok": True, "rootIdentity": identity, "receipt": {**record, "phase": "completed", **completion}}
     archived_control = archived_control_rel(target)
     if archived_control is not None and action == "delete":
         archived_state = isolation_state(root, archived_control)
@@ -2277,8 +2343,17 @@ if __name__ == "__main__":
         # anti-replay completion identity is persisted before the window is
         # released; failure keeps remain-on-exit on and the window preserved.
         if request.get("managedInner") is True and result.get("ok") and action in ("delete", "move", "restore", "isolate"):
+            completion = None
+            if action == "isolate" and isinstance(result.get("receipt"), dict) \
+                    and result["receipt"].get("isolationCompletionProtocol") == 1:
+                candidate = {name: result["receipt"][name] for name in ISOLATION_COMPLETION_KEYS if name in result["receipt"]}
+                # The bounded control read keeps its 4096-byte limit; an
+                # oversized completion echo is simply omitted (the isolated
+                # copy then keeps the older review chain), never truncated.
+                if len(json.dumps(candidate, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= 3072:
+                    completion = candidate
             try:
-                result["finalize"] = finalize_managed_window(checked_root, request)
+                result["finalize"] = finalize_managed_window(checked_root, request, completion)
             except GuardError as error:
                 result["finalize"] = {"finalized": False, "receiptWritten": False, "code": error.code}
     except GuardError as error:

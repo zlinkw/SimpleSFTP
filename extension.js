@@ -8,6 +8,8 @@ const transferCapacity = new TransferCapacity();
 const metadataTreeCapacity = new TransferCapacity();
 const metadataInventoryCapacity = new TransferCapacity();
 const cleanupReadCapacity = new TransferCapacity();
+// 0.2.111 隔离区后台删除走独立的受限并发维护通道：既不与批量传输抢容量，也不得被借用为读池。
+const maintenanceCleanupCapacity = new TransferCapacity();
 // Short, exact code checks cannot queue behind a recursive artifact inventory.
 // Each lane remains bounded to two servers globally and one read per server.
 const codeInventoryCapacity = new TransferCapacity();
@@ -1692,10 +1694,13 @@ const API_METHOD_CAPABILITIES = {
       "files.cleanup.check": { readOnly: true, zeroWrites: true, receiptOnly: true, automaticExecution: false },
       "files.cleanup.verify": { readOnly: true, completedReceiptRequired: true },
       "files.cleanup.settle": { frozenApprovalRequired: true, receiptOnly: true, startsNewMoves: false },
-      "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: 1, requiredInputGuard: 1, registeredIsolationDeletion: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
+      "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: 1, requiredInputGuard: 1, registeredIsolationDeletion: 1, backgroundIsolatedDelete: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
       "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
       "files.cleanup.stagedSlots": { readOnly: true, incomingGenerationPreview: true, retainedGenerations: 2 },
-      "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1, tmuxSessionPrefix: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1 },
+      "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1, tmuxSessionPrefix: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1, isolationCompletionReceipt: 1 },
+      // 0.2.111 后台删除入口：只接受已登记隔离 token，删除集合由插件登记记录派生；
+      // 它仍是远端修改（不声明 readOnly），但作为隔离区维护任务不长期占用传输忙。
+      "files.cleanup.isolatedMaintenanceDelete": { registeredIsolationTokenOnly: 1, pluginDerivedDeleteSet: 1, isolationCompletionReceiptRequired: 1, clientSuppliedDestinations: false, maintenanceChannel: 1, executorEvidenceAtMoveOnly: 1 },
       "sync.projectInventory": { scopeTransport: "stdin",
         readOnly: true, ownCacheWritesOnly: true, maxScopePaths: 5000, maxScopeBytes: 1048576, idlePolicy: "observe-filesystem", scopedTraversal: "direct-roots-v1", codeInventoryLane: 1, capacityTiming: 1, metadataOnly: 1, contentIdentity: 1 },
       "sync.serverToServerFpsync": { retentionKey: "stable-logical-source", generation: "stable-run-id", retainedGenerations: 2, compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
@@ -3578,7 +3583,7 @@ function nextTransferId(operation) {
   return `transfer-${Date.now()}-${transferSequence}-${String(operation || "").replace(/[^\w.-]+/g, "-")}`;
 }
 
-function createTransferController({ id, operation, localPath, remotePath, host, observeOnlyIdle = true, readObserver = false, remoteMutation = false }) {
+function createTransferController({ id, operation, localPath, remotePath, host, observeOnlyIdle = true, readObserver = false, remoteMutation = false, maintenanceCleanup = false }) {
   const listeners = new Set();
   const progressListeners = new Set();
   let cancelled = false;
@@ -3705,8 +3710,10 @@ function createTransferController({ id, operation, localPath, remotePath, host, 
   const parentController = transferContext.getStore();
   const parentCancellation = parentController?.onCancel((reason) => controller.cancel(reason));
   // 只读观测身份在注册那一刻随控制器一起固定；未显式证明的控制器一律按可能写入处理。
+  // 维护豁免同样只在注册时固定，且必须与 remoteMutation 事实同时成立才在投影中生效。
   controller.readObserver = readObserver === true;
   controller.remoteMutation = remoteMutation === true;
+  controller.maintenanceCleanup = maintenanceCleanup === true;
   activeTransfers.set(controller.id, controller);
   if (parentController?.status === "cancelled") controller.cancel("上层操作已取消");
   return controller;
@@ -4174,6 +4181,7 @@ function createLocalApiMethods() {
     "files.cleanup.confirm": params => cleanupFileApi.confirm(params),
     "files.cleanup.execute": params => cleanupFileApi.execute(params),
     "files.cleanup.status": params => cleanupFileApi.status(params),
+    "files.cleanup.isolatedMaintenanceDelete": params => cleanupFileApi.isolatedMaintenanceDelete(params),
     status: async () => {
       const active = getActiveSharedServer();
       return {
@@ -4642,7 +4650,10 @@ function createLocalApiMethods() {
     methods[name] = async (params = {}) => {
       const controllerId = nextTransferId(name);
       const operationId = String(params._operationId || controllerId);
-      const remoteMutation = /^(upload[.]|handoff[.]|sync[.](?:serverToServer|deletePath)|remote[.])/.test(name);
+      // 隔离区后台删除是远端修改（只删已登记隔离副本，范围由引擎按登记约束），
+      // 它不获得 readObserver 只读身份；它对传输忙的豁免来自下面显式登记的维护事实。
+      const remoteMutation = name === "files.cleanup.isolatedMaintenanceDelete"
+        || /^(upload[.]|handoff[.]|sync[.](?:serverToServer|deletePath)|remote[.])/.test(name);
       const recoveryContext = name === "sync.serverToServerFpsync" || READ_ONLY_SETTLEMENT_METHODS.includes(name)
         ? { method: name, params: retryIdentity(params) } : undefined;
       // Metadata is a cancellable read, never a durable modifying transaction.
@@ -4660,7 +4671,9 @@ function createLocalApiMethods() {
       const controller = createTransferController({ id: controllerId, operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "",
         // No file operation is failed or killed because a filesystem call is slow.
         // Errors and explicit cancellation still settle through the original path.
-        observeOnlyIdle: true, readObserver, remoteMutation });
+        // 维护豁免事实由本路由按方法名固定登记（客户端参数无法伪装或删除执行不得自称）：
+        // 只有 files.cleanup.isolatedMaintenanceDelete 这一个入口的控制器携带它。
+        observeOnlyIdle: true, readObserver, remoteMutation, maintenanceCleanup: name === "files.cleanup.isolatedMaintenanceDelete" });
       controller.operationId = operationId;
       const requestContext = currentApiRequestContext();
       const readSignal = requestContext?.readOnly ? requestContext.signal : undefined;
@@ -4674,7 +4687,8 @@ function createLocalApiMethods() {
         const memoryRead = name === "sync.downloadMappedPaths" && params.memoryOnly === true && params.metricsOnly === true;
         const cleanupRead = ["files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.check", "files.cleanup.verify", "files.cleanup.status", "files.cleanup.observeBatch", "files.cleanup.stagedSlots"].includes(name);
         const metadataInventory = name === "sync.projectInventory" && params.metadataOnly === true;
-        const pool = cleanupRead ? cleanupReadCapacity : metadataInventory ? metadataInventoryCapacity : memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
+        const maintenanceDelete = name === "files.cleanup.isolatedMaintenanceDelete";
+        const pool = maintenanceDelete ? maintenanceCleanupCapacity : cleanupRead ? cleanupReadCapacity : metadataInventory ? metadataInventoryCapacity : memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
           : ["sync.projectTree", "sync.projectTreeState", "sync.projectFileStats"].includes(name) ? metadataTreeCapacity : transferCapacity;
         const result = await transferContext.run(controller, () => withTransferCapacity(params, () => apiRouteController.run(controller, () => method(params)), pool));
         if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认");

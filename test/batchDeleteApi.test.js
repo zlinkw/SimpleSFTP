@@ -26,13 +26,20 @@ function harness(options = {}) {
         ok: true, rootIdentity: IDENTITY,
         metrics: { entryReads: request.targets.length, mountReads: 1, entryCheckMs: 2 },
         targets: request.targets.map(target => {
+          if (options.entryRow) { const custom = options.entryRow(target); if (custom) return custom; }
           if (target.relativePath === 'out/gone.log') return { relativePath: target.relativePath, type: 'file', missing: true };
           const row = {
             relativePath: target.relativePath, type: target.type,
             absolutePath: '/srv/proj/' + target.relativePath, device: '7', inode: '2' + calls.length + target.relativePath.length,
           };
           if (target.type === 'directory') row.isolationName = 'iso_candidate';
-          if (target.relativePath.startsWith('clean_dir/')) row.archived = true;
+          if (target.relativePath.startsWith('clean_dir/')) {
+            row.archived = true;
+            // 0.2.111 echo shapes stay opt-in so every pre-existing expectation
+            // keeps its byte-for-byte transport; the maintenance tests ask for
+            // exactly what the real engine answers.
+            if (options.isolateProbeRow) Object.assign(row, options.isolateProbeRow(target));
+          }
           return row;
         }),
       };
@@ -47,6 +54,21 @@ function harness(options = {}) {
           receipts: request.entries.map(entry => ({ relativePath: entry.relativePath, mode: 'removed' })) },
       };
       return reply;
+    }
+    if (request.action === 'inspect' && request.isolate === true) {
+      if (options.inspectFail) return { ok: false, error: { code: options.inspectFail } };
+      return { ok: true, rootIdentity: IDENTITY, backgroundIsolatedDelete: 1, target: { type: request.target.type, absolutePath: '/srv/proj/' + request.target.relativePath,
+        fingerprint: 'top-' + request.target.relativePath, device: '7', inode: '9' + request.target.relativePath.length,
+        fingerprintMode: 'top_level', inventory: [], executorsChecked: true, executors: [] } };
+    }
+    if (request.action === 'isolate') {
+      if (typeof options.isolate === 'function') return options.isolate(request);
+      if (options.isolateError) return { ok: false, error: { code: options.isolateError,
+        ...(options.mutationStarted === undefined ? {} : { mutationStarted: options.mutationStarted }) } };
+      return { ok: true, rootIdentity: IDENTITY, receipt: { operationId: request.operationId, action: 'isolate', phase: 'completed',
+        isolationCompletionProtocol: 1, archiveBatch: request.target.archiveBatch, sourceRelativePath: request.target.relativePath,
+        destinationRelativePath: request.target.destination, renameCommitted: true, sourceMissingAtMove: true, registered: true,
+        executorsChecked: true, executors: [] } };
     }
     if (request.action === 'batch-verify') {
       return {
@@ -283,8 +305,7 @@ test('an interrupted isolate-then-delete never settles completed while its isola
     error => error.code === 'DELETE_RECEIPT_UNCERTAIN');
 });
 
-test('completion accounting finishes once the isolation tree is gone even if a fresh result reuses the original name', async () => {
-  const h = harness({ verifyStatus: entry => entry.relativePath === 'out/iso_candidate' ? 'gone'
+test('completion accounting finishes once the isolation tree is gone even if a fresh result reuses the original name', async () => {  const h = harness({ verifyStatus: entry => entry.relativePath === 'out/iso_candidate' ? 'gone'
     : entry.relativePath === 'out/run1' ? 'replaced' : 'gone' });
   const row = await h.preview([{ relativePath: 'out/run1', type: 'directory' }]);
   await confirmed(h, row);
@@ -295,4 +316,187 @@ test('completion accounting finishes once the isolation tree is gone even if a f
   const proof = await h.api.verify({consumerRoot: __CONSUMER__,  token: row.token, index: 0 });
   assert.equal(proof.state, 'completed');
   assert.equal(proof.isolationStatus, 'gone');
+});
+
+// ---------- 0.2.111 files.cleanup.isolatedMaintenanceDelete (wire contract verbatim) ----------
+// params are exactly { token, digest, targets: [{ index, relativePath, destination }] };
+// the answer state is "accepted" | "already_accepted" | "failed" (+ optional operationId);
+// anything else the caller records as unknown. The delete set derives from the LEDGER only.
+const ISO_BATCH = 'job-' + 'a'.repeat(48);
+const ISO_SRC = 'out/run1';
+const ISO_DEST = 'clean_dir/' + ISO_BATCH + '/out/run1';
+const ISO_COMPLETION = { isolationCompletionProtocol: 1, archiveBatch: ISO_BATCH, renameCommitted: true,
+  sourceMissingAtMove: true, registered: true, executorsChecked: true, executors: [] };
+// the echo derives its bindings from the destination itself, exactly like the
+// engine reads them back from the registration record.
+const isolatedProbe = (target, extra = {}) => ({ relativePath: target.relativePath, type: target.type,
+  absolutePath: '/srv/proj/' + target.relativePath, device: '7', inode: '3' + target.relativePath.length,
+  archived: true, isolationState: 'isolated',
+  isolationCompletion: { ...ISO_COMPLETION, archiveBatch: ISO_BATCH, sourceRelativePath: target.relativePath.slice(('clean_dir/' + ISO_BATCH + '/').length),
+    destinationRelativePath: target.relativePath }, ...extra });
+async function isolatedToken(h) {
+  const preview = await h.api.preview({ consumerRoot: __CONSUMER__, node: { kind: 'local', root: '/srv/proj' }, action: 'isolate',
+    targets: [{ relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST }] });
+  assert.equal(preview.safety.backgroundIsolatedDelete, 1, 'the isolate preview must advertise the SE-published capability verbatim');
+  await h.api.confirm({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, confirm: true, phase: 1, exactTargets: ['/srv/proj/' + ISO_SRC] });
+  await h.api.execute({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
+  return preview;
+}
+
+test('isolatedMaintenanceDelete derives the delete set from the ledger; a replaced caller destination is refused before any RPC', async () => {
+  const h = harness({ entryRow: target => target.relativePath === ISO_DEST ? isolatedProbe(target) : null });
+  const preview = await isolatedToken(h);
+  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest,
+    targets: [{ index: 0, relativePath: ISO_SRC, destination: 'clean_dir/' + ISO_BATCH + '/out/OTHER' }] }), error => error.code === 'TARGET_BINDINGS_MISMATCH');
+  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest,
+    targets: [{ index: 1, relativePath: ISO_SRC, destination: ISO_DEST }] }), error => error.code === 'TARGET_BINDINGS_MISMATCH', 'index must name the frozen target');
+  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest,
+    targets: [{ index: 0, relativePath: ISO_SRC, destination: ISO_DEST }, { index: 0, relativePath: ISO_SRC, destination: ISO_DEST }] }),
+    error => error.code === 'TARGET_BINDINGS_MISMATCH', 'one ledger target may only be claimed once');
+  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: 'f'.repeat(64) }), error => error.code === 'CONFIRM_REQUIRED',
+    'the frozen digest is mandatory');
+  assert.equal(h.counts('delete-fast'), 0, 'every refusal above happened before the wire');
+  assert.equal(h.counts('batch-inspect'), 0, 'even the read-only re-check is refused until the request shape and bindings hold');
+  const bound = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest,
+    targets: [{ index: 0, relativePath: ISO_SRC, destination: ISO_DEST }] });
+  assert.equal(bound.ok, true);
+  assert.equal(bound.state, 'accepted', 'accepted is the highest claim this entry may make');
+  assert.equal(bound.operationId, h.lastOf('isolate').operationId, 'the maintenance round is bound to the isolate operation');
+  assert.equal(h.counts('delete-fast'), 1);
+  const inspected = h.lastOf('batch-inspect');
+  assert.deepEqual(inspected.targets.map(t => t.relativePath), [ISO_DEST], 'the ledger destination is the ONLY path re-checked');
+  const entries = h.lastOf('delete-fast').entries;
+  assert.deepEqual(entries.map(e => e.relativePath), [ISO_DEST]);
+  assert.equal(entries[0].device, '7'); assert.equal(entries[0].inode, '3' + ISO_DEST.length, 'entries bind the engine-confirmed identity');
+  assert.equal(JSON.stringify(h.calls.filter(c => ['batch-inspect', 'delete-fast'].includes(c.action))).includes('"' + ISO_SRC + '"'), false,
+    'the source path never reaches the maintenance chain');
+  assert.equal(JSON.stringify(h.lastOf('delete-fast')).includes('.operations'), false, 'the control region never appears in a mutation entry');
+  const stored = await h.api.read(preview.token, __CONSUMER__);
+  assert.equal(stored.isolatedDelete.phase, 'completed');
+  assert.deepEqual(stored.isolatedDelete.targets, [{ destinationRelativePath: ISO_DEST, type: 'directory' }]);
+  const again = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest,
+    targets: [{ index: 0, relativePath: ISO_SRC, destination: ISO_DEST }] });
+  assert.equal(again.state, 'already_accepted');
+  assert.equal(h.counts('delete-fast'), 1, 'a finished maintenance delete is never re-run');
+});
+
+test('non-isolate tokens, missing ledger residency and unregistered archive states all refuse without any mutation', async () => {
+  const h = harness({ entryRow: target => target.relativePath === ISO_DEST ? isolatedProbe(target) : null });
+  const del = await h.preview([file('out/x.log')]);
+  await confirmed(h, del);
+  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: del.token, digest: del.digest }), error => error.code === 'NOT_ISOLATION_TOKEN',
+    'the generic two-confirmation permanent delete chain keeps its own entry');
+  // a token that lives in no ledger of THIS plugin process stops at the owner contract:
+  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: 'a'.repeat(48), digest: 'f'.repeat(64) }), error => error.code === 'PREVIEW_EXPIRED',
+    'no owner is ever guessed by scanning');
+  for (const [label, probe] of [
+    ['restored registration', target => isolatedProbe(target, { isolationState: 'restored' })],
+    ['unregistered archive path', target => ({ ...isolatedProbe(target), isolationState: undefined, isolationCompletion: undefined })],
+    ['absent destination without a deleted marker', target => ({ relativePath: target.relativePath, type: target.type, missing: true, archived: true })],
+  ]) {
+    const g = harness({ entryRow: target => target.relativePath === ISO_DEST ? probe(target) : null });
+    const preview = await isolatedToken(g);
+    await assert.rejects(g.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest,
+      targets: [{ index: 0, relativePath: ISO_SRC, destination: ISO_DEST }] }), error => error.code === 'NOT_REGISTERED_ISOLATION', label);
+    assert.equal(g.counts('delete-fast'), 0, label + ': refusal happens before the mutation');
+    const stored = await g.api.read(preview.token, __CONSUMER__);
+    assert.equal(stored.isolatedDelete, undefined, label + ': a refused call records no lifecycle');
+  }
+});
+
+test('a ledger without any move-moment receipt keeps the manual chain: NOT_ISOLATION_COMPLETION_RECEIPT, and the engine-side echo passes when the registration has it', async () => {
+  // old-format token: the isolate response carries no completion facts and the
+  // registration echo has none either — settle-repaired rows look exactly like
+  // this, and they must NEVER be auto-deleted.
+  const plain = harness({ isolate: () => ({ ok: true, rootIdentity: IDENTITY,
+    receipt: { operationId: 'cleanup-op', action: 'isolate', phase: 'completed' } }),
+  entryRow: target => target.relativePath === ISO_DEST ? isolatedProbe(target, { isolationCompletion: undefined }) : null });
+  const preview = await isolatedToken(plain);
+  await assert.rejects(plain.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest }),
+    error => error.code === 'NOT_ISOLATION_COMPLETION_RECEIPT');
+  assert.equal(plain.counts('delete-fast'), 0);
+  // the same ledger WITHOUT the local receipt still runs when the persisted
+  // registration itself echoes the completion facts (single source of truth).
+  const echo = harness({ isolate: () => ({ ok: true, rootIdentity: IDENTITY,
+    receipt: { operationId: 'cleanup-op', action: 'isolate', phase: 'completed' } }),
+  entryRow: target => target.relativePath === ISO_DEST ? isolatedProbe(target) : null });
+  const echoPreview = await isolatedToken(echo);
+  const ran = await echo.api.isolatedMaintenanceDelete({ token: echoPreview.token, digest: echoPreview.digest });
+  assert.equal(ran.state, 'accepted');
+  assert.equal(echo.counts('delete-fast'), 1);
+});
+
+test('an incomplete isolate batch is never deleted: pending and absent siblings block the whole token', async () => {
+  const h = harness({ entryRow: target => target.relativePath.startsWith('clean_dir/' + ISO_BATCH + '/') ? isolatedProbe(target) : null });
+  const preview = await h.api.preview({ consumerRoot: __CONSUMER__, node: { kind: 'local', root: '/srv/proj' }, action: 'isolate',
+    targets: [{ relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST },
+      { relativePath: 'out/run2', type: 'directory', archiveBatch: ISO_BATCH, destination: 'clean_dir/' + ISO_BATCH + '/out/run2' }] });
+  await h.api.confirm({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, confirm: true, phase: 1,
+    exactTargets: ['/srv/proj/' + ISO_SRC, '/srv/proj/out/run2'] });
+  await h.api.execute({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
+  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest }), error => error.code === 'NOT_ISOLATED_COMPLETE',
+    'one unfinished target blocks the whole token; partial maintenance deletion is not offered');
+  assert.equal(h.counts('delete-fast'), 0);
+  await h.api.execute({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 1 });
+  const done = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  assert.equal(done.state, 'accepted');
+  assert.deepEqual(h.lastOf('delete-fast').entries.map(e => e.relativePath).sort(),
+    [ISO_DEST, 'clean_dir/' + ISO_BATCH + '/out/run2']);
+});
+
+test('lost mutation answers stay unknown and resolve read-only; only the proven zero-mutation fact is a retryable failed', async () => {
+  let gone = false;
+  const h = harness({ entryRow: target => target.relativePath !== ISO_DEST ? null
+    : gone ? { relativePath: ISO_DEST, type: 'directory', missing: true, archived: true, isolationState: 'deleted' } : isolatedProbe(target) });
+  const preview = await isolatedToken(h);
+  h.deleteFastReplies.push({ ok: false, error: { code: 'REQUEST_TIMEOUT', message: 'the mutation answer was lost' } });
+  const lost = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  assert.equal(lost.ok, true, 'a maintenance failure is never thrown back into the dispatch chain');
+  assert.equal(lost.state, 'unknown');
+  assert.match(lost.reason, /REQUEST_TIMEOUT/, 'the failure carries a displayable reason');
+  const mid = await h.api.read(preview.token, __CONSUMER__);
+  assert.equal(mid.isolatedDelete.phase, 'unknown');
+  // still-present destinations while unknown: NOT re-mutated, answered unknown.
+  const stillThere = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  assert.equal(stillThere.state, 'unknown');
+  assert.equal(h.counts('delete-fast'), 1, 'unknown is resolved by read-only re-inspection, never by a second mutation');
+  // read-only facts show every destination gone with persisted deleted markers.
+  gone = true;
+  const resolved = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  assert.equal(resolved.state, 'already_accepted');
+  assert.equal(resolved.verifiedBy, 'isolation_deleted');
+  assert.equal(h.counts('delete-fast'), 1);
+  const done = await h.api.read(preview.token, __CONSUMER__);
+  assert.equal(done.isolatedDelete.phase, 'completed');
+  // a refusal with the explicit zero-mutation fact is a displayable failed and stays retryable.
+  const g = harness({ entryRow: target => target.relativePath === ISO_DEST ? isolatedProbe(target) : null });
+  const gPreview = await isolatedToken(g);
+  g.deleteFastReplies.push({ ok: false, error: { code: 'ENTRY_IDENTITY_CHANGED', message: 'identity drifted before any unlink', mutationStarted: false } });
+  const refused = await g.api.isolatedMaintenanceDelete({ token: gPreview.token, digest: gPreview.digest });
+  assert.equal(refused.state, 'failed', 'only the engine-proven zero-mutation fact may claim failed');
+  assert.match(refused.reason, /ENTRY_IDENTITY_CHANGED/);
+  assert.equal((await g.api.read(gPreview.token, __CONSUMER__)).isolatedDelete.phase, 'failed');
+  const retried = await g.api.isolatedMaintenanceDelete({ token: gPreview.token, digest: gPreview.digest });
+  assert.equal(retried.state, 'accepted');
+  assert.equal(g.counts('delete-fast'), 2, 'a proven no-op failed is retryable exactly once per call, with no parallel executor');
+});
+
+test('concurrent calls for one token never create a second executor', async () => {
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const base = harness({ entryRow: target => target.relativePath === ISO_DEST ? isolatedProbe(target) : null });
+  const preview = await isolatedToken(base);
+  const original = base.transport;
+  // hold the delete-fast reply so the second call arrives while the first runs
+  base.api.transport = async request => { const value = await original(request);
+    if (request.action === 'delete-fast') await gate; return value; };
+  const first = base.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  await new Promise(resolve => setImmediate(resolve));
+  let second;
+  try { second = await base.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest }); }
+  finally { release(); }
+  assert.equal(second.state, 'already_accepted', 'a running maintenance delete answers already_accepted, never a second mutation');
+  assert.match(second.reason, /不创建第二个删除执行器/);
+  const finished = await first;
+  assert.equal(finished.state, 'accepted');
+  assert.equal(base.counts('delete-fast'), 1);
 });
