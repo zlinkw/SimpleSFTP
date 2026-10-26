@@ -1078,15 +1078,24 @@ def verify_staged_journal_binding(root, target, binding):
     journal is still the committed, expired row the reclaim was authorized against; the same
     generation may have resumed, changed or freshly re-committed after the report. Every missing,
     corrupt, future, contradictory or simply different fact denies the rename; the earlier
-    committed/expired verdict is never trusted across that window."""
+    committed/expired verdict is never trusted across that window.
+
+    0.2.114: requireExpired distinguishes WHO authorized the isolation. True (the default for every
+    0.2.113 caller, byte-for-byte) is the automatic expiry reclaim: the age threshold must still
+    hold. Exactly False is an explicitly user-confirmed early release frozen in the preview ledger:
+    ONLY the final age-threshold rule is skipped — every other under-lock check (shape, identity,
+    generation, committed status, per-field presence/format, exact terminalAt binding, future
+    timestamp, createdAt contradiction, unreadable/corrupt journal) denies exactly as before."""
     identity = binding.get("identity") if isinstance(binding, dict) else None
     generation = binding.get("generation") if isinstance(binding, dict) else None
     expiry_ms = binding.get("expiryMs") if isinstance(binding, dict) else None
     expected_terminal = binding.get("terminalAt") if isinstance(binding, dict) else None
+    require_expired = binding.get("requireExpired", True) if isinstance(binding, dict) else None
     if not (isinstance(identity, str) and re.fullmatch(r"[0-9a-f]{64}", identity)
             and isinstance(generation, str) and re.fullmatch(r"[0-9a-f]{64}", generation)
             and isinstance(expiry_ms, int) and not isinstance(expiry_ms, bool) and expiry_ms > 0
-            and (expected_terminal is None or (isinstance(expected_terminal, int) and not isinstance(expected_terminal, bool) and expected_terminal > 0))):
+            and (expected_terminal is None or (isinstance(expected_terminal, int) and not isinstance(expected_terminal, bool) and expected_terminal > 0))
+            and isinstance(require_expired, bool)):
         deny("INVALID_STAGED_JOURNAL_BINDING")
     rel = str(target.get("relativePath") or "")
     if not STAGED_SLOT_REL_RE.match(rel):
@@ -1139,11 +1148,12 @@ def verify_staged_journal_binding(root, target, binding):
     else:
         basis = manifest_mtime
     # The three consistency rules (malformed above, future, createdAt-contradiction) apply to
-    # EVERY basis actually used under the lock — not only to the mtime fallback branch.
+    # EVERY basis actually used under the lock — not only to the mtime fallback branch. They also
+    # apply to a user-confirmed release: that mode skips ONLY the age threshold below.
     now = time.time()
     if basis > now or (created_s and basis < created_s - 1):
         deny("STAGED_JOURNAL_MISMATCH", rel, reason)
-    if (now - basis) * 1000 < expiry_ms:
+    if require_expired and (now - basis) * 1000 < expiry_ms:
         deny("STAGED_JOURNAL_MISMATCH", rel, reason)
 
 
@@ -2282,7 +2292,12 @@ def main(request):
         # side only advertises safety.backgroundIsolatedDelete when EVERY
         # isolate inspect of this backend answered with this flag. An older
         # engine keeps the old downgrade chain honest.
+        # 0.2.114: staged-slot inspects additionally answer THIS engine's support for the
+        # user-confirmed early release (requireExpired:false recheck mode) with the same
+        # per-backend proof discipline; anything else (or an older engine) stays silent.
         return {"ok": True, "rootIdentity": identity, "backgroundIsolatedDelete": 1,
+                **({"userConfirmedSlotRelease": 1}
+                   if STAGED_SLOT_REL_RE.match(str(target.get("relativePath") or "")) else {}),
                 "target": isolate_inspect(root, target, request.get("operationId"))}
     if action == "isolate":
         batch = target.get("archiveBatch")

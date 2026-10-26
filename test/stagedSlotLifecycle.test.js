@@ -8,7 +8,11 @@ const { spawnSync } = require("node:child_process");
 const identity = "11".repeat(32);
 const generation = "c3".repeat(32);
 
-test("staged slots keep two generations end to end: preview, fail-closed third, confirmed executor, landing", () => {
+// The fixture runs as two independently budgeted sections (the G2 host run showed the single
+// combined run crossing the spawn budget once the release scenarios grew): SAME file, SAME real
+// engine and receiver, section selected by argv. The union of the two verdict dicts equals the
+// old single verdict key-for-key — nothing moved off, nothing weakened, no timeout changed.
+function runFixture(...section) {
   const nativeFiles = [path.join(__dirname, "stagedSlotLifecycle.fixture.py"),
     path.resolve(__dirname, "../staged-tar-receive.py"), path.resolve(__dirname, "../cleanup-files.py")];
   const distro = process.env.SIMPLE_TEST_WSL_DISTRO || "Ubuntu-Codex";
@@ -18,13 +22,17 @@ test("staged slots keep two generations end to end: preview, fail-closed third, 
     assert.equal(resolved.status, 0, resolved.stderr || resolved.error?.message);
     return resolved.stdout.trim();
   }) : nativeFiles;
-  const argv = ["-B", "-X", "utf8", ...files];
+  const argv = ["-B", "-X", "utf8", ...files, ...section];
   const run = process.platform === "win32"
     ? spawnSync("wsl.exe", ["--distribution", distro, "--exec", "python3", ...argv],
       { encoding: "utf8", timeout: 10000, windowsHide: true })
     : spawnSync("python3", argv, { encoding: "utf8", timeout: 10000, windowsHide: true });
   assert.equal(run.status, 0, (run.stderr || run.stdout || "").slice(-3000));
-  assert.deepEqual(JSON.parse(run.stdout.trim().split("\n").pop()),
+  return JSON.parse(run.stdout.trim().split("\n").pop());
+}
+
+test("staged slots keep two generations end to end: preview, fail-closed third, confirmed executor, landing", () => {
+  assert.deepEqual(runFixture("core"),
     { ok: true, pendingBlocked: true, leaving: "simple_cluster/.simple-sftp-staging/d-" + "1".repeat(24) + "/0", thirdGenerationLanded: true,
       hardlinkPublication: { tarPublished: true, pendingAliasPreserved: true, chunkPublished: true,
         normalTargetPublished: true, directoryTargetRejected: true, symlinkTargetRejected: true },
@@ -40,6 +48,22 @@ test("staged slots keep two generations end to end: preview, fail-closed third, 
         reclaimBindingGenerationChangedRefused: true, reclaimBindingFreshCommitRefused: true,
         reclaimBindingTerminalRemovedRefused: true, reclaimBindingCreatedAfterTerminalRefused: true,
         reclaimBindingLegacyNullUpdateRefused: true, reclaimBindingUnchangedAccepted: true } });
+});
+
+// 0.2.114: the user-confirmed early release works on the REAL filesystem, while every
+// other under-lock rule still denies it, defaults stay byte-identical and capability
+// answers are truthful (staged slots answer, everything else stays silent).
+test("0.2.114 user-confirmed early release: the young slot isolates ONLY in requireExpired:false mode; every other rule still denies", () => {
+  assert.deepEqual(runFixture("release"), { ok: true, userRelease: {
+    userReleaseYoungAccepted: true, userReleaseAbsentStillRefused: true, userReleaseTrueStillRefused: true,
+    userReleaseModeNotBooleanRefused: true, userReleaseGenerationSwapRefused: true,
+    userReleaseNonTerminalRefused: true, userReleaseFreshCommitRefused: true,
+    userReleaseMalformedTimeRefused: true, userReleaseFutureTimeRefused: true,
+    userReleaseCreatedContradictionRefused: true, userReleaseJournalRemovedRefused: true,
+    userReleaseJournalRemovedDefaultRefused: true, userReleaseJournalCorruptRefused: true,
+    userReleaseJournalCorruptDefaultRefused: true, userReleaseJournalNonObjectRefused: true,
+    userReleaseJournalNonObjectDefaultRefused: true,
+    userReleaseInspectProof: true, userReleaseInspectAnswers: true } });
 });
 
 // The extension-side production request builder must encode the SAME read-only protocol the
@@ -101,7 +125,7 @@ test("production archive builder keeps the scope across changed selections and r
 test("expiry defaults are registered and can never fall below the ruled one-day floor", () => {
   const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../package.json"), "utf8"));
   const props = pkg.contributes.configuration.properties;
-  assert.equal(pkg.version, "0.2.113");
+  assert.equal(pkg.version, "0.2.114");
   assert.equal(props["simpleSftp.autoReclaimExpiredCommittedSlots"].type, "boolean");
   assert.equal(props["simpleSftp.autoReclaimExpiredCommittedSlots"].default, true);
   assert.equal(props["simpleSftp.stagedSlotCommittedExpiryMs"].default, 86400000);

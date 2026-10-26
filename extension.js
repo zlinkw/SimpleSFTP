@@ -1700,7 +1700,7 @@ const API_METHOD_CAPABILITIES = {
       "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1, tmuxSessionPrefix: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1, isolationCompletionReceipt: 1 },
       // 0.2.111 后台删除入口：只接受已登记隔离 token，删除集合由插件登记记录派生；
       // 它仍是远端修改（不声明 readOnly），但作为隔离区维护任务不长期占用传输忙。
-      "files.cleanup.isolatedMaintenanceDelete": { registeredIsolationTokenOnly: 1, pluginDerivedDeleteSet: 1, isolationCompletionReceiptRequired: 1, clientSuppliedDestinations: false, maintenanceChannel: 1, executorEvidenceAtMoveOnly: 1 },
+      "files.cleanup.isolatedMaintenanceDelete": { registeredIsolationTokenOnly: 1, pluginDerivedDeleteSet: 1, isolationCompletionReceiptRequired: 1, clientSuppliedDestinations: false, maintenanceChannel: 1, executorEvidenceAtMoveOnly: 1, userConfirmedSlotRelease: 1 },
       "sync.projectInventory": { scopeTransport: "stdin",
         readOnly: true, ownCacheWritesOnly: true, maxScopePaths: 5000, maxScopeBytes: 1048576, idlePolicy: "observe-filesystem", scopedTraversal: "direct-roots-v1", codeInventoryLane: 1, capacityTiming: 1, metadataOnly: 1, contentIdentity: 1 },
       "sync.serverToServerFpsync": { retentionKey: "stable-logical-source", generation: "stable-run-id", retainedGenerations: 2, claimScopedExpiredReclaim: 1, stageBlockEvidence: 1, compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
