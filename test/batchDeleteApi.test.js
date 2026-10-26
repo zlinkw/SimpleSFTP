@@ -511,7 +511,10 @@ const MANAGED_COMPLETED = { ok: true, rootIdentity: IDENTITY, state: 'completed'
   irreversible: false, finalizePending: false, executor: null };
 const MANAGED_PENDING = { ok: true, rootIdentity: IDENTITY, state: 'pending' };
 async function managedIsolateToken(h, targets) {
-  const preview = await h.api.preview({ consumerRoot: __CONSUMER__, node: { kind: 'local', root: '/srv/proj' }, action: 'isolate',
+  // The field rows are node.kind remote -> observationMode normalizes to "tmux"
+  // (cleanup-file-api.js:458); a local node would normalize to "filesystem" and
+  // execute would run the synchronous local isolate chain instead of managed-start.
+  const preview = await h.api.preview({ consumerRoot: __CONSUMER__, node: { kind: 'remote', host: 'h', port: 22, user: 'zlk', root: '/srv/proj' }, action: 'isolate',
     observationMode: 'managed_tmux', targets });
   await h.api.confirm({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, confirm: true, phase: 1,
     exactTargets: targets.map(t => '/srv/proj/' + t.relativePath) });
