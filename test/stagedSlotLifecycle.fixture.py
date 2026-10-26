@@ -29,18 +29,70 @@ def encode(request):
     return base64.b64encode(raw).decode("ascii")
 
 
+# Required keys per receiver request shape. The no-mode branch of the dispatch is the TAR
+# receive path — NOT a mode string — so it gets its own list instead of a fake mode name.
 CALL_REQUIRED = {"staleReport": ("root", "identity"),
                  "chunkStatus": ("root", "identity", "generation", "entries"),
-                 "receive": ("root", "identity", "generation", "entries")}
+                 "receiveChunk": ("root", "identity", "generation", "entries", "offset")}
+TAR_REQUIRED = ("root", "identity", "generation", "entries")
+
+
+def _dispatched_modes(path):
+    # AUTHORITATIVE mode list derived from the receiver's own __main__ dispatch source (the
+    # request.get("mode") comparisons exist only there): mode names are never hand-copied, so a
+    # renamed or removed receiver mode fails the consistency assertion below instead of turning
+    # the fixture guard itself into a KeyError.
+    with open(path, encoding="utf-8") as handle:
+        source = handle.read()
+    return set(sum((re.findall(r'"(\w+)"', tail) for tail in
+                    re.findall(r'request\.get\("mode"\)\s+(?:==|in)\s+([^\n]+?)(?=:|$)', source)), []))
+
+
+def _fixture_modes(path):
+    # Precise AST walk instead of a text scan: only literal mode values ACTUALLY handed to a
+    # call(...) site count (a bare regex also hit unrelated keywords such as tarfile's mode="w").
+    import ast
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    modes = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and ((isinstance(node.func, ast.Name) and node.func.id == "call")
+                                                or (isinstance(node.func, ast.Attribute) and node.func.attr == "call"))):
+            continue
+        for arg in node.args:
+            pairs = []
+            if isinstance(arg, ast.Dict):
+                pairs = [(k.value, v) for k, v in zip(arg.keys, arg.values) if isinstance(k, ast.Constant)]
+            elif isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name) and arg.func.id == "dict":
+                pairs = [(kw.arg, kw.value) for kw in arg.keywords if kw is not None]
+            for key, value in pairs:
+                if key == "mode" and isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    modes.add(value.value)
+    return modes
+
+
+RECEIVER_MODES = _dispatched_modes(receiver_path)
+FIXTURE_MODES = _fixture_modes(__file__)
+assert RECEIVER_MODES, "could not derive any receiver mode from the dispatch source"
+assert set(CALL_REQUIRED) <= RECEIVER_MODES, ("fixture guard registers modes the receiver never dispatches",
+                                              sorted(CALL_REQUIRED), sorted(RECEIVER_MODES))
+assert FIXTURE_MODES <= set(CALL_REQUIRED), ("fixture sends receiver modes the guard cannot validate",
+                                             sorted(FIXTURE_MODES), sorted(CALL_REQUIRED))
 
 
 def call(request, stdin=b""):
     # Fixture-side construction guard: the receiver subscripts its request fields, so a malformed
     # hand-built request must fail HERE naming the missing keys, never later as an opaque wrapped
     # error code that hides which fixture call was wrong.
-    mode = request.get("mode") or "receive"
-    missing = [key for key in CALL_REQUIRED[mode] if request.get(key) is None]
-    assert not missing, "fixture receiver request (%s) missing key(s): %s :: %r" % (mode, missing, request)
+    mode = request.get("mode")
+    if mode is None:
+        required = TAR_REQUIRED
+    else:
+        required = CALL_REQUIRED.get(mode)
+        assert required is not None, ("fixture guard has no required-keys entry for receiver mode %r; registered: %s; receiver dispatches: %s"
+                                      % (mode, sorted(CALL_REQUIRED), sorted(RECEIVER_MODES)))
+    missing = [key for key in required if request.get(key) is None]
+    assert not missing, "fixture receiver request (%s) missing key(s): %s :: %r" % (mode or "tar-receive", missing, request)
     return subprocess.run([sys.executable, "-B", "-X", "utf8", receiver_path, encode(request)],
                           input=stdin, capture_output=True, timeout=8)
 
