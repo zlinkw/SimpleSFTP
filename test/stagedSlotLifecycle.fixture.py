@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -28,7 +29,18 @@ def encode(request):
     return base64.b64encode(raw).decode("ascii")
 
 
+CALL_REQUIRED = {"staleReport": ("root", "identity"),
+                 "chunkStatus": ("root", "identity", "generation", "entries"),
+                 "receive": ("root", "identity", "generation", "entries")}
+
+
 def call(request, stdin=b""):
+    # Fixture-side construction guard: the receiver subscripts its request fields, so a malformed
+    # hand-built request must fail HERE naming the missing keys, never later as an opaque wrapped
+    # error code that hides which fixture call was wrong.
+    mode = request.get("mode") or "receive"
+    missing = [key for key in CALL_REQUIRED[mode] if request.get(key) is None]
+    assert not missing, "fixture receiver request (%s) missing key(s): %s :: %r" % (mode, missing, request)
     return subprocess.run([sys.executable, "-B", "-X", "utf8", receiver_path, encode(request)],
                           input=stdin, capture_output=True, timeout=8)
 
@@ -248,6 +260,25 @@ recv_spec.loader.exec_module(recv)
 
 
 def engine(request):
+    # Fixture-side construction guard mirroring the production chain (cleanup-file-api.js 536-542
+    # forces destination before ANY isolate inspect; cleanup-files.py subscripts target["destination"]
+    # in isolate_inspect and pins archiveBatch/destination layout for the isolate action). A
+    # hand-built request must fail HERE naming the missing key, never be swallowed into the
+    # engine's wrapped INSPECTION_OR_AUDIT_FAILED code that hides the real defect.
+    assert isinstance(request.get("root"), str) and request.get("root"), request
+    action = request.get("action")
+    assert isinstance(action, str) and action, request
+    assert re.fullmatch(r"[a-zA-Z0-9._:-]{1,128}", str(request.get("operationId") or "")), request
+    target = request.get("target")
+    assert isinstance(target, dict) and isinstance(target.get("relativePath"), str) and target["relativePath"] \
+        and target.get("type") in ("file", "directory"), target
+    if action == "isolate" or (action == "inspect" and request.get("isolate")):
+        assert isinstance(target.get("destination"), str) and target["destination"], \
+            "engine %s requires target.destination :: %r" % (action, target)
+    batch = target.get("archiveBatch")
+    if batch is not None:
+        assert re.fullmatch(r"job-[a-f0-9]{48}", batch), target
+        assert target.get("destination") == "clean_dir/" + batch + "/" + target["relativePath"], target
     done = subprocess.run([sys.executable, "-B", "-X", "utf8", engine_path],
                           input=json.dumps(request).encode("utf-8"), capture_output=True, timeout=15)
     assert done.returncode == 0, done.stderr.decode()[-1500:]
@@ -438,13 +469,15 @@ try:
                        and any(row["status"] == "locked" and row["protectedReason"] == "slot-locked"
                                and row["locked"] is True for row in locked_report["held"]))
     slot_rel = STAGING + "/d-" + KEY_L[:24] + "/" + lock_slot
-    isolate_inspection = engine({"root": lock_root, "action": "inspect", "isolate": True, "operationId": "lock-iso",
-                                 "target": {"relativePath": slot_rel, "type": "directory"}})
-    assert isolate_inspection["ok"], isolate_inspection
-    frozen_target = dict(isolate_inspection["target"], relativePath=slot_rel, type="directory")
+    # The frozen isolate binding is built ONCE, exactly as the production preview hands it to the
+    # isolate inspect (cleanup-file-api.js 536-542: destination is validated before inspect and is
+    # re-sent unchanged at execute): inspect and isolate now see the IDENTICAL target fields.
     batch = "job-" + hashlib.sha256(b"lockcase-isolate").hexdigest()[:48]
-    frozen_target["archiveBatch"] = batch
-    frozen_target["destination"] = "clean_dir/" + batch + "/" + slot_rel
+    frozen_target = {"relativePath": slot_rel, "type": "directory", "archiveBatch": batch,
+                     "destination": "clean_dir/" + batch + "/" + slot_rel}
+    isolate_inspection = engine({"root": lock_root, "action": "inspect", "isolate": True, "operationId": "lock-iso",
+                                 "target": dict(frozen_target)})
+    assert isolate_inspection["ok"], isolate_inspection
     locked_isolate = engine({"root": lock_root, "action": "isolate", "operationId": "lock-iso", "target": frozen_target})
     slotLockHeldBlocksIsolate = (locked_isolate["ok"] is False
                                  and locked_isolate["error"]["code"] in ("SLOT_LOCK_HELD", "SLOT_LOCK_UNCERTAIN"))
