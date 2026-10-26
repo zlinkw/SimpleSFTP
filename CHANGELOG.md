@@ -3,7 +3,8 @@
 ## 0.2.112
 
 - 修复：托管观察链（managed_tmux/filesystem 隔离）的完成结论此前只随应答返回、从不写入磁盘台账，导致台账永远停留在“执行中”，后台维护删除按持久状态判 NOT_ISOLATED_COMPLETE 而永不放行。现在 status/execute/check 观察到“完成”证明时先持久化再返回：completed 只能由完成证明推进，证据缺失或降级绝不擦除已落盘的 completed；对既有读者（SE、状态界面、status 返回结构）形状逐字不变。多目标 token 的“存在未完成目标整批不删”保护原样保留，:1163 判据与 isolatedMaintenanceDelete 未改动。
-- 测试：batchDeleteApi 新增 r108 四用例——status 一轮后重读台账必须为 completed 且后台删除放行；execute/check 复检已提交的改名即刻持久化、绝不重发；姊妹目标未完成时整批拒删且零变更。
+- 修复（审核阻断项）：观察轮次的持久化不再整副本回写——同一 token 的并发 check/execute/status 此前可各持读到的旧副本互相覆盖（慢一轮会擦掉另一目标刚落盘的 completed，甚至覆盖维护删除的生命周期字段）。现在每 token 一条串行队列，写入前以当前台账为基线仅推进本次观察到的目标，completed 只进不出；不引入跨进程锁，执行中/完成/未知三类推进同走该合并。
+- 测试：batchDeleteApi 新增 r108 四用例——status 一轮后重读台账必须为 completed 且后台删除放行；execute/check 复检已提交的改名即刻持久化、绝不重发；姊妹目标未完成时整批拒删且零变更。另新增 r110 两条：受控交错（两个并发 check 各证明一个目标完成，磁盘与内存必须同时保留两个 completed 且后台删除一次放行）、降级免疫（completed 之后再收到 pending 应答或查询异常，返回形状如实、落盘 completed 绝不回退）。
 
 ## 0.2.111
 

@@ -569,3 +569,60 @@ test('r108 protection lock: one completed target never releases the whole-token 
     error => error.code === 'NOT_ISOLATED_COMPLETE', 'an unfinished sibling blocks the whole token — the protection is not relaxed');
   assert.equal(h.counts('delete-fast'), 0, 'refusal happens before any mutation');
 });
+
+// ---------- r110 (review blocker): concurrent rounds must merge, never write a stale copy back ----------
+// read() hands out an independent copy and save() writes the whole row with no CAS. The gate below
+// forces the interleave deterministically: both check() rounds capture their row copies (both
+// [pending, pending]) BEFORE either persists, so a whole-copy writeback loses one completion no
+// matter which save lands last; the per-token merge chain must keep both.
+test('r110 two concurrent observations of one token each persist their own completion; the disk keeps both', async () => {
+  let arrived = 0;
+  let releaseFirst;
+  const gate = new Promise(resolve => { releaseFirst = resolve; });
+  const h = harness({ entryRow: target => target.relativePath.startsWith('clean_dir/' + ISO_BATCH + '/') ? isolatedProbe(target) : null,
+    managedObserve: async () => {
+      arrived += 1;
+      // Hold the engine answer until BOTH rounds have passed their read() and wait in observe(),
+      // so both ledger copies are provably captured before either completion is persisted.
+      if (arrived === 1) await gate; else releaseFirst();
+      return MANAGED_COMPLETED;
+    } });
+  const preview = await managedIsolateToken(h, [
+    { relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST },
+    { relativePath: 'out/run2', type: 'directory', archiveBatch: ISO_BATCH, destination: 'clean_dir/' + ISO_BATCH + '/out/run2' }]);
+  const [proof0, proof1] = await Promise.all([
+    h.api.check({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 }),
+    h.api.check({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 1 })]);
+  assert.equal(proof0.state, 'completed'); assert.equal(proof1.state, 'completed');
+  assert.equal(arrived, 2, 'both observation rounds must overlap inside the engine call');
+  const stored = await h.api.read(preview.token, __CONSUMER__);
+  assert.deepEqual(stored.states, ['completed', 'completed'],
+    'each concurrent round may advance only its own target: neither completed may be erased by the other');
+  const ran = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  assert.equal(ran.state, 'accepted', 'both completions are durable, so the background delete admits at the first attempt');
+  assert.equal(h.counts('delete-fast'), 1);
+});
+
+test('r110 a persisted completed never demotes: later pending answers and query failures keep the ledger completed', async () => {
+  let mode = 'completed';
+  const h = harness({ managedObserve: () => {
+    if (mode === 'completed') return MANAGED_COMPLETED;
+    if (mode === 'pending') return MANAGED_PENDING;
+    throw new Error('TRANSPORT_EXPLODED');
+  } });
+  const preview = await managedIsolateToken(h, [{ relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST }]);
+  await h.api.check({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
+  assert.equal((await h.api.read(preview.token, __CONSUMER__)).states[0], 'completed', 'baseline: the completion proof is durable');
+  mode = 'pending';
+  const pendingCheck = await h.api.check({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
+  assert.equal(pendingCheck.state, 'pending', 'the engine answer is still returned verbatim while the ledger stays completed');
+  const pendingRound = await h.api.status({ consumerRoot: __CONSUMER__, token: preview.token });
+  assert.equal(pendingRound.states[0], 'completed');
+  mode = 'error';
+  const failedRound = await h.api.status({ consumerRoot: __CONSUMER__, token: preview.token });
+  assert.equal(failedRound.states[0], 'completed');
+  assert.equal(failedRound.observations[0].state, 'unknown');
+  assert.equal(failedRound.observations[0].queryError, 'TRANSPORT_EXPLODED');
+  assert.equal((await h.api.read(preview.token, __CONSUMER__)).states[0], 'completed',
+    'missing or degraded evidence never erases the persisted completed, through check or status');
+});

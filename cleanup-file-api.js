@@ -368,7 +368,7 @@ class CleanupFileApi {
   constructor({ storageRoot, transport, activity, lease }) {
     this.storageRoot = storageRoot; this.transport = transport; this.activity = activity; this.lease = lease;
     this.previews = new Map(); this.busy = new Set(); this.localExecutions = new Map();
-    this.observeInFlight = 0; this.observeWaiters = [];
+    this.observeInFlight = 0; this.observeWaiters = []; this.progressChains = new Map();
   }
   /** Shared read-only in-flight budget for the whole API instance: exactly two
    *  engine reads at once, independent of any request's readConcurrency. Each
@@ -443,6 +443,29 @@ class CleanupFileApi {
     const root = requireConsumerRoot(row.consumerRoot);
     await atomicWriteText(path.join(await ensureConsumerCleanupDir(root), row.token + ".json"), JSON.stringify(row));
     this.previews.set(row.token, copy(row));
+  }
+  /** r110 (review blocker): persist observation progress WITHOUT whole-copy writeback.
+   * read() hands out an independent copy and save() writes the whole row with no CAS, while an
+   * observation round is slow, so two rounds of one token (routes do not serialize them) can each
+   * hold a stale copy. A per-token promise chain keeps every reload-merge-save critical section
+   * ordered inside this process (precedent: the localExecutions map), and the merge re-bases on
+   * the current row: only observed indices advance, completed is reached only from a completed
+   * proof and is never erased by an older round, and lifecycle fields written concurrently (for
+   * example an isolatedDelete record) survive because they live on the re-read row, not the stale copy. */
+  async persistObservationProgress(row, mutations, observations) {
+    const previous = this.progressChains.get(row.token) || Promise.resolve();
+    const step = previous.then(async () => {
+      const fresh = await this.read(row.token, row.consumerRoot);
+      for (const mutation of mutations) {
+        if (!Number.isInteger(mutation.index) || fresh.states[mutation.index] === undefined) continue;
+        if (fresh.states[mutation.index] === "completed") continue; // completed only advances from a completed proof
+        fresh.states[mutation.index] = mutation.state;
+      }
+      if (observations !== undefined) fresh.observations = copy(observations);
+      await this.save(fresh);
+    });
+    this.progressChains.set(row.token, step.then(() => undefined, () => undefined));
+    return step;
   }
   async preview(params) {
     const consumerRoot = requireConsumerRoot(params.consumerRoot); // the LOCAL consuming project, never node.root
@@ -882,7 +905,7 @@ class CleanupFileApi {
       // ledger must never keep saying "executing" after the engine proved the
       // move completed; a background delete reads ONLY persisted states.
       const proof = await this.observe(row, index);
-      if (proof && proof.state === "completed" && row.states[index] !== "completed") { row.states[index] = "completed"; await this.save(row); }
+      if (proof && proof.state === "completed" && row.states[index] !== "completed") { row.states[index] = "completed"; await this.persistObservationProgress(row, [{ index, state: "completed" }]); }
       return proof;
     }
     return this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity, target: row.targets[index],
@@ -949,7 +972,7 @@ class CleanupFileApi {
         // r108: completion proved at execute-time lands in the ledger before the
         // return; only a completed proof may write completed, and an already
         // completed row is never rewritten. The returned proof is untouched.
-        if (proof.state === "completed" && row.states[index] !== "completed") { row.states[index] = "completed"; await this.save(row); }
+        if (proof.state === "completed" && row.states[index] !== "completed") { row.states[index] = "completed"; await this.persistObservationProgress(row, [{ index, state: "completed" }]); }
         return proof;
       }
       if (proof.state !== "pending") fail("CLEANUP_TARGET_CHANGED");
@@ -959,7 +982,9 @@ class CleanupFileApi {
         cleanupAction: row.action, operationId: row.operationId, target: row.targets[index],
         tmuxSessionPrefix: row.tmuxSessionPrefix || params.tmuxSessionPrefix || "simple" };
       // A lost response cannot leave a local busy flag that blocks later observations.
-      row.states[index] = "executing"; await this.save(row);
+      // r110: this write must also merge (never whole-copy), or a stale round could erase a
+      // sibling target's completed written while this observation was in flight.
+      row.states[index] = "executing"; await this.persistObservationProgress(row, [{ index, state: "executing" }]);
       if (row.observationMode === "filesystem") {
         if (this.localExecutions.has(key)) return { ok: true, state: "executing" };
         const execution = this.checked(request); this.localExecutions.set(key, execution);
@@ -1067,6 +1092,7 @@ class CleanupFileApi {
     }
     if (row.observationMode) {
       row.observations = [];
+      const progress = [];
       for (let index = 0; index < row.targets.length; index++) {
         try {
           const proof = await this.observe(row, index);
@@ -1076,10 +1102,13 @@ class CleanupFileApi {
           // erase an already-persisted completion.
           if (!(row.states[index] === "completed" && proof.state !== "completed")) row.states[index] = proof.state;
         } catch(error) { row.observations.push({ state: "unknown", queryError: error.message }); if (row.states[index] !== "completed") row.states[index] = "unknown"; }
+        progress.push({ index, state: row.states[index] });
       }
       // The ledger is durable after every full status round: a reader that never
       // calls status (or a later background-delete admission) sees the same truth.
-      await this.save(row);
+      // r110: merged per-index against the current row (completed is sticky there too),
+      // so a slow round cannot erase completions or lifecycle written mid-round.
+      await this.persistObservationProgress(row, progress, row.observations);
     }
     return row;
   }
