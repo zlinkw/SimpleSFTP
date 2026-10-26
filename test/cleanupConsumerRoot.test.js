@@ -245,13 +245,30 @@ test("r119 user-confirmed early release: strict boolean mode, frozen into digest
   // can only resolve a token after confirm — before it, the frozen preview lives in memory only.
   const pFalse = await api.preview({ ...base, authorizationSource: "single_confirmation_release", stagedJournal: { ...binding, requireExpired: false } });
   const pTrue = await api.preview({ ...base, authorizationSource: "single_confirmation_release", stagedJournal: binding });
-  await assert.rejects(mkApi(storageRoot).read(pFalse.token, ROOT_A), error => error.code === "PREVIEW_EXPIRED");
-  // The mode joins the digest preimage: identical previews differing only in mode differ in digest.
+  // Zero writes, on the real filesystem: the persisted ledger is a CONFIRM-time artifact, so no
+  // project record exists yet while the preview is memory-only.
+  assert.equal(fs.existsSync(projectFile(ROOT_A, pFalse.token)), false);
+  // A cold reader is refused with exactly LEGACY_IMPORT_UNBOUND — pinned deliberately, not
+  // "any refusal passes": read() with no project record AND no frozen digest stops at the owner
+  // contract instead of guessing an owner (cleanup-file-api.js:405-411), which is precisely what
+  // "the ledger was never written" looks like to a cold reader. PREVIEW_EXPIRED would be the
+  // mislabel here — it claims a record existed and aged out, which preview never did. The same
+  // stop code is already pinned by this suite's cross-root cases and the observe-batch
+  // owner-contract cases; changing it would break that established contract.
+  await assert.rejects(mkApi(storageRoot).read(pFalse.token, ROOT_A), error => error.code === "LEGACY_IMPORT_UNBOUND");
+  // The mode joins the digest preimage. Determinism control first: the same mode twice gives the
+  // same digest (the stub answers are static, token/operationId/expiresAt are outside the
+  // preimage), so the difference below is attributable to requireExpired alone.
+  const pTrueAgain = await api.preview({ ...base, authorizationSource: "single_confirmation_release", stagedJournal: binding });
+  assert.equal(pTrue.digest, pTrueAgain.digest);
   assert.notEqual(pFalse.digest, pTrue.digest);
   // The shared stub transport never answers the engine proof ⇒ the safety flag stays silent.
   assert.equal(pFalse.safety.userConfirmedSlotRelease, undefined);
   await api.confirm({ token: pFalse.token, digest: pFalse.digest, confirm: true, phase: 1, consumerRoot: ROOT_A,
     exactTargets: pFalse.targets.map(row => row.absolutePath) });
+  // Positive control for the zero-write probe above: confirm (not preview) persists the ledger, so
+  // the very same path check that was false before now sees the file — the probe can discriminate.
+  assert.equal(fs.existsSync(projectFile(ROOT_A, pFalse.token)), true);
   // A mode flip cannot survive the exact-digest check: pTrue's digest on pFalse's token is refused.
   await assert.rejects(api.confirm({ token: pFalse.token, digest: pTrue.digest, confirm: true, phase: 1, consumerRoot: ROOT_A,
     exactTargets: pFalse.targets.map(row => row.absolutePath) }), error => error.code === "CONFIRM_REQUIRED");
