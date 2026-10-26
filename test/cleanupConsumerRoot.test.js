@@ -154,6 +154,32 @@ test("preview refuses a missing or relative consumer root; execute/settle/verify
   assert.equal((await api.settle({ token: a.token, digest: a.digest, index: 0, consumerRoot: ROOT_A })).state, "pending");
 });
 
+test("r118 reclaim authorizations are recorded explicitly, isolate-only, and ride the frozen row", async () => {
+  const api = mkApi(path.join(os.tmpdir(), "legacy-reclaim-" + Date.now()));
+  const rel = "simple_cluster/.simple-sftp-staging/d-" + "1".repeat(24) + "/0";
+  const batch = "job-" + "ab".repeat(24);
+  const base = { consumerRoot: ROOT_A, node: nodeOf("/srv/target"), action: "isolate",
+    targets: [{ relativePath: rel, type: "directory", archiveBatch: batch, destination: "clean_dir/" + batch + "/" + rel }] };
+  const auto = await api.preview({ ...base, authorizationSource: "auto_expiry_reclaim" });
+  assert.equal(auto.reclaimAuthorizationSource, "auto_expiry_reclaim");
+  const single = await api.preview({ ...base, authorizationSource: "single_confirmation_release" });
+  assert.equal(single.reclaimAuthorizationSource, "single_confirmation_release");
+  // Reclaim authorizations never ride another action, and unknown sources are refused outright.
+  await assert.rejects(api.preview({ ...base, action: "move", authorizationSource: "auto_expiry_reclaim" }),
+    error => error.code === "INVALID_AUTHORIZATION_SOURCE");
+  await assert.rejects(api.preview({ ...base, authorizationSource: "auto_delete_please" }),
+    error => error.code === "INVALID_AUTHORIZATION_SOURCE");
+  // Ownership rules are unchanged: the recorded row lives only under the consuming project…
+  assert.ok(fs.existsSync(projectFile(ROOT_A, auto.token)));
+  const cold = mkApi(api.storageRoot);
+  assert.equal((await cold.read(auto.token, ROOT_A)).reclaimAuthorizationSource, "auto_expiry_reclaim");
+  // …and the marker is ownership metadata: the frozen digest preimage (node/rootIdentity/action/
+  // targets/safety/prefix) stays exactly as it was, so confirm/execute/maintenance bindings do
+  // not change shape for any older caller.
+  assert.equal(auto.digest, hash({ node: auto.node, rootIdentity: auto.rootIdentity, action: "isolate",
+    targets: auto.targets, safety: auto.safety, tmuxSessionPrefix: auto.tmuxSessionPrefix }));
+});
+
 test("upload-state writes into the project managed tree; the legacy .vscode file stays read-only", () => {
   const loadStub = () => { const original = Module._load; Module._load = function (name, ...rest) {
     if (name === "vscode") return { TreeItem: class {}, ProgressLocation: { Notification: 1 },

@@ -492,6 +492,13 @@ class CleanupFileApi {
     if (this.previews.size >= 4096) fail("CLEANUP_PREVIEW_CAPACITY_EXCEEDED");
     const { node, action = "move", targets } = params;
     if (params.authorizationMode !== undefined && params.authorizationMode !== "confirmed_paths") fail("INVALID_AUTHORIZATION_MODE");
+    // Staged-slot reclaim authorizations are recorded EXPLICITLY and travel with the frozen ledger
+    // row: "auto_expiry_reclaim" is the automatic claim-scoped policy, "single_confirmation_release"
+    // is the exact-preview user-confirmed release. Both are isolate-only; nothing else accepts them
+    // and they never change the confirmation counts, digests or delete rules of any other chain.
+    const reclaimAuthorizationSource = params.authorizationSource;
+    if (reclaimAuthorizationSource !== undefined
+      && (action !== "isolate" || !["auto_expiry_reclaim", "single_confirmation_release"].includes(reclaimAuthorizationSource))) fail("INVALID_AUTHORIZATION_SOURCE");
     const pathOnly = params.authorizationMode === "confirmed_paths";
     // Confirmed paths only ever authorize permanent deletion; a move/restore
     if (pathOnly && action !== "delete") fail("INVALID_ACTION");
@@ -541,7 +548,7 @@ class CleanupFileApi {
     const backgroundIsolatedDelete = action === "isolate" && isolateEngineProof.length === rows.length
       && isolateEngineProof.every(Boolean) ? 1 : undefined;
     const row = { token: crypto.randomBytes(24).toString("hex"), operationId: "cleanup-" + crypto.randomBytes(16).toString("hex"), consumerRoot, node: copy(node), rootIdentity: identity,
-      action, observationMode, authorizationMode: pathOnly ? "confirmed_paths" : undefined, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, managedObservation: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: action === "isolate" ? 1 : undefined, requiredInputGuard: action === "isolate" ? 1 : undefined, isolationCompletionReceipt: backgroundIsolatedDelete, backgroundIsolatedDelete, registeredIsolationDeletion: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1, chunkedFrozenManifest: 1, pinnedRuntimeProgram: 1, handleScan: pathOnly ? "confirmed_paths" : observationMode ? "managed_tmux" : "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
+      action, observationMode, authorizationMode: pathOnly ? "confirmed_paths" : undefined, reclaimAuthorizationSource, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, managedObservation: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: action === "isolate" ? 1 : undefined, requiredInputGuard: action === "isolate" ? 1 : undefined, isolationCompletionReceipt: backgroundIsolatedDelete, backgroundIsolatedDelete, registeredIsolationDeletion: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1, chunkedFrozenManifest: 1, pinnedRuntimeProgram: 1, handleScan: pathOnly ? "confirmed_paths" : observationMode ? "managed_tmux" : "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
     row.tmuxSessionPrefix = tmuxSessionPrefix;
     row.targetDigests = rows.map(targetHash);
     row.digest = hash({ node: row.node, rootIdentity: identity, action, targets: rows, safety: row.safety, tmuxSessionPrefix });
@@ -1284,6 +1291,7 @@ class CleanupFileApi {
         }
         row.isolatedDelete = { capability: "isolationBackgroundDelete", protocol: 1, phase: "accepted", operationId: row.operationId,
           acceptedAt: new Date().toISOString(), alreadyDeleted: alreadyDone,
+          ...(row.reclaimAuthorizationSource ? { reclaimAuthorizationSource: row.reclaimAuthorizationSource } : {}),
           targets: entries.map(entry => ({ destinationRelativePath: entry.relativePath, type: entry.type })) };
         await this.saveIsolatedDelete(row); // durable acceptance BEFORE any mutation
         if (!entries.length) {

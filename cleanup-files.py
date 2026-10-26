@@ -991,6 +991,77 @@ def mutation_lock(root):
 # traversals hold only the exact isolation subtree chain. ---
 ARCHIVED_BATCH_RE = re.compile(r"^clean_dir/(job-[a-f0-9]{48})/(.+)$")
 
+# Staging two-generation slot layout owned by the pinned receiver (identity dir
+# d-<hex>, fixed slots 0/1, sibling <slot>.lock held non-blockingly by claim).
+STAGED_SLOT_REL_RE = re.compile(r"^simple_cluster/\.simple-sftp-staging/d-[0-9a-f]{8,64}/([01])$")
+
+
+def staged_slot_lock(root, target):
+    """Isolation-moment verification of one staged slot's lock.
+
+    A receiver claim holds <slot>.lock (flock LOCK_EX|LOCK_NB) across admission and
+    streaming, so a lock check done only at earlier preview time cannot prove the slot
+    is unheld AT the rename. An ABSENT lock file means no holder (claim creates the file
+    before locking and never removes it); a lock that is held, unopenable or whose
+    check capability is missing refuses the isolation — fail closed, never a weaker path.
+    The returned handle must stay open across the rename and is closed by the caller.
+    """
+    rel = str(target.get("relativePath") or "")
+    if not STAGED_SLOT_REL_RE.match(rel):
+        return None
+    parent_rel, leaf = rel.rsplit("/", 1)
+    leaf += ".lock"
+    parent_full = path_guard(root, parent_rel)
+    if os.name == "nt":
+        try:
+            stream = open(os.path.join(parent_full, leaf), "r+b")
+        except FileNotFoundError:
+            return None
+        except OSError:
+            deny("SLOT_LOCK_UNCERTAIN", os.path.join(parent_full, leaf), "槽锁文件无法打开，拒绝隔离")
+        try:
+            import msvcrt
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            stream.close()
+            deny("SLOT_LOCK_HELD", os.path.join(parent_full, leaf), "槽锁被持有，拒绝隔离")
+        return stream
+    try:
+        parent_fd = os.open(parent_full, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        deny("SLOT_LOCK_UNCERTAIN", parent_full, "无法钉住槽锁所在目录，拒绝隔离")
+    if not getattr(os, "O_NOFOLLOW", 0) or not hasattr(os, "flock") or not hasattr(os, "O_DIRECTORY"):
+        try:
+            os.close(parent_fd)
+        finally:
+            deny("SLOT_LOCK_UNCERTAIN", parent_full, "运行环境缺少槽锁核验能力，拒绝隔离")
+    try:
+        try:
+            fd = os.open(leaf, os.O_RDWR | os.O_NOFOLLOW, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            deny("SLOT_LOCK_UNCERTAIN", leaf, "槽锁文件无法打开，拒绝隔离")
+        try:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            deny("SLOT_LOCK_HELD", leaf, "槽锁被持有，拒绝隔离")
+        return fd
+    finally:
+        os.close(parent_fd)
+
+
+def release_staged_slot_lock(handle):
+    if handle is None:
+        return
+    try:
+        handle.close() if not isinstance(handle, int) else os.close(handle)
+    except OSError:
+        pass
+
 
 def archived_control_rel(target):
     """Exact confirmed-path deletion target for one registered isolated subtree."""
@@ -2154,16 +2225,24 @@ def main(request):
         os.makedirs(os.path.dirname(value["destination"]), exist_ok=True)
         path_guard(root, target["destination"], True, True)
         child = parent_cd(root, value["absolutePath"])
-        # Exactly one atomic rename; a missing no-replace primitive or a
-        # cross-filesystem target fails closed, never degrades to a copy.
-        no_replace(child, value["destination"])
-        # Completion proof for this move: the atomic no-replace rename
-        # committed, the source name is absent in this very move, the
-        # registration lands, and the durable completion audit line below
-        # closes the record. The isolated copy itself is NOT re-read here;
-        # this receipt never claims the isolated content was re-verified.
-        if os.path.lexists(value["absolutePath"]):
-            deny("SOURCE_STILL_EXISTS")
+        # Staged slots additionally prove the slot lock is FREE at THIS rename moment
+        # (held across the rename until the source name is gone), closing the window
+        # between an earlier preview and the mutation; a racing claim keeps its flock
+        # and this isolation refuses instead of moving an active checkpoint.
+        slot_lock = staged_slot_lock(root, target)
+        try:
+            # Exactly one atomic rename; a missing no-replace primitive or a
+            # cross-filesystem target fails closed, never degrades to a copy.
+            no_replace(child, value["destination"])
+            # Completion proof for this move: the atomic no-replace rename
+            # committed, the source name is absent in this very move, the
+            # registration lands, and the durable completion audit line below
+            # closes the record. The isolated copy itself is NOT re-read here;
+            # this receipt never claims the isolated content was re-verified.
+            if os.path.lexists(value["absolutePath"]):
+                deny("SOURCE_STILL_EXISTS")
+        finally:
+            release_staged_slot_lock(slot_lock)
         destination_rel = os.path.relpath(value["destination"], root).replace(os.sep, "/")
         completion = {"isolationCompletionProtocol": 1, "archiveBatch": batch,
                       "sourceRelativePath": target["relativePath"], "destinationRelativePath": target["destination"],

@@ -1696,14 +1696,14 @@ const API_METHOD_CAPABILITIES = {
       "files.cleanup.settle": { frozenApprovalRequired: true, receiptOnly: true, startsNewMoves: false },
       "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: 1, requiredInputGuard: 1, registeredIsolationDeletion: 1, backgroundIsolatedDelete: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
       "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
-      "files.cleanup.stagedSlots": { readOnly: true, incomingGenerationPreview: true, retainedGenerations: 2 },
+      "files.cleanup.stagedSlots": { readOnly: true, incomingGenerationPreview: true, retainedGenerations: 2, expiredCommittedReclaim: 1, defaultExpiryMs: 86400000, virtualRetentionWindow: 2, structuredBlockEvidence: 1, releaseConfirmationCount: 1 },
       "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1, tmuxSessionPrefix: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1, isolationCompletionReceipt: 1 },
       // 0.2.111 后台删除入口：只接受已登记隔离 token，删除集合由插件登记记录派生；
       // 它仍是远端修改（不声明 readOnly），但作为隔离区维护任务不长期占用传输忙。
       "files.cleanup.isolatedMaintenanceDelete": { registeredIsolationTokenOnly: 1, pluginDerivedDeleteSet: 1, isolationCompletionReceiptRequired: 1, clientSuppliedDestinations: false, maintenanceChannel: 1, executorEvidenceAtMoveOnly: 1 },
       "sync.projectInventory": { scopeTransport: "stdin",
         readOnly: true, ownCacheWritesOnly: true, maxScopePaths: 5000, maxScopeBytes: 1048576, idlePolicy: "observe-filesystem", scopedTraversal: "direct-roots-v1", codeInventoryLane: 1, capacityTiming: 1, metadataOnly: 1, contentIdentity: 1 },
-      "sync.serverToServerFpsync": { retentionKey: "stable-logical-source", generation: "stable-run-id", retainedGenerations: 2, compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
+      "sync.serverToServerFpsync": { retentionKey: "stable-logical-source", generation: "stable-run-id", retainedGenerations: 2, claimScopedExpiredReclaim: 1, stageBlockEvidence: 1, compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
       "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, memoryWrapperResults: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024, memoryReadLane: 1, capacityTiming: 1 },
     };
 
@@ -1837,11 +1837,136 @@ function transferScope64(value) {
 // project-relative source paths. It never contains stage ids, content hashes, Worker/GPU or node
 // identities, so the same logical source keeps ONE two-generation slot across workers and reruns;
 // generation is the caller's stable run/command id (retries and extra batches reuse it).
+function stagedScope(options = {}) {
+  // The caller-declared stable scope shown in the structured stage block: the SAME string the
+  // identity hashes over, never a recomputed or display-only variant.
+  return String(options.retentionKey || (options.directory ? "directory:" + options.relativePath : "project-files"));
+}
+
 function stagedLogicalKey(destinationRemotePath, paths, options = {}) {
   // Scope is declared by the caller, not the current changed-file selection or content.
   // Two fixed lanes belong to the same job/run; changing archive partitions opens no new keys.
-  const scope = String(options.retentionKey || (options.directory ? "directory:" + options.relativePath : "project-files"));
+  const scope = stagedScope(options);
   return transferScope64(JSON.stringify([scope, Number(options.stagingLane) === 1 ? 1 : 0]));
+}
+
+// The ruled 1-day floor: the AUTOMATIC chain can never be configured below it (early reclaim of a
+// under-threshold candidate stays a per-batch user-confirmed release, never a config side door).
+const STAGED_SLOT_DEFAULT_EXPIRY_MS = 86400000;
+
+function stagedSlotExpirySettings() {
+  const config = vscode.workspace.getConfiguration("simpleSftp");
+  const enabled = simpleSftpConfigValue(config, "simpleSftp.autoReclaimExpiredCommittedSlots") === true;
+  const raw = Number(simpleSftpConfigValue(config, "simpleSftp.stagedSlotCommittedExpiryMs"));
+  const expiryMs = Number.isFinite(raw) && raw > STAGED_SLOT_DEFAULT_EXPIRY_MS ? Math.floor(raw) : STAGED_SLOT_DEFAULT_EXPIRY_MS;
+  return { enabled, expiryMs };
+}
+
+function stagedSlotStageBlock(context, report) {
+  // The structured TRANSFER_STAGE_PENDING stage block (schemaVersion 1). Python side supplies ONLY
+  // slot facts; host/profile/scope/lane are filled in HERE by the calling JS layer. The complete
+  // readable error text stays on error.message — this block is additive evidence, never a path the
+  // caller has to parse, and every backend binding for a release still uses the FULL values below.
+  const rows = Array.isArray(report && report.slots) ? report.slots : [];
+  const leaving = (Array.isArray(report && report.stale) ? report.stale : [])[0];
+  const time = value => Number.isFinite(Number(value)) ? Number(value) : 0;
+  const slots = rows.map(row => ({
+    slot: String(row.path || "").split("/").pop(),
+    path: String(row.path || ""),
+    generation: String(row.generation || ""),
+    status: String(row.status || "unresolved"),
+    createdAt: time(row.createdAt),
+    terminalAt: time(row.terminalAt),
+    updatedAt: time(row.updatedAt),
+    timeSource: typeof row.timeSource === "string" ? row.timeSource : null,
+    ageMs: Number.isInteger(row.ageMs) ? row.ageMs : null,
+    locked: row.locked === true,
+    protectedReason: typeof row.protectedReason === "string" ? row.protectedReason : null,
+  }));
+  return {
+    schemaVersion: 1,
+    code: "TRANSFER_STAGE_PENDING",
+    destination: { id: String(context.destination?.id || context.destination?.host || ""),
+      profile: String(context.profile || ""), host: String(context.destination?.host || "") },
+    scope: String(context.scope || ""),
+    lane: Number(context.lane) === 1 ? 1 : 0,
+    identity: String(context.identity || ""),
+    incomingGeneration: String(context.incomingGeneration || ""),
+    slots,
+    // A releasable candidate is ONLY a structured, unlocked, committed leaving slot — never a
+    // locked, non-terminal, unresolved or time-unknown one, and never derived from error text.
+    releaseCandidate: Boolean(leaving) && String(leaving.status) === "committed" && leaving.locked !== true,
+  };
+}
+
+async function attachStagedStageBlock(error, context) {
+  // Fresh read-only facts at refuse time; the block and the enriched text travel with the ORIGINAL
+  // error (message prefix preserved verbatim). A failing probe must never replace the real error.
+  const node = { kind: "remote", host: context.destination.host, user: context.destination.username,
+    port: context.destination.port, root: context.destination.remotePath };
+  const report = await stagedSlotStaleReport(node, context.identity, context.incomingGeneration, context.expiryMs);
+  const block = stagedSlotStageBlock(context, report);
+  error.stageBlock = block;
+  error.apiData = { ...(error.apiData && typeof error.apiData === "object" ? error.apiData : {}), stageBlock: block };
+  const profileText = block.destination.profile ? `（profile ${block.destination.profile}）` : "";
+  error.message = `${error.message} · 暂存槽卡点：主机 ${block.destination.host}${profileText} · 范围 ${block.scope} · 通道 ${block.lane} · 身份 ${block.identity.slice(0, 12)}… · 待进入代 ${block.incomingGeneration.slice(0, 12)}…`;
+  return error;
+}
+
+async function reclaimExpiredStagedSlots(options = {}) {
+  // Ruled claim-scoped reclaim: inspect ONLY this run's identity/lane, act ONLY on the single
+  // leaving slot the REMOTE clock proves committed and older than the threshold, and route it
+  // through the existing preview → one confirm → isolate → completion-proven → registered-delete
+  // chain. No global scan, no background service. Any non-completed observation, unknown receipt
+  // or refused delete STOPS without replay; the transfer then surfaces its unchanged
+  // TRANSFER_STAGE_PENDING plus the structured stage block.
+  const { destination, identity, generation, scope, lane, consumerRoot, api, expiryMs } = options;
+  if (!api || typeof api.preview !== "function") return { attempted: false, reason: "no-cleanup-api" };
+  if (!/^[0-9a-f]{64}$/.test(String(identity || "")) || !/^[0-9a-f]{64}$/.test(String(generation || ""))) return { attempted: false, reason: "invalid-scope" };
+  const root = String(consumerRoot || "");
+  if (!root || !path.isAbsolute(root) || /[\x00\r\n]/.test(root)) return { attempted: false, reason: "no-consumer-root" };
+  const node = { kind: "remote", host: destination.host, user: destination.username, port: destination.port, root: destination.remotePath };
+  const report = await stagedSlotStaleReport(node, identity, generation, expiryMs);
+  const leaving = (report.stale || [])[0];
+  if (!leaving) return { attempted: false, reason: "no-leaving-candidate", lane, identity };
+  if (leaving.expiredCommitted !== true || leaving.status !== "committed" || leaving.locked === true) {
+    return { attempted: false, reason: String(leaving.expiryReason || "not-expired"), lane, identity };
+  }
+  const relativePath = String(leaving.path || "");
+  if (!relativePath) return { attempted: false, reason: "no-leaving-path", lane, identity };
+  const archiveBatch = "job-" + crypto.createHash("sha256")
+    .update(JSON.stringify(["staged-slot-reclaim", identity, leaving.generation, relativePath, crypto.randomBytes(8).toString("hex")])).digest("hex").slice(0, 48);
+  const preview = await api.preview({ node, action: "isolate", consumerRoot: root, authorizationSource: "auto_expiry_reclaim",
+    targets: [{ relativePath, type: "directory", archiveBatch, destination: "clean_dir/" + archiveBatch + "/" + relativePath }] });
+  const pending = preview.targets.map((target, index) => ({ target, index })).filter(({ target }) => !target.missing);
+  if (!pending.length) return { attempted: true, outcome: "unknown", reason: "candidate-vanished", lane, identity };
+  try {
+    await api.confirm({ token: preview.token, digest: preview.digest, confirm: true, phase: 1, consumerRoot: root,
+      exactTargets: preview.targets.filter(target => !target.missing).map(target => target.absolutePath) });
+    for (const { index } of pending) await api.execute({ token: preview.token, digest: preview.digest, index, consumerRoot: root });
+    // Bounded wait for the ISOLATION completion proof only (the delete itself is the maintenance
+    // channel and never blocks this decision). "unknown" states stop the wait — never re-sent.
+    let isolated = false;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const row = await api.status({ token: preview.token, consumerRoot: root });
+      if (pending.every(({ index }) => row.states[index] === "completed")) { isolated = true; break; }
+      if (pending.some(({ index }) => row.states[index] === "unknown")) break;
+      await new Promise(resolve => setTimeout(resolve, 3000));
+    }
+    if (!isolated) return { attempted: true, outcome: "unknown", reason: "isolation-completion-not-proven", lane, identity, token: preview.token };
+    // Permanent deletion derives its set EXCLUSIVELY from this frozen ledger token; without the
+    // move-time completion proof the entry itself refuses (NOT_ISOLATION_COMPLETION_RECEIPT).
+    const deletion = await api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, consumerRoot: root,
+      targets: pending.map(({ index, target }) => ({ index, relativePath: target.relativePath, destination: target.destination })) });
+    const state = String(deletion && deletion.state || "unknown");
+    return { attempted: true, outcome: ["accepted", "already_accepted"].includes(state) ? "accepted" : "not-accepted",
+      deleteState: state, isolationProven: true, lane, identity, token: preview.token, digest: preview.digest };
+  } catch (error) {
+    // An error after mutations were sent is an UNKNOWN outcome, not a retry signal: the ledger
+    // (batchExecuting / isolatedDelete lifecycle) is what later readers resolve against.
+    return { attempted: true, outcome: "unknown", reason: String(error && error.code || error && error.message || "reclaim-failed").slice(0, 200),
+      lane, identity, token: preview.token, digest: preview.digest };
+  }
 }
 
 function stagedTarUnpackingCommand(destination, compression, options = {}, expectedFiles = {}, paths = Object.keys(expectedFiles)) {
@@ -1890,22 +2015,38 @@ function chunkTransferCommand(target, request) {
 // subtree candidate that ONLY continues through files.cleanup.preview(confirmed_paths) and both path
 // confirmations before the batched executor runs — never auto-confirmed. WITHOUT a generation the
 // inventory never proposes the retained two generations at all.
-function stagedSlotStaleReportCommand(target, identity, generation) {
-  const payload = require("node:zlib").deflateRawSync(Buffer.from(JSON.stringify({ mode: "staleReport", root: target.remotePath, identity, ...(generation ? { generation } : {}) }), "utf8")).toString("base64");
+function stagedSlotStaleReportCommand(target, identity, generation, expiryMs) {
+  // `expiry: {ms}` ONLY travels when a caller asked for the remote-clock expiry verdict; the plain
+  // inventory/admission commands stay byte-identical for every older consumer of this protocol.
+  const payload = require("node:zlib").deflateRawSync(Buffer.from(JSON.stringify({ mode: "staleReport", root: target.remotePath, identity,
+    ...(generation ? { generation } : {}), ...(Number.isInteger(expiryMs) && expiryMs > 0 ? { expiry: { ms: expiryMs } } : {}) }), "utf8")).toString("base64");
   return stagedReceiverInvocation(payload);
 }
 
-async function stagedSlotStaleReport(node, identity, generation) {
-  if (node?.kind === "local") return { stale: [], held: [] };
+async function stagedSlotStaleReport(node, identity, generation, expiryMs) {
+  if (node?.kind === "local") return { stale: [], held: [], slots: [] };
   if (!/^[0-9a-f]{64}$/.test(String(identity || "")) || (generation != null && generation !== "" && !/^[0-9a-f]{64}$/.test(String(generation)))) cleanupFail("INVALID_REQUEST");
   const target = directSyncTarget({ host: node.host, username: node.user, port: node.port, remotePath: node.root }, "清点暂存槽");
-  const reply = await runRemoteBatchSsh(target, stagedSlotStaleReportCommand(target, identity, generation ? String(generation) : undefined), [], 20000, { stage: "清点暂存槽" });
+  const reply = await runRemoteBatchSsh(target, stagedSlotStaleReportCommand(target, identity, generation ? String(generation) : undefined, expiryMs), [], 20000, { stage: "清点暂存槽" });
   const report = JSON.parse(reply);
-  return { stale: Array.isArray(report.stale) ? report.stale : [], held: Array.isArray(report.held) ? report.held : [] };
+  return { stale: Array.isArray(report.stale) ? report.stale : [], held: Array.isArray(report.held) ? report.held : [],
+    slots: Array.isArray(report.slots) ? report.slots : [] };
 }
 
 function stagedSlotCleanupCandidates(report) {
-  return (report.stale || []).map(row => ({ relativePath: row.path, type: "directory", status: row.status, logicalKey: row.identity || "", generation: row.generation || "", updatedAt: row.updatedAt || 0 }));
+  // Additive structured facts ride along so a capable caller can render the exact release preview
+  // without ever parsing paths out of error text; older consumers keep the original fields verbatim.
+  return (report.stale || []).map(row => ({ relativePath: row.path, type: "directory", status: row.status, logicalKey: row.identity || "",
+    generation: row.generation || "", updatedAt: row.updatedAt || 0,
+    createdAt: Number.isFinite(Number(row.createdAt)) ? Number(row.createdAt) : 0,
+    terminalAt: Number.isFinite(Number(row.terminalAt)) ? Number(row.terminalAt) : 0,
+    timeSource: typeof row.timeSource === "string" ? row.timeSource : null,
+    ageMs: Number.isInteger(row.ageMs) ? row.ageMs : null,
+    expiredCommitted: row.expiredCommitted === true,
+    expiryReason: typeof row.expiryReason === "string" ? row.expiryReason : null,
+    locked: row.locked === true,
+    releaseCandidate: row.status === "committed" && row.locked !== true,
+    protectedReason: typeof row.protectedReason === "string" ? row.protectedReason : null }));
 }
 
 function remoteTransferOutcomeUnknown() {
@@ -2002,6 +2143,7 @@ async function transferPartitionedTarCore(source, destination, paths, timeoutMs,
         try {
           await runRemoteBatchSsh(source, directCommand, group, timeoutMs, options);
         } catch (error) {
+          if (error instanceof Error && error.stagingLane === undefined) error.stagingLane = stagingLane;
           const retryable = /host key verification failed|no .* host key|permission denied|connection timed out|connect to host|network is unreachable|could not resolve hostname|connection refused/i.test(formatError(error));
           if (!retryable || remoteTransferOutcomeUnknown()) {
             noteFailure(error);
@@ -2010,6 +2152,7 @@ async function transferPartitionedTarCore(source, destination, paths, timeoutMs,
           try {
             await relayTarFiles(source, destination, group, timeoutMs, { ...options, stagingLane, transferId });
           } catch (relayError) {
+            if (relayError instanceof Error && relayError.stagingLane === undefined) relayError.stagingLane = stagingLane;
             noteFailure(relayError);
             return;
           }
@@ -2020,6 +2163,7 @@ async function transferPartitionedTarCore(source, destination, paths, timeoutMs,
         report("done", index + 1, group);
       }
     } catch (error) {
+      if (error instanceof Error && error.stagingLane === undefined) error.stagingLane = stagingLane;
       noteFailure(error);
       throw error;
     }
@@ -2068,6 +2212,7 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
     const groups = snapshot.totalGroups ? ` · 分组 ${snapshot.completedGroups || 0}/${snapshot.totalGroups}` : "";
     progress.report({ message: `${label} · ${files}${groups} · ${Math.round(bytes / 1024)} KiB${wire ? " 实际流字节" : " 已处理"} · 已耗时 ${Math.floor((Date.now() - notifyStartedAt) / 1000)} 秒` });
   });
+  let stageBlockContext = null;
   try {
   const requestedCompression = requestedTransferCompression(options);
   const source = directSyncTarget(options.source, "来源");
@@ -2134,6 +2279,29 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   const effectiveOptions = { ...options, generation: options.generation || options._operationId || transferController?.operationId || transferController?.id || nextTransferId("staging"), compression, expectedFiles: sourceHashes, wireTelemetry: true, onWireBytes: (count) => { wireBytes += count; } };
   const planned = partitionTransferPaths(changed, options.singleStream === true ? Math.max(changed.length, 1) : 80,
     FPSYNC_PARALLEL_STREAMS, fileSizes, FPSYNC_MAX_BATCH_BYTES);
+  // Claim-scoped expiry reclaim for THIS run's identities only (ruled Q2): before the receiver
+  // claims, each lane of this scope gets one read-only admission report; an expired committed
+  // leaving slot is reclaimed through the existing managed isolate-then-delete chain. No scan of
+  // any other identity, no background service, and every unknown outcome just leaves the classic
+  // fail-closed pending error in place (now enriched with the structured stage block).
+  const stageGeneration = effectiveOptions.generation;
+  const stageScopeText = stagedScope(effectiveOptions);
+  const stageIdentities = [0, 1].map(stagingLane => stagedLogicalKey(destination.remotePath, [], { ...effectiveOptions, stagingLane }));
+  const stageExpiry = stagedSlotExpirySettings();
+  stageBlockContext = { destination, generation: stageGeneration, scope: stageScopeText, identities: stageIdentities,
+    profile: String(options.profile || destination.profile || ""), expiryMs: stageExpiry.expiryMs };
+  const stagedSlotReclaim = [];
+  if (stageExpiry.enabled && planned.length) {
+    const reclaimConsumerRoot = typeof options.consumerRoot === "string" && options.consumerRoot ? options.consumerRoot
+      : String(vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath || "");
+    for (const stagingLane of [0, 1]) {
+      try {
+        stagedSlotReclaim.push(await reclaimExpiredStagedSlots({ destination, scope: stageScopeText, lane: stagingLane,
+          identity: stageIdentities[stagingLane], generation: stageGeneration,
+          consumerRoot: reclaimConsumerRoot, api: cleanupFileApi, expiryMs: stageExpiry.expiryMs }));
+      } catch { /* reclaim probes are never allowed to mask or delay the transfer decision itself */ }
+    }
+  }
   progress.report({ message: changed.length
     ? "清单完成（" + inventoryMs + " ms）；跳过相同 " + unchangedFiles + "，目标缺失 " + missingFiles + "，内容不同 " + differentFiles + "；采用" + (compression === "none" ? "无压缩" : compression === "zstd" ? "zstd 压缩" : "gzip 压缩") + "流处理 " + changed.length + "/" + paths.length + " 个文件，共 " + planned.length + " 组"
     : `清单完成（${inventoryMs} ms）；${paths.length} 个文件均无需传输，准备校验…` });
@@ -2178,7 +2346,21 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   advance(100, `完成：传输 ${changed.length}/${paths.length} 个文件，SHA256 校验通过 · 清单 ${timing.inventoryMs} ms · 流处理 ${timing.streamMs} ms · 校验 ${timing.verifyMs} ms`);
   return { ok: true, paths: paths.length, transferredFiles: changed.length, partitions,
     verification: "sha256", transport: "partitioned-tar", compression, singleStream: options.singleStream === true,
-    directory, relativePath, timing, hashCache, compressionDecision, wireBytes, missingFiles, differentFiles, unchangedFiles };
+    directory, relativePath, timing, hashCache, compressionDecision, wireBytes, missingFiles, differentFiles, unchangedFiles,
+    stagedSlotReclaim };
+  } catch (error) {
+    // A blocked admission keeps its exact TRANSFER_STAGE_PENDING text (prefix untouched, release
+    // bindings never parsed from text) and additionally carries the structured stage block so the
+    // caller can show WHICH host and WHICH scope is stuck. Evidence gathering must never replace
+    // the original failure: any probe problem falls back to the untouched error.
+    if (stageBlockContext && /TRANSFER_STAGE_PENDING/.test(String(error && error.message || ""))) {
+      const lane = Number.isInteger(error && error.stagingLane) ? error.stagingLane : 0;
+      try {
+        await attachStagedStageBlock(error, { ...stageBlockContext, lane, identity: stageBlockContext.identities[lane],
+          incomingGeneration: stageBlockContext.generation });
+      } catch { /* the original error travels unchanged */ }
+    }
+    throw error;
   } finally { notification?.dispose?.(); }
 }
 
@@ -4170,13 +4352,18 @@ function createLocalApiMethods() {
     "files.cleanup.stagedSlots": async params => {
       // params.generation (a stable incoming run id) turns this into an admission preview; without
       // it the call is a pure read-only inventory that never lists the retained two generations.
+      // The remote-clock expiry verdict rides on the leaving candidate so a capable caller can
+      // distinguish an expired committed old generation from a retained one without guessing time.
       const generation = params.generation ? transferScope64(params.generation) : undefined;
       const identities = params.identity ? [String(params.identity)] : [0, 1].map(stagingLane =>
         stagedLogicalKey(params.node?.root, [], { retentionKey: params.retentionKey, stagingLane }));
       if (!params.identity && !String(params.retentionKey || "").trim()) cleanupFail("INVALID_REQUEST");
-      const reports = await Promise.all(identities.map(identity => stagedSlotStaleReport(params.node, identity, generation)));
+      const expiry = stagedSlotExpirySettings();
+      const reports = await Promise.all(identities.map(identity => stagedSlotStaleReport(params.node, identity, generation, expiry.expiryMs)));
       return { candidates: reports.flatMap(stagedSlotCleanupCandidates),
-        held: reports.reduce((count, report) => count + report.held.length, 0), identities };
+        slots: reports.flatMap(report => Array.isArray(report.slots) ? report.slots : []),
+        held: reports.reduce((count, report) => count + report.held.length, 0), identities,
+        expiry: { enabled: expiry.enabled, ms: expiry.expiryMs } };
     },
     "files.cleanup.confirm": params => cleanupFileApi.confirm(params),
     "files.cleanup.execute": params => cleanupFileApi.execute(params),
@@ -7080,6 +7267,11 @@ module.exports = {
     mappedStagingPath,
     stagedSlotCleanupCandidates,
     stagedSlotStaleReportCommand,
+    stagedScope,
+    stagedSlotExpirySettings,
+    stagedSlotStageBlock,
+    reclaimExpiredStagedSlots,
+    STAGED_SLOT_DEFAULT_EXPIRY_MS,
     openMappedDownloadStream,
     directSyncTarget,
     directSyncRelativePath,

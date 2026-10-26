@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import zlib
 
 receiver_path, engine_path = sys.argv[1], sys.argv[2]
@@ -233,7 +234,222 @@ assert rejected_link.returncode != 0 and b"unsafe publication target" in rejecte
 assert os.readlink(os.path.join(neg_root, "sym.bin")) == "link_target.bin"
 assert open(link_target, "rb").read() == payload_bytes("L1")
 
+# ---------------------------------------------------------------------------
+# r118 committed-slot expiry reclaim contract (0.2.113).
+# terminalAt is written when a row ENTERS committed and never refreshed while terminal; the
+# expiry verdict is computed ONLY from the remote clock over the trusted basis (terminalAt,
+# legacy updatedAt, and the non-followed manifest mtime as last resort), and every time
+# problem keeps the slot protected. The receiver itself NEVER reclaims — admission stays
+# fail-closed TRANSFER_STAGE_PENDING and only adds the machine-readable stderr facts.
+# ---------------------------------------------------------------------------
+recv_spec = importlib.util.spec_from_file_location("staged_receive", receiver_path)
+recv = importlib.util.module_from_spec(recv_spec)
+recv_spec.loader.exec_module(recv)
+
+
+def engine(request):
+    done = subprocess.run([sys.executable, "-B", "-X", "utf8", engine_path],
+                          input=json.dumps(request).encode("utf-8"), capture_output=True, timeout=15)
+    assert done.returncode == 0, done.stderr.decode()[-1500:]
+    return json.loads(done.stdout.decode("utf-8").strip().split("\n").pop())
+
+
+def edit_journal(root_dir, identity, slot, mutate):
+    full = os.path.join(root_dir, STAGING, "d-" + identity[:24], slot, "manifest.json")
+    with open(full, "rb") as handle:
+        row = json.loads(handle.read())
+    mutate(row)
+    with open(full, "wb") as handle:
+        handle.write(json.dumps(row).encode("utf-8"))
+    return row
+
+
+KEY_X = identity_key("55")
+GEN_X1, GEN_X2, GEN_X3, GEN_X4 = "f1" * 32, "f2" * 32, "f3" * 32, "f4" * 32
+exp_root = os.path.join(project, "expcase")
+os.makedirs(exp_root)
+land(GEN_X1, payload_bytes("X1"), root=exp_root, identity=KEY_X)
+land(GEN_X2, payload_bytes("X2"), root=exp_root, identity=KEY_X)
+# terminalAtWritten: every fresh committed journal carries a positive terminal moment.
+terminalAtWritten = all((slot_generation(slot).get("terminalAt") or 0) > 0
+                        and abs(slot_generation(slot)["terminalAt"] - slot_generation(slot)["updatedAt"]) <= 1
+                        for slot in ("0", "1"))
+assert terminalAtWritten, (slot_generation("0"), slot_generation("1"))
+
+# --- journal terminalAt lifecycle: enter committed writes it, terminal rewrites carry it,
+# --- any non-terminal rewrite drops it, a fresh re-commit stamps a new terminal moment.
+jcase = os.path.join(project, "jcase")
+os.makedirs(os.path.join(jcase, STAGING, "d-" + KEY_X[:24], "0"))
+journal_fd = os.open(os.path.join(jcase, STAGING, "d-" + KEY_X[:24], "0"), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+recv.journal(journal_fd, {"identity": KEY_X, "generation": GEN_X4, "status": "committed", "count": 1})
+first_commit = recv.read_journal(journal_fd)
+assert (first_commit.get("terminalAt") or 0) > 0
+recv.journal(journal_fd, {"identity": KEY_X, "generation": GEN_X4, "status": "committed", "count": 2})
+second_commit = recv.read_journal(journal_fd)
+assert second_commit["terminalAt"] == first_commit["terminalAt"], "terminal rewrites must never refresh terminalAt"
+recv.journal(journal_fd, {"identity": KEY_X, "generation": GEN_X4, "status": "preparing", "entries": []})
+assert "terminalAt" not in recv.read_journal(journal_fd), "a resumed (non-terminal) row must drop terminalAt"
+os.close(journal_fd)
+journalTerminalAtCarried = True
+
+EXPIRY_MS = 86400000
+
+
+def set_terminal(identity, slot, seconds_ago):
+    edit_journal(exp_root, identity, slot, lambda row: row.update(terminalAt=int(time.time()) - seconds_ago))
+
+
+set_terminal(KEY_X, "0", 172800)  # two days old, slot 1 stays fresh
+exp_report = json.loads(call({"mode": "staleReport", "root": exp_root, "identity": KEY_X, "generation": GEN_X3,
+                              "expiry": {"ms": EXPIRY_MS}}).stdout)
+expiredOldGenerationTrue = (len(exp_report["stale"]) == 1
+                            and exp_report["stale"][0]["expiredCommitted"] is True
+                            and exp_report["stale"][0]["expiryReason"] == "expired"
+                            and exp_report["stale"][0]["timeSource"] == "terminalAt"
+                            and exp_report["stale"][0]["ageMs"] >= 172800000
+                            and exp_report["stale"][0]["locked"] is False
+                            and len(exp_report["held"]) == 1
+                            and exp_report["held"][0]["protectedReason"] == "within-retention-window"
+                            and len(exp_report["slots"]) == 2
+                            and sorted(row["role"] for row in exp_report["slots"]) == ["held", "leaving"])
+assert expiredOldGenerationTrue, exp_report
+
+# While the stale candidate is only PROPOSED, the receiver itself never reclaims: the third
+# generation stays fail-closed, and the refusal now additionally carries machine-readable facts.
+blocked2 = call({"mode": "chunkStatus", "root": exp_root, "identity": KEY_X, "generation": GEN_X3,
+                 "entries": [{"path": "out/large.bin", "sha256": "0" * 64, "size": 10}]})
+claimStillPending = blocked2.returncode != 0 and b"TRANSFER_STAGE_PENDING" in blocked2.stderr
+structuredPendingFacts = b"SIMPLE_STAGE_PENDING " in blocked2.stderr
+if structuredPendingFacts:
+    marker_line = next(line for line in blocked2.stderr.decode("utf-8").split("\n") if line.startswith("SIMPLE_STAGE_PENDING "))
+    marker = json.loads(marker_line[len("SIMPLE_STAGE_PENDING "):])
+    structuredPendingFacts = (marker["code"] == "TRANSFER_STAGE_PENDING" and marker["identity"] == KEY_X
+                              and marker["incomingGeneration"] == GEN_X3 and len(marker["slots"]) == 2)
+assert claimStillPending and structuredPendingFacts, blocked2.stderr[-600:]
+
+# --- deterministic threshold boundary (same-process report so the clock cannot drift):
+# exactly `expiry` old is expired (>=), one second younger is protected.
+set_terminal(KEY_X, "0", 86400)
+boundary_expired = recv.stale_report(exp_root, KEY_X, GEN_X4, EXPIRY_MS)
+boundaryAtLeastDay = bool(boundary_expired["stale"]) and boundary_expired["stale"][0]["expiredCommitted"] is True
+set_terminal(KEY_X, "0", 86399)
+boundary_young = recv.stale_report(exp_root, KEY_X, GEN_X4, EXPIRY_MS)
+boundaryJustBelow = not boundary_young["stale"][0]["expiredCommitted"] and boundary_young["stale"][0]["expiryReason"] == "within-threshold"
+assert boundaryAtLeastDay and boundaryJustBelow, (boundary_expired["stale"], boundary_young["stale"])
+
+# --- untrusted time NEVER expires: future stamps and clock contradictions stay protected.
+set_terminal(KEY_X, "0", -3600)  # one hour into the future
+future_report = recv.stale_report(exp_root, KEY_X, GEN_X4, EXPIRY_MS)
+futureProtected = (future_report["stale"][0]["expiredCommitted"] is False
+                   and future_report["stale"][0]["expiryReason"] == "time-future")
+created_seconds = int(recv.read_journal(os.open(os.path.join(exp_root, STAGING, "d-" + KEY_X[:24], "0"),
+                                                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))["createdAt"] // 1_000_000_000)
+edit_journal(exp_root, KEY_X, "0", lambda row: row.update(terminalAt=created_seconds - 10))
+contradiction_report = recv.stale_report(exp_root, KEY_X, GEN_X4, EXPIRY_MS)
+contradictionProtected = (contradiction_report["stale"][0]["expiredCommitted"] is False
+                          and contradiction_report["stale"][0]["expiryReason"] == "time-contradiction")
+assert futureProtected and contradictionProtected, (future_report["stale"], contradiction_report["stale"])
+
+# --- manifest-mtime fallback ONLY for a valid journal with no usable timestamps; slot
+# --- directory/lock/data mtimes are never consulted (this is the last accepted source).
+def strip_times(row):
+    row.pop("terminalAt", None)
+    row.pop("updatedAt", None)
+edit_journal(exp_root, KEY_X, "0", strip_times)
+manifest_path = os.path.join(exp_root, STAGING, "d-" + KEY_X[:24], "0", "manifest.json")
+old = time.time() - 172800
+os.utime(manifest_path, (old, old))
+mtime_report = recv.stale_report(exp_root, KEY_X, GEN_X4, EXPIRY_MS)
+mtimeAgedExpired = (mtime_report["stale"][0]["expiredCommitted"] is True
+                    and mtime_report["stale"][0]["timeSource"] == "manifestMtime")
+fresh = time.time()
+os.utime(manifest_path, (fresh, fresh))
+mtime_report2 = recv.stale_report(exp_root, KEY_X, GEN_X4, EXPIRY_MS)
+mtimeFreshProtected = mtime_report2["stale"][0]["expiredCommitted"] is False
+assert mtimeAgedExpired and mtimeFreshProtected, (mtime_report["stale"], mtime_report2["stale"])
+
+# --- same-generation retry proposes nothing; inventory keeps every slot held.
+own_report = recv.stale_report(exp_root, KEY_X, GEN_X1)  # GEN_X1 still owns slot 0 (only times were edited)
+sameGenerationNoReclaim = own_report["stale"] == [] and own_report["slots"][0]["role"] == "held"
+inventory_report = recv.stale_report(exp_root, KEY_X)
+inventoryRolesHeld = inventory_report["stale"] == [] and all(row["role"] == "held" for row in inventory_report["slots"])
+assert sameGenerationNoReclaim and inventoryRolesHeld, (own_report, inventory_report)
+
+# --- corrupt journal stays protected even with expiry requested.
+KEY_C2 = identity_key("66")
+GEN_C2A, GEN_C2B = "a6" * 32, "b6" * 32
+corrupt_root = os.path.join(project, "corruptcase")
+os.makedirs(corrupt_root)
+land(GEN_C2A, payload_bytes("K1"), root=corrupt_root, identity=KEY_C2)
+land(GEN_C2B, payload_bytes("K2"), root=corrupt_root, identity=KEY_C2)
+with open(os.path.join(corrupt_root, STAGING, "d-" + KEY_C2[:24], "0", "manifest.json"), "wb") as handle:
+    handle.write(b"{not-json")
+corrupt_report = recv.stale_report(corrupt_root, KEY_C2, "c6" * 32, EXPIRY_MS)
+corruptProtected = (corrupt_report["stale"] == []
+                    and any(row["status"] == "unresolved" and row["protectedReason"] == "journal-unresolved"
+                            for row in corrupt_report["held"]))
+assert corruptProtected, corrupt_report
+
+# --- isolation-moment slot lock: while a claim holds the flock, BOTH the read-only report and
+# --- the engine isolate refuse; after release the isolate lands and the freed slot re-admits.
+KEY_L = identity_key("77")
+GEN_L1, GEN_L2, GEN_L3 = "a7" * 32, "b7" * 32, "c7" * 32
+lock_root = os.path.join(project, "lockcase")
+os.makedirs(lock_root)
+land(GEN_L1, payload_bytes("L1b"), root=lock_root, identity=KEY_L)
+land(GEN_L2, payload_bytes("L2b"), root=lock_root, identity=KEY_L)
+lock_slot = "0"  # the first land takes slot 0 deterministically
+assert json.loads(open(os.path.join(lock_root, STAGING, "d-" + KEY_L[:24], lock_slot, "manifest.json"), "rb").read())["generation"] == GEN_L1
+lock_holder = os.open(os.path.join(lock_root, STAGING, "d-" + KEY_L[:24], lock_slot + ".lock"),
+                      os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+import fcntl as _fcntl
+_fcntl.flock(lock_holder, _fcntl.LOCK_EX)
+try:
+    locked_report = recv.stale_report(lock_root, KEY_L, GEN_L3, EXPIRY_MS)
+    lockedProtected = (locked_report["stale"] == []
+                       and any(row["status"] == "locked" and row["protectedReason"] == "slot-locked"
+                               and row["locked"] is True for row in locked_report["held"]))
+    slot_rel = STAGING + "/d-" + KEY_L[:24] + "/" + lock_slot
+    isolate_inspection = engine({"root": lock_root, "action": "inspect", "isolate": True, "operationId": "lock-iso",
+                                 "target": {"relativePath": slot_rel, "type": "directory"}})
+    assert isolate_inspection["ok"], isolate_inspection
+    frozen_target = dict(isolate_inspection["target"], relativePath=slot_rel, type="directory")
+    batch = "job-" + hashlib.sha256(b"lockcase-isolate").hexdigest()[:48]
+    frozen_target["archiveBatch"] = batch
+    frozen_target["destination"] = "clean_dir/" + batch + "/" + slot_rel
+    locked_isolate = engine({"root": lock_root, "action": "isolate", "operationId": "lock-iso", "target": frozen_target})
+    slotLockHeldBlocksIsolate = (locked_isolate["ok"] is False
+                                 and locked_isolate["error"]["code"] in ("SLOT_LOCK_HELD", "SLOT_LOCK_UNCERTAIN"))
+    assert lockedProtected and slotLockHeldBlocksIsolate, (locked_report, locked_isolate)
+finally:
+    _fcntl.flock(lock_holder, _fcntl.LOCK_UN)
+    os.close(lock_holder)
+released_isolate = engine({"root": lock_root, "action": "isolate", "operationId": "lock-iso-2", "target": frozen_target})
+isolateAfterRelease = released_isolate["ok"] is True
+claimAfterIsolate = call({"mode": "chunkStatus", "root": lock_root, "identity": KEY_L, "generation": GEN_L3,
+                          "entries": [{"path": "out/large.bin", "sha256": "0" * 64, "size": 10}]})
+claimAdmitted = claimAfterIsolate.returncode == 0 and json.loads(claimAfterIsolate.stdout)["offset"] == 0
+assert isolateAfterRelease and claimAdmitted, (released_isolate, claimAfterIsolate.stderr[-400:])
+
 print(json.dumps({"ok": True, "pendingBlocked": True, "leaving": leaving, "thirdGenerationLanded": True,
                   "hardlinkPublication": {"tarPublished": True, "pendingAliasPreserved": True,
                                           "chunkPublished": True, "normalTargetPublished": True,
-                                          "directoryTargetRejected": True, "symlinkTargetRejected": True}}))
+                                          "directoryTargetRejected": True, "symlinkTargetRejected": True},
+                  "expiryReclaim": {"terminalAtWritten": terminalAtWritten,
+                                    "journalTerminalAtCarried": journalTerminalAtCarried,
+                                    "expiredOldGenerationTrue": expiredOldGenerationTrue,
+                                    "claimStillPending": claimStillPending,
+                                    "structuredPendingFacts": structuredPendingFacts,
+                                    "boundaryAtLeastDay": boundaryAtLeastDay,
+                                    "boundaryJustBelow": boundaryJustBelow,
+                                    "futureProtected": futureProtected,
+                                    "contradictionProtected": contradictionProtected,
+                                    "mtimeAgedExpired": mtimeAgedExpired,
+                                    "mtimeFreshProtected": mtimeFreshProtected,
+                                    "sameGenerationNoReclaim": sameGenerationNoReclaim,
+                                    "inventoryRolesHeld": inventoryRolesHeld,
+                                    "corruptProtected": corruptProtected,
+                                    "lockedProtected": lockedProtected,
+                                    "slotLockHeldBlocksIsolate": slotLockHeldBlocksIsolate,
+                                    "isolateAfterRelease": isolateAfterRelease,
+                                    "claimAdmitted": claimAdmitted}}))

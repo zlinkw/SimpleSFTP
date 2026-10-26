@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.113
+
+- 新增（用户裁定 2026-10-26）：Worker 同步 claim 前对本次 identity/lane 就地回收已过期的最旧 committed 暂存槽。默认开启（`simpleSftp.autoReclaimExpiredCommittedSlots`），阈值默认 1 天（`simpleSftp.stagedSlotCommittedExpiryMs`，下限即 1 天，不允许配置得更短）。自动回收仅限：journal 完整可读＋identity 匹配＋status=committed＋隔离瞬间槽锁可非阻塞取得＋在“当前两代＋待进入代”去重虚拟窗口中是唯一退出窗口的最旧代＋终态时间距今 ≥ 阈值＋预览到执行路径/根身份/device-inode 未变；时间不可得、格式错误、未来时间、时钟矛盾一律按未过期不回收。禁止后台/全局扫描；隔离、删除或回执 unknown 时不重放修改，保持 TRANSFER_STAGE_PENDING。
+- 新增：journal 进入 committed 时写入 `terminalAt`（后续同终态重写不刷新，回到非终态即丢弃；旧 journal 无该字段时年龄回退 `updatedAt`，仅 journal 合法但时间字段缺失时允许读 manifest.json 非跟随链接 mtime；槽目录/锁文件/数据文件 mtime 一律不采信）。
+- 新增：TRANSFER_STAGE_PENDING 错误只增不改——原文前缀逐字保留，JS 调用层补齐主机/profile/范围/通道后的结构化 `stageBlock`（error.stageBlock 与 error.apiData.stageBlock），错误文本追加白话卡点“卡在哪台、哪个范围”；Python 端仅报告槽事实并在 stderr 输出 `SIMPLE_STAGE_PENDING` 机器可读快照。释放入口由调用方按 capabilities＋releaseCandidate 决定，SFTP 端把自动过期与一次确认释放的授权来源分别记入冻结台账（`reclaimAuthorizationSource`）。
+- 引擎扩展：isolate 动作对暂存槽布局在**实际 rename 瞬间**非阻塞核验 `<slot>.lock` 并跨改名持有；锁被持有/无法核验一律拒绝隔离（SLOT_LOCK_HELD / SLOT_LOCK_UNCERTAIN），fail closed。
+- 能力描述符扩展：`files.cleanup.stagedSlots` 增 `expiredCommittedReclaim/defaultExpiryMs/virtualRetentionWindow/structuredBlockEvidence/releaseConfirmationCount`；`sync.serverToServerFpsync` 增 `claimScopedExpiredReclaim/stageBlockEvidence`。
+
 ## 0.2.112
 
 - 修复：托管观察链（managed_tmux/filesystem 隔离）的完成结论此前只随应答返回、从不写入磁盘台账，导致台账永远停留在“执行中”，后台维护删除按持久状态判 NOT_ISOLATED_COMPLETE 而永不放行。现在 status/execute/check 观察到“完成”证明时先持久化再返回：completed 只能由完成证明推进，证据缺失或降级绝不擦除已落盘的 completed；对既有读者（SE、状态界面、status 返回结构）形状逐字不变。多目标 token 的“存在未完成目标整批不删”保护原样保留，:1163 判据与 isolatedMaintenanceDelete 未改动。
