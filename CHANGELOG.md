@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.114
+
+- 修复（真实功能缺陷，SimpleExperiment 0.5.416 审核查出）：0.2.113 的锁内 journal 复检末尾**无条件**要求年龄 ≥ 过期阈值（默认 1 天），使"用户已确认的提前释放旧槽占用"在用户点完确认后仍被拒——用户授权要做的动作实际做不成。现在绑定显式区分授权来源：新增布尔 `stagedJournal.requireExpired`，**缺省=true，0.2.113 全部既有调用方行为逐字节不变**；仅当恰为 `false`（用户一次确认释放）时锁内**只跳过最后那条年龄阈值**，其余检查（形状、identity、generation、committed、逐字段存在/格式、绑定 terminalAt 精确不回退、未来时间、createdAt 矛盾、journal 损坏/缺失）一条不少。`expiryMs` 两种模式都仍必填且 >0，不许用 0 隐式关年龄规则。
+- 模式不可中途翻转：`requireExpired` 随预览进入冻结台账与 digest 前置（无绑定的既有预览 digest 逐字节不变），确认/执行只重放冻结值，预览仍 `{readOnly:true, zeroWrites:true}`。
+- 能力真实：新引擎在**暂存槽 isolate inspect** 应答 `userConfirmedSlotRelease: 1`（仅暂存槽目标），插件照 `backgroundIsolatedDelete` 同款同源证明派生 preview safety 旗标——旧引擎、混批或非暂存目标一律静默不宣称；`files.cleanup.isolatedMaintenanceDelete` 描述符补 `userConfirmedSlotRelease: 1` 供 SimpleExperiment 在弹确认前门口判掉入口。自动过期回收路径不改行为、不发送该字段。
+
 ## 0.2.113
 
 - 新增（用户裁定 2026-10-26）：Worker 同步 claim 前对本次 identity/lane 就地回收已过期的最旧 committed 暂存槽。默认开启（`simpleSftp.autoReclaimExpiredCommittedSlots`），阈值默认 1 天（`simpleSftp.stagedSlotCommittedExpiryMs`，下限即 1 天，不允许配置得更短）。自动回收仅限：journal 完整可读＋identity 匹配＋status=committed＋隔离瞬间槽锁可非阻塞取得＋在“当前两代＋待进入代”去重虚拟窗口中是唯一退出窗口的最旧代＋终态时间距今 ≥ 阈值＋预览到执行路径/根身份/device-inode 未变；时间不可得、格式错误、未来时间、时钟矛盾一律按未过期不回收。禁止后台/全局扫描；隔离、删除或回执 unknown 时不重放修改，保持 TRANSFER_STAGE_PENDING。

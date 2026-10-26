@@ -212,15 +212,77 @@ test("r118 journal binding: explicit facts ride the frozen row, malformed bindin
   await api.confirm({ token: p.token, digest: p.digest, confirm: true, phase: 1, consumerRoot: ROOT_A,
     exactTargets: p.targets.map(row => row.absolutePath) });
   const cold = mkApi(api.storageRoot);
-  assert.deepEqual((await cold.read(p.token, ROOT_A)).stagedJournal, binding);
+  // 0.2.114: the frozen row stores the mode EXPLICITLY — absent input freezes to requireExpired:true,
+  // so execute and any later reader always see the byte-identical 0.2.113 expiry behaviour.
+  assert.deepEqual((await cold.read(p.token, ROOT_A)).stagedJournal, { ...binding, requireExpired: true });
   // Execute hands EXACTLY those expectations to the engine isolate request (the engine re-proves
   // them under the slot lock before the rename — see the fixture's binding race scenarios).
   const before = sentRequests.length;
   await api.execute({ token: p.token, digest: p.digest, index: 0, consumerRoot: ROOT_A });
   const isolateRequests = sentRequests.slice(before).filter(request => request.action === "isolate");
   assert.equal(isolateRequests.length, 1, JSON.stringify(isolateRequests.map(request => request.action)));
-  assert.deepEqual(isolateRequests[0].stagedJournal, binding);
+  assert.deepEqual(isolateRequests[0].stagedJournal, { ...binding, requireExpired: true });
   assert.equal(isolateRequests[0].target.relativePath, rel);
+});
+
+test("r119 user-confirmed early release: strict boolean mode, frozen into digest and row, engine proof gates advertising", async () => {
+  const storageRoot = path.join(os.tmpdir(), "r119-release-" + Date.now());
+  const api = mkApi(storageRoot);
+  const rel = "simple_cluster/.simple-sftp-staging/d-" + "1".repeat(24) + "/0";
+  const batch = "job-" + "ab".repeat(24);
+  const binding = { identity: "ab".repeat(32), generation: "cd".repeat(32), status: "committed", terminalAt: 172800, expiryMs: 86400000 };
+  const base = { consumerRoot: ROOT_A, node: nodeOf("/srv/target"), action: "isolate",
+    targets: [{ relativePath: rel, type: "directory", archiveBatch: batch, destination: "clean_dir/" + batch + "/" + rel }] };
+  // The mode is a real boolean or absent: truthy stand-ins are refused in BOTH chains.
+  for (const bad of ["false", 1, 0, null]) {
+    await assert.rejects(api.preview({ ...base, authorizationSource: "single_confirmation_release", stagedJournal: { ...binding, requireExpired: bad } }),
+      error => error.code === "INVALID_STAGED_JOURNAL_BINDING");
+  }
+  // expiryMs stays required and > 0 whatever the mode: nobody smuggles 0 to switch the age rule off.
+  await assert.rejects(api.preview({ ...base, authorizationSource: "single_confirmation_release",
+    stagedJournal: { ...binding, expiryMs: 0, requireExpired: false } }), error => error.code === "INVALID_STAGED_JOURNAL_BINDING");
+  // Preview keeps zero writes: the persisted ledger is a CONFIRM-time artifact, so a cold reader
+  // can only resolve a token after confirm — before it, the frozen preview lives in memory only.
+  const pFalse = await api.preview({ ...base, authorizationSource: "single_confirmation_release", stagedJournal: { ...binding, requireExpired: false } });
+  const pTrue = await api.preview({ ...base, authorizationSource: "single_confirmation_release", stagedJournal: binding });
+  await assert.rejects(mkApi(storageRoot).read(pFalse.token, ROOT_A), error => error.code === "PREVIEW_EXPIRED");
+  // The mode joins the digest preimage: identical previews differing only in mode differ in digest.
+  assert.notEqual(pFalse.digest, pTrue.digest);
+  // The shared stub transport never answers the engine proof ⇒ the safety flag stays silent.
+  assert.equal(pFalse.safety.userConfirmedSlotRelease, undefined);
+  await api.confirm({ token: pFalse.token, digest: pFalse.digest, confirm: true, phase: 1, consumerRoot: ROOT_A,
+    exactTargets: pFalse.targets.map(row => row.absolutePath) });
+  // A mode flip cannot survive the exact-digest check: pTrue's digest on pFalse's token is refused.
+  await assert.rejects(api.confirm({ token: pFalse.token, digest: pTrue.digest, confirm: true, phase: 1, consumerRoot: ROOT_A,
+    exactTargets: pFalse.targets.map(row => row.absolutePath) }), error => error.code === "CONFIRM_REQUIRED");
+  const cold = mkApi(storageRoot);
+  assert.deepEqual((await cold.read(pFalse.token, ROOT_A)).stagedJournal, { ...binding, requireExpired: false });
+  // Execute replays ONLY the frozen value; the engine consumes it under the slot lock.
+  const before = sentRequests.length;
+  await api.execute({ token: pFalse.token, digest: pFalse.digest, index: 0, consumerRoot: ROOT_A });
+  const isolates = sentRequests.slice(before).filter(request => request.action === "isolate");
+  assert.equal(isolates.length, 1);
+  assert.equal(isolates[0].stagedJournal.requireExpired, false);
+  // Capability truth: an engine that ANSWERS the flag on staged inspects advertises it; the
+  // same-source discipline means one silent target is enough to keep the whole flag absent.
+  const answeringTransport = async request => {
+    const result = await transport(request);
+    if (request.action === "inspect" && request.isolate === true) result.userConfirmedSlotRelease = 1;
+    return result;
+  };
+  const answeringApi = new CleanupFileApi({ storageRoot: path.join(os.tmpdir(), "r119-answer-" + Date.now()),
+    transport: answeringTransport, activity: async () => {}, lease: async (n, t, work) => work() });
+  assert.equal((await answeringApi.preview(base)).safety.userConfirmedSlotRelease, 1);
+  const halfSilent = async request => {
+    const result = await transport(request);
+    if (request.action === "inspect" && request.isolate === true && request.target.relativePath === rel) result.userConfirmedSlotRelease = 1;
+    return result;
+  };
+  const mixedApi = new CleanupFileApi({ storageRoot: path.join(os.tmpdir(), "r119-mixed-" + Date.now()),
+    transport: halfSilent, activity: async () => {}, lease: async (n, t, work) => work() });
+  const mixed = await mixedApi.preview({ ...base, targets: [...base.targets,
+    { relativePath: "docs", type: "directory", archiveBatch: "job-" + "ef".repeat(24), destination: "clean_dir/" + "job-" + "ef".repeat(24) + "/docs" }] });
+  assert.equal(mixed.safety.userConfirmedSlotRelease, undefined);
 });
 
 test("upload-state writes into the project managed tree; the legacy .vscode file stays read-only", () => {

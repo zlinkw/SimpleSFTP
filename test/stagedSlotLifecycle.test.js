@@ -39,7 +39,16 @@ test("staged slots keep two generations end to end: preview, fail-closed third, 
         legacyFallbackStillWorks: true, reclaimBindingNonTerminalRefused: true,
         reclaimBindingGenerationChangedRefused: true, reclaimBindingFreshCommitRefused: true,
         reclaimBindingTerminalRemovedRefused: true, reclaimBindingCreatedAfterTerminalRefused: true,
-        reclaimBindingLegacyNullUpdateRefused: true, reclaimBindingUnchangedAccepted: true } });
+        reclaimBindingLegacyNullUpdateRefused: true, reclaimBindingUnchangedAccepted: true,
+        // 0.2.114: the user-confirmed early release works on the REAL filesystem, while every
+        // other under-lock rule still denies it, defaults stay byte-identical and capability
+        // answers are truthful (staged slots answer, everything else stays silent).
+        userReleaseYoungAccepted: true, userReleaseAbsentStillRefused: true, userReleaseTrueStillRefused: true,
+        userReleaseModeNotBooleanRefused: true, userReleaseGenerationSwapRefused: true,
+        userReleaseNonTerminalRefused: true, userReleaseFreshCommitRefused: true,
+        userReleaseMalformedTimeRefused: true, userReleaseFutureTimeRefused: true,
+        userReleaseCreatedContradictionRefused: true, userReleaseJournalRemovedRefused: true,
+        userReleaseInspectProof: true, userReleaseInspectAnswers: true } });
 });
 
 // The extension-side production request builder must encode the SAME read-only protocol the

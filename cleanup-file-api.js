@@ -513,8 +513,16 @@ class CleanupFileApi {
         || !/^[0-9a-f]{64}$/.test(String(stagedJournal.generation || ""))
         || stagedJournal.status !== "committed"
         || !(Number.isInteger(stagedJournal.expiryMs) && stagedJournal.expiryMs > 0)
-        || !(stagedJournal.terminalAt === null || (Number.isInteger(stagedJournal.terminalAt) && stagedJournal.terminalAt > 0))) fail("INVALID_STAGED_JOURNAL_BINDING");
+        || !(stagedJournal.terminalAt === null || (Number.isInteger(stagedJournal.terminalAt) && stagedJournal.terminalAt > 0))
+        // 0.2.114: WHO authorized the isolation is an explicit boolean, never a truthy stand-in;
+        // ABSENT means true, so every 0.2.113 caller keeps expiry behaviour byte-for-byte.
+        || !(stagedJournal.requireExpired === undefined || typeof stagedJournal.requireExpired === "boolean")) fail("INVALID_STAGED_JOURNAL_BINDING");
     }
+    // The mode freezes with the preview (0.2.114): it joins the digest preimage, so flipping it
+    // between preview → confirm → execute breaks the exact-digest check, and execute can only
+    // ever replay the frozen value stored on the row. expiryMs stays required and > 0 in BOTH
+    // modes — nobody smuggles 0 to switch the age rule off implicitly.
+    const frozenRequireExpired = stagedJournal === undefined ? undefined : (stagedJournal.requireExpired === undefined ? true : stagedJournal.requireExpired);
     const pathOnly = params.authorizationMode === "confirmed_paths";
     // Confirmed paths only ever authorize permanent deletion; a move/restore
     if (pathOnly && action !== "delete") fail("INVALID_ACTION");
@@ -533,6 +541,10 @@ class CleanupFileApi {
     // keeps the whole plan on the old downgrade chain — the plugin never
     // advertises a capability the connected backend did not show.
     const isolateEngineProof = [];
+    // Same-source proof for the user-confirmed early release (0.2.114): ONLY staged-slot inspect
+    // answers carry the engine's userConfirmedSlotRelease flag, so a mixed batch, a non-staged
+    // target or an older engine keeps the safety flag silent — never advertised for free.
+    const userReleaseEngineProof = [];
     for (const original of targets) {
       const target = { ...original, ...(observationMode ? { activityEvidenceMode: "managed_tmux" } : {}) };
       if (pathOnly) { target.authorizationMode = "confirmed_paths"; delete target.expectedOwner; delete target.expectedSha256; }
@@ -558,17 +570,25 @@ class CleanupFileApi {
         ...(action === "isolate" ? { isolate: true } : {}), target });
       if (identity && hash(identity) !== hash(result.rootIdentity)) fail("ROOT_IDENTITY_CHANGED");
       identity = result.rootIdentity;
-      if (action === "isolate") isolateEngineProof.push(result.backgroundIsolatedDelete === 1);
+      if (action === "isolate") { isolateEngineProof.push(result.backgroundIsolatedDelete === 1); userReleaseEngineProof.push(result.userConfirmedSlotRelease === 1); }
       rows.push({ ...copy(target), ...result.target, destination: target.destination });
     }
     const backgroundIsolatedDelete = action === "isolate" && isolateEngineProof.length === rows.length
       && isolateEngineProof.every(Boolean) ? 1 : undefined;
+    const userConfirmedSlotRelease = action === "isolate" && userReleaseEngineProof.length === rows.length
+      && userReleaseEngineProof.every(Boolean) ? 1 : undefined;
     const row = { token: crypto.randomBytes(24).toString("hex"), operationId: "cleanup-" + crypto.randomBytes(16).toString("hex"), consumerRoot, node: copy(node), rootIdentity: identity,
       action, observationMode, authorizationMode: pathOnly ? "confirmed_paths" : undefined, reclaimAuthorizationSource,
-      stagedJournal: stagedJournal ? copy(stagedJournal) : undefined, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, managedObservation: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: action === "isolate" ? 1 : undefined, requiredInputGuard: action === "isolate" ? 1 : undefined, isolationCompletionReceipt: backgroundIsolatedDelete, backgroundIsolatedDelete, registeredIsolationDeletion: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1, chunkedFrozenManifest: 1, pinnedRuntimeProgram: 1, handleScan: pathOnly ? "confirmed_paths" : observationMode ? "managed_tmux" : "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
+      // The stored binding carries the EXPLICIT mode (0.2.114): execute replays this copy verbatim,
+      // so the engine always sees the frozen requireExpired, never a caller-time re-guess.
+      stagedJournal: stagedJournal ? copy({ ...stagedJournal, requireExpired: frozenRequireExpired }) : undefined, targets: rows, safety: { gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwner: true, immutableArchiveBatch: true, batchPreviewCapacity: 4096, managedObservation: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: action === "isolate" ? 1 : undefined, requiredInputGuard: action === "isolate" ? 1 : undefined, isolationCompletionReceipt: backgroundIsolatedDelete, backgroundIsolatedDelete, userConfirmedSlotRelease, registeredIsolationDeletion: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1, chunkedFrozenManifest: 1, pinnedRuntimeProgram: 1, handleScan: pathOnly ? "confirmed_paths" : observationMode ? "managed_tmux" : "visible_same_user_processes" }, expiresAt: Date.now() + 30 * 60 * 1000, confirmations: 0, states: rows.map(row => row.missing ? "absent" : "pending") };
     row.tmuxSessionPrefix = tmuxSessionPrefix;
     row.targetDigests = rows.map(targetHash);
-    row.digest = hash({ node: row.node, rootIdentity: identity, action, targets: rows, safety: row.safety, tmuxSessionPrefix });
+    // requireExpired joins the digest preimage when a binding froze it (0.2.114 contract ③):
+    // previews that differ only in the mode get different digests, so a mode flip can never
+    // survive the exact-digest check from confirm to execute. Without a binding the key is
+    // undefined and JSON.stringify drops it — every existing (0.2.113) digest is byte-identical.
+    row.digest = hash({ node: row.node, rootIdentity: identity, action, targets: rows, safety: row.safety, tmuxSessionPrefix, requireExpired: frozenRequireExpired });
     this.previews.set(row.token, copy(row)); // Preview does not write a journal or a remote hash cache.
     return copy(row);
   }
