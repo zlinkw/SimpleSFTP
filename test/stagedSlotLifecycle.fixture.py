@@ -530,6 +530,10 @@ mtimeContradictionProtected = (mtime_bad_row["expiredCommitted"] is False
                                and mtime_bad_row["expiryReason"] == "time-contradiction")
 # --- but a LEGITIMATE legacy row (fields genuinely absent, consistent times) still expires.
 edit_journal(mal_root, KEY_M, "0", lambda row: row.update(createdAt=(int(time.time()) - 172860) * 1_000_000_000))
+# edit_journal REWRITES manifest.json, refreshing its mtime to now; re-age it AFTER the last
+# edit (same edit-then-utime order as the accepted fallback case above) so the report reads
+# the intended 2-day-old evidence instead of the fixture's own write.
+os.utime(os.path.join(mal_root, STAGING, "d-" + KEY_M[:24], "0", "manifest.json"), (time.time() - 172800,) * 2)
 legacy_row = edited_leaving(recv.stale_report(mal_root, KEY_M, "d1" * 32, EXPIRY_MS))
 legacyFallbackStillWorks = legacy_row["expiredCommitted"] is True and legacy_row["timeSource"] == "manifestMtime"
 assert (malformedTimeProtected and malformedNoOlderFallback and mtimeContradictionProtected

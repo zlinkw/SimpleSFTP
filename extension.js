@@ -7283,6 +7283,7 @@ module.exports = {
     stagedSlotCleanupCandidates,
     stagedSlotStaleReportCommand,
     transferScope64,
+    attachStagedStageBlock,
     stagedScope,
     stagedSlotExpirySettings,
     stagedSlotStageBlock,
