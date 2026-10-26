@@ -22,6 +22,18 @@ import zlib
 receiver_path, engine_path = sys.argv[1], sys.argv[2]
 project = tempfile.mkdtemp(prefix="staged-slot-lifecycle-")
 
+_TICK_ON = os.environ.get("STAGED_FIXTURE_TICKS") == "1"  # diagnostics only: stderr timing lines, stdout untouched
+_TICK_LAST = [time.monotonic()]
+
+
+def mark(name):
+    if not _TICK_ON:
+        return
+    now = time.monotonic()
+    sys.stderr.write("SIMPLE_TICK %s +%dms\n" % (name, round((now - _TICK_LAST[0]) * 1000)))
+    _TICK_LAST[0] = now
+
+
 
 def encode(request):
     compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
@@ -269,6 +281,7 @@ def identity_key(tag):
     return (tag * 32)[:64]
 
 
+mark("tar-publish")
 # --- positive: tar publish onto a legal hard-linked metrics target + pending alias -------
 KEY_T, KEY_C, KEY_N = identity_key("22"), identity_key("33"), identity_key("44")
 GEN_D, GEN_E = "d1" * 32, "e1" * 32
@@ -324,6 +337,7 @@ assert os.readlink(os.path.join(neg_root, "sym.bin")) == "link_target.bin"
 assert open(link_target, "rb").read() == payload_bytes("L1")
 
 # ---------------------------------------------------------------------------
+mark("expiry-contract")
 # r118 committed-slot expiry reclaim contract (0.2.113).
 # terminalAt is written when a row ENTERS committed and never refreshed while terminal; the
 # expiry verdict is computed ONLY from the remote clock over the trusted basis (terminalAt,
@@ -372,6 +386,148 @@ def edit_journal(root_dir, identity, slot, mutate):
     return row
 
 
+EXPIRY_MS = 86400000
+
+
+def edited_leaving(report):
+    # Locate the EDITED slot by its slot path, never by list index: the window evicts the row with
+    # the OLDEST createdAt, so every protection scenario below must first prove that edited slot IS
+    # still that single leaving candidate — otherwise its assertion would silently guard another
+    # (healthy) row. The path suffix check simultaneously pins the ruled eviction-order semantics.
+    rows = [row for row in report["stale"] if row["path"].endswith("/0")]
+    assert len(report["stale"]) == 1 and len(rows) == 1, report["stale"]
+    return rows[0]
+
+
+KEY_B, GEN_B1, GEN_B2 = identity_key("bb"), "a8" * 32, "b8" * 32
+
+
+def resume_checkpoint(row):
+    row["status"] = "preparing"
+    row["entries"] = []
+    row.pop("terminalAt", None)
+
+
+SECTION = sys.argv[3] if len(sys.argv) > 3 else "core"  # 0.2.114 timing split: core and release spawn independently
+if SECTION == "release":
+    # --- 0.2.114: a user-CONFIRMED early release must actually succeed under the same under-lock
+    # --- recheck, and NOTHING else may loosen. A committed slot one minute past its terminal moment
+    # --- is exactly the manual-button case: the receiver itself says "not expired", so only the
+    # --- requireExpired:false mode (frozen by preview from the user's own confirmation) can pass —
+    # --- and it passes while every remaining rule still denies. Success/refusal is asserted against
+    # --- the REAL filesystem: the source slot directory is really gone, the isolated copy really
+    # --- exists — never a simulated boolean standing in for directory state.
+    def user_release_case(name, require_expired=False, mutate=None, future_terminal=False, remove_journal=False,
+                          journal_bytes=None):
+        case_start = time.monotonic()
+        case_root = os.path.join(project, "released-" + name)
+        os.makedirs(case_root)
+        land(GEN_B1, payload_bytes("R1"), root=case_root, identity=KEY_B)
+        land(GEN_B2, payload_bytes("R2"), root=case_root, identity=KEY_B)
+        committed_at = int(time.time()) - 60  # YOUNG: a full day minus a minute to go
+        edit_journal(case_root, KEY_B, "0", lambda row: row.update(
+            createdAt=(committed_at - 60) * 1_000_000_000,
+            terminalAt=committed_at + 3600 if future_terminal else committed_at))
+        # The receiver itself must call this slot NOT expired BEFORE any tampering: only the user-
+        # confirmed mode can ever unlock it (asserted pre-mutation, like the binding race cases).
+        assert edited_leaving(recv.stale_report(case_root, KEY_B, "c8" * 32, EXPIRY_MS))["expiredCommitted"] is False, name
+        journal_path = os.path.join(case_root, STAGING, "d-" + KEY_B[:24], "0", "manifest.json")
+        if remove_journal:
+            os.remove(journal_path)
+        elif journal_bytes is not None:
+            with open(journal_path, "wb") as handle:
+                handle.write(journal_bytes)
+        if mutate is not None:
+            edit_journal(case_root, KEY_B, "0", mutate)
+        slot_rel = STAGING + "/d-" + KEY_B[:24] + "/0"
+        batch = "job-" + hashlib.sha256(("released-" + name).encode("utf-8")).hexdigest()[:48]
+        binding = {"identity": KEY_B, "generation": GEN_B1, "status": "committed",
+                   "terminalAt": committed_at + 3600 if future_terminal else committed_at, "expiryMs": EXPIRY_MS}
+        if require_expired is not None:
+            binding["requireExpired"] = require_expired
+        isolate = engine({"root": case_root, "action": "isolate", "operationId": "released-" + name,
+                          "target": {"relativePath": slot_rel, "type": "directory", "archiveBatch": batch,
+                                     "destination": "clean_dir/" + batch + "/" + slot_rel},
+                          "stagedJournal": binding})
+        if _TICK_ON:
+            sys.stderr.write("SIMPLE_TICK case:%s wall=%dms\n" % (name, round((time.monotonic() - case_start) * 1000)))
+        return isolate, os.path.join(case_root, STAGING, "d-" + KEY_B[:24], "0"), \
+            os.path.join(case_root, "clean_dir", batch, slot_rel)
+
+
+    def user_release_refused(name, accepted_codes=("STAGED_JOURNAL_MISMATCH",), **kwargs):
+        isolate, slot_dir, _ = user_release_case(name, **kwargs)
+        return (isolate["ok"] is False and isolate["error"]["code"] in accepted_codes
+                and os.path.exists(slot_dir))
+
+
+    release_iso, release_slot_dir, release_dest = user_release_case("young")
+    userReleaseYoungAccepted = (release_iso["ok"] is True
+                                and not os.path.exists(release_slot_dir)      # source slot really gone
+                                and os.path.isfile(os.path.join(release_dest, "manifest.json")))  # copy really exists
+    # 0.2.113 defaults stay byte-for-byte: absent or true keeps the age rule, young slot refused.
+    userReleaseAbsentStillRefused = user_release_refused("youngabsent", require_expired=None)
+    userReleaseTrueStillRefused = user_release_refused("youngtrue", require_expired=True)
+    # A truthy stand-in is not the mode: the engine shape-check denies before anything else.
+    mode_shape_isolate, mode_shape_dir, _ = user_release_case("youngstring", require_expired="false")
+    userReleaseModeNotBooleanRefused = (mode_shape_isolate["ok"] is False
+                                        and mode_shape_isolate["error"]["code"] == "INVALID_STAGED_JOURNAL_BINDING"
+                                        and os.path.exists(mode_shape_dir))
+    # With the mode set, EVERY other under-lock rule still denies on a genuinely mutated journal.
+    userReleaseGenerationSwapRefused = user_release_refused("gswap", mutate=lambda row: row.update(generation="f8" * 32))
+    userReleaseNonTerminalRefused = user_release_refused("nonterminal", mutate=resume_checkpoint)
+    userReleaseFreshCommitRefused = user_release_refused("fresh", mutate=lambda row: row.update(terminalAt=int(time.time())))
+    userReleaseMalformedTimeRefused = user_release_refused("nullupdate", mutate=lambda row: row.update(updatedAt=None))
+    userReleaseFutureTimeRefused = user_release_refused("future", future_terminal=True)  # binding carries the SAME future moment
+    userReleaseCreatedContradictionRefused = user_release_refused(
+        "contradict", mutate=lambda row: row.update(createdAt=(int(time.time()) + 3600) * 1_000_000_000))
+    # --- G2 RED round定性: a REMOVED journal was always refused — path_guard's own MISSING_TARGET
+    # --- gate (cleanup-files.py:177-179, called at :1110 BEFORE the binding recheck and the rename)
+    # --- denies fail-closed; only the old fixture key wrongly demanded STAGED_JOURNAL_MISMATCH and
+    # --- scored a legitimate refusal as a failure. Both fail-closed codes are accepted here and the
+    # --- untouched-slot assertion stays: the "missing ledger must refuse" protection is unchanged.
+    userReleaseJournalRemovedRefused = user_release_refused("nojournal", remove_journal=True,
+                                                            accepted_codes=("MISSING_TARGET", "STAGED_JOURNAL_MISMATCH"))
+    # Journal missing / corrupt / non-object must refuse under BOTH modes, on the real files.
+    userReleaseJournalRemovedDefaultRefused = user_release_refused("nojournal-default", require_expired=None, remove_journal=True,
+                                                                   accepted_codes=("MISSING_TARGET", "STAGED_JOURNAL_MISMATCH"))
+    userReleaseJournalCorruptRefused = user_release_refused("journal-corrupt", journal_bytes=b"{not-json")
+    userReleaseJournalCorruptDefaultRefused = user_release_refused("journal-corrupt-default", require_expired=None, journal_bytes=b"{not-json")
+    userReleaseJournalNonObjectRefused = user_release_refused("journal-array", journal_bytes=b"[7]")
+    userReleaseJournalNonObjectDefaultRefused = user_release_refused("journal-array-default", require_expired=None, journal_bytes=b"[7]")
+    # --- capability truth at the engine door: staged-slot isolate inspects answer the mode;
+    # --- non-staged targets (and therefore every older engine) stay silent.
+    os.makedirs(os.path.join(project, "plaindir"), exist_ok=True)
+    nonstaged_silent = engine({"root": project, "action": "inspect", "isolate": True, "operationId": "proof-silent",
+                               "target": {"relativePath": "plaindir", "type": "directory",
+                                          "destination": "clean_dir/" + "job-" + "cd" * 24 + "/plaindir"}})
+    userReleaseInspectProof = (nonstaged_silent.get("ok") is True and nonstaged_silent.get("backgroundIsolatedDelete") == 1
+                               and "userConfirmedSlotRelease" not in nonstaged_silent)  # non-staged stays silent
+    # Land a real staged slot in the main project tree and prove the POSITIVE answer end to end.
+    land(GEN_B1, payload_bytes("PF"), root=project, identity=KEY_B)
+    proof_slot_rel = STAGING + "/d-" + KEY_B[:24] + "/0"
+    proof_answer = engine({"root": project, "action": "inspect", "isolate": True, "operationId": "proof-answer",
+                           "target": {"relativePath": proof_slot_rel, "type": "directory",
+                                      "destination": "clean_dir/" + "job-" + "ef" * 24 + "/" + proof_slot_rel}})
+    userReleaseInspectAnswers = proof_answer.get("userConfirmedSlotRelease") == 1
+    assert (userReleaseYoungAccepted and userReleaseAbsentStillRefused and userReleaseTrueStillRefused
+            and userReleaseModeNotBooleanRefused and userReleaseGenerationSwapRefused
+            and userReleaseNonTerminalRefused and userReleaseFreshCommitRefused
+            and userReleaseMalformedTimeRefused and userReleaseFutureTimeRefused
+            and userReleaseCreatedContradictionRefused and userReleaseJournalRemovedRefused
+            and userReleaseJournalRemovedDefaultRefused and userReleaseJournalCorruptRefused
+            and userReleaseJournalCorruptDefaultRefused and userReleaseJournalNonObjectRefused
+            and userReleaseJournalNonObjectDefaultRefused
+            and userReleaseInspectProof and userReleaseInspectAnswers), {
+            "young": release_iso, "absent": userReleaseAbsentStillRefused, "true": userReleaseTrueStillRefused,
+            "shape": mode_shape_isolate, "gswap": userReleaseGenerationSwapRefused,
+            "nonterminal": userReleaseNonTerminalRefused, "fresh": userReleaseFreshCommitRefused,
+            "nullupdate": userReleaseMalformedTimeRefused, "future": userReleaseFutureTimeRefused,
+            "contradict": userReleaseCreatedContradictionRefused, "nojournal": userReleaseJournalRemovedRefused,
+            "silent": userReleaseInspectProof, "answer": proof_answer}
+    print(json.dumps({"ok": True, "userRelease": {"userReleaseYoungAccepted": userReleaseYoungAccepted, "userReleaseAbsentStillRefused": userReleaseAbsentStillRefused, "userReleaseTrueStillRefused": userReleaseTrueStillRefused, "userReleaseModeNotBooleanRefused": userReleaseModeNotBooleanRefused, "userReleaseGenerationSwapRefused": userReleaseGenerationSwapRefused, "userReleaseNonTerminalRefused": userReleaseNonTerminalRefused, "userReleaseFreshCommitRefused": userReleaseFreshCommitRefused, "userReleaseMalformedTimeRefused": userReleaseMalformedTimeRefused, "userReleaseFutureTimeRefused": userReleaseFutureTimeRefused, "userReleaseCreatedContradictionRefused": userReleaseCreatedContradictionRefused, "userReleaseJournalRemovedRefused": userReleaseJournalRemovedRefused, "userReleaseJournalRemovedDefaultRefused": userReleaseJournalRemovedDefaultRefused, "userReleaseJournalCorruptRefused": userReleaseJournalCorruptRefused, "userReleaseJournalCorruptDefaultRefused": userReleaseJournalCorruptDefaultRefused, "userReleaseJournalNonObjectRefused": userReleaseJournalNonObjectRefused, "userReleaseJournalNonObjectDefaultRefused": userReleaseJournalNonObjectDefaultRefused, "userReleaseInspectProof": userReleaseInspectProof, "userReleaseInspectAnswers": userReleaseInspectAnswers}}))
+    raise SystemExit
+
 KEY_X = identity_key("55")
 GEN_X1, GEN_X2, GEN_X3, GEN_X4 = "f1" * 32, "f2" * 32, "f3" * 32, "f4" * 32
 exp_root = os.path.join(project, "expcase")
@@ -384,6 +540,7 @@ terminalAtWritten = all((slot_generation(slot).get("terminalAt") or 0) > 0
                         for slot in ("0", "1"))
 assert terminalAtWritten, (slot_generation("0"), slot_generation("1"))
 
+mark("journal-lifecycle")
 # --- journal terminalAt lifecycle: enter committed writes it, terminal rewrites carry it,
 # --- any non-terminal rewrite drops it, a fresh re-commit stamps a new terminal moment.
 jcase = os.path.join(project, "jcase")
@@ -400,9 +557,6 @@ assert "terminalAt" not in recv.read_journal(journal_fd), "a resumed (non-termin
 os.close(journal_fd)
 journalTerminalAtCarried = True
 
-EXPIRY_MS = 86400000
-
-
 def set_times(identity, slot, created_ago, terminal_ago):
     # Age a slot explicitly on BOTH clocks: eviction orders by createdAt ascending and the expiry
     # verdict reads the terminalAt basis, so a scenario must state both or the edited row silently
@@ -417,16 +571,6 @@ def set_terminal(identity, slot, seconds_ago):
     # because a terminalAt older than createdAt IS the ruled clock contradiction that must stay
     # protected — pinning an aged slot to a fresh createdAt would test the guard, not expiry.
     set_times(identity, slot, seconds_ago + 60, seconds_ago)
-
-
-def edited_leaving(report):
-    # Locate the EDITED slot by its slot path, never by list index: the window evicts the row with
-    # the OLDEST createdAt, so every protection scenario below must first prove that edited slot IS
-    # still that single leaving candidate — otherwise its assertion would silently guard another
-    # (healthy) row. The path suffix check simultaneously pins the ruled eviction-order semantics.
-    rows = [row for row in report["stale"] if row["path"].endswith("/0")]
-    assert len(report["stale"]) == 1 and len(rows) == 1, report["stale"]
-    return rows[0]
 
 
 set_terminal(KEY_X, "0", 172800)  # two days old, slot 1 stays fresh
@@ -572,6 +716,7 @@ corruptProtected = (corrupt_report["stale"] == []
                             for row in corrupt_report["held"]))
 assert corruptProtected, corrupt_report
 
+mark("slot-lock")
 # --- isolation-moment slot lock: while a claim holds the flock, BOTH the read-only report and
 # --- the engine isolate refuse; after release the isolate lands and the freed slot re-admits.
 KEY_L = identity_key("77")
@@ -615,18 +760,12 @@ claimAfterIsolate = call({"mode": "chunkStatus", "root": lock_root, "identity": 
 claimAdmitted = claimAfterIsolate.returncode == 0 and json.loads(claimAfterIsolate.stdout)["offset"] == 0
 assert isolateAfterRelease and claimAdmitted, (released_isolate, claimAfterIsolate.stderr[-400:])
 
+mark("p13-binding")
 # --- P1-3 ruling: the reclaim authorization binds to the journal, not the path, and the engine
 # --- re-proves identity/generation/committed-status/terminal-moment/age UNDER the held slot lock
 # --- before the rename. Same-generation resume, regeneration or fresh re-commit between report
 # --- and isolate must each refuse and leave the slot untouched; the untouched expired slot still
 # --- isolates (the gate is not a blanket denial).
-KEY_B, GEN_B1, GEN_B2 = identity_key("bb"), "a8" * 32, "b8" * 32
-
-
-def resume_checkpoint(row):
-    row["status"] = "preparing"
-    row["entries"] = []
-    row.pop("terminalAt", None)
 
 
 def reclaim_binding_case(name, mutate_before_isolate, binding_terminal="keep", reage_manifest=False):
@@ -686,119 +825,6 @@ assert (reclaimBindingNonTerminalRefused and reclaimBindingGenerationChangedRefu
                                                      reclaimBindingCreatedAfterTerminalRefused,
                                                      reclaimBindingLegacyNullUpdateRefused)
 
-# --- 0.2.114: a user-CONFIRMED early release must actually succeed under the same under-lock
-# --- recheck, and NOTHING else may loosen. A committed slot one minute past its terminal moment
-# --- is exactly the manual-button case: the receiver itself says "not expired", so only the
-# --- requireExpired:false mode (frozen by preview from the user's own confirmation) can pass —
-# --- and it passes while every remaining rule still denies. Success/refusal is asserted against
-# --- the REAL filesystem: the source slot directory is really gone, the isolated copy really
-# --- exists — never a simulated boolean standing in for directory state.
-def user_release_case(name, require_expired=False, mutate=None, future_terminal=False, remove_journal=False,
-                      journal_bytes=None):
-    case_root = os.path.join(project, "released-" + name)
-    os.makedirs(case_root)
-    land(GEN_B1, payload_bytes("R1"), root=case_root, identity=KEY_B)
-    land(GEN_B2, payload_bytes("R2"), root=case_root, identity=KEY_B)
-    committed_at = int(time.time()) - 60  # YOUNG: a full day minus a minute to go
-    edit_journal(case_root, KEY_B, "0", lambda row: row.update(
-        createdAt=(committed_at - 60) * 1_000_000_000,
-        terminalAt=committed_at + 3600 if future_terminal else committed_at))
-    # The receiver itself must call this slot NOT expired BEFORE any tampering: only the user-
-    # confirmed mode can ever unlock it (asserted pre-mutation, like the binding race cases).
-    assert edited_leaving(recv.stale_report(case_root, KEY_B, "c8" * 32, EXPIRY_MS))["expiredCommitted"] is False, name
-    journal_path = os.path.join(case_root, STAGING, "d-" + KEY_B[:24], "0", "manifest.json")
-    if remove_journal:
-        os.remove(journal_path)
-    elif journal_bytes is not None:
-        with open(journal_path, "wb") as handle:
-            handle.write(journal_bytes)
-    if mutate is not None:
-        edit_journal(case_root, KEY_B, "0", mutate)
-    slot_rel = STAGING + "/d-" + KEY_B[:24] + "/0"
-    batch = "job-" + hashlib.sha256(("released-" + name).encode("utf-8")).hexdigest()[:48]
-    binding = {"identity": KEY_B, "generation": GEN_B1, "status": "committed",
-               "terminalAt": committed_at + 3600 if future_terminal else committed_at, "expiryMs": EXPIRY_MS}
-    if require_expired is not None:
-        binding["requireExpired"] = require_expired
-    isolate = engine({"root": case_root, "action": "isolate", "operationId": "released-" + name,
-                      "target": {"relativePath": slot_rel, "type": "directory", "archiveBatch": batch,
-                                 "destination": "clean_dir/" + batch + "/" + slot_rel},
-                      "stagedJournal": binding})
-    return isolate, os.path.join(case_root, STAGING, "d-" + KEY_B[:24], "0"), \
-        os.path.join(case_root, "clean_dir", batch, slot_rel)
-
-
-def user_release_refused(name, accepted_codes=("STAGED_JOURNAL_MISMATCH",), **kwargs):
-    isolate, slot_dir, _ = user_release_case(name, **kwargs)
-    return (isolate["ok"] is False and isolate["error"]["code"] in accepted_codes
-            and os.path.exists(slot_dir))
-
-
-release_iso, release_slot_dir, release_dest = user_release_case("young")
-userReleaseYoungAccepted = (release_iso["ok"] is True
-                            and not os.path.exists(release_slot_dir)      # source slot really gone
-                            and os.path.isfile(os.path.join(release_dest, "manifest.json")))  # copy really exists
-# 0.2.113 defaults stay byte-for-byte: absent or true keeps the age rule, young slot refused.
-userReleaseAbsentStillRefused = user_release_refused("youngabsent", require_expired=None)
-userReleaseTrueStillRefused = user_release_refused("youngtrue", require_expired=True)
-# A truthy stand-in is not the mode: the engine shape-check denies before anything else.
-mode_shape_isolate, mode_shape_dir, _ = user_release_case("youngstring", require_expired="false")
-userReleaseModeNotBooleanRefused = (mode_shape_isolate["ok"] is False
-                                    and mode_shape_isolate["error"]["code"] == "INVALID_STAGED_JOURNAL_BINDING"
-                                    and os.path.exists(mode_shape_dir))
-# With the mode set, EVERY other under-lock rule still denies on a genuinely mutated journal.
-userReleaseGenerationSwapRefused = user_release_refused("gswap", mutate=lambda row: row.update(generation="f8" * 32))
-userReleaseNonTerminalRefused = user_release_refused("nonterminal", mutate=resume_checkpoint)
-userReleaseFreshCommitRefused = user_release_refused("fresh", mutate=lambda row: row.update(terminalAt=int(time.time())))
-userReleaseMalformedTimeRefused = user_release_refused("nullupdate", mutate=lambda row: row.update(updatedAt=None))
-userReleaseFutureTimeRefused = user_release_refused("future", future_terminal=True)  # binding carries the SAME future moment
-userReleaseCreatedContradictionRefused = user_release_refused(
-    "contradict", mutate=lambda row: row.update(createdAt=(int(time.time()) + 3600) * 1_000_000_000))
-# --- G2 RED round定性: a REMOVED journal was always refused — path_guard's own MISSING_TARGET
-# --- gate (cleanup-files.py:177-179, called at :1110 BEFORE the binding recheck and the rename)
-# --- denies fail-closed; only the old fixture key wrongly demanded STAGED_JOURNAL_MISMATCH and
-# --- scored a legitimate refusal as a failure. Both fail-closed codes are accepted here and the
-# --- untouched-slot assertion stays: the "missing ledger must refuse" protection is unchanged.
-userReleaseJournalRemovedRefused = user_release_refused("nojournal", remove_journal=True,
-                                                        accepted_codes=("MISSING_TARGET", "STAGED_JOURNAL_MISMATCH"))
-# Journal missing / corrupt / non-object must refuse under BOTH modes, on the real files.
-userReleaseJournalRemovedDefaultRefused = user_release_refused("nojournal-default", require_expired=None, remove_journal=True,
-                                                               accepted_codes=("MISSING_TARGET", "STAGED_JOURNAL_MISMATCH"))
-userReleaseJournalCorruptRefused = user_release_refused("journal-corrupt", journal_bytes=b"{not-json")
-userReleaseJournalCorruptDefaultRefused = user_release_refused("journal-corrupt-default", require_expired=None, journal_bytes=b"{not-json")
-userReleaseJournalNonObjectRefused = user_release_refused("journal-array", journal_bytes=b"[7]")
-userReleaseJournalNonObjectDefaultRefused = user_release_refused("journal-array-default", require_expired=None, journal_bytes=b"[7]")
-# --- capability truth at the engine door: staged-slot isolate inspects answer the mode;
-# --- non-staged targets (and therefore every older engine) stay silent.
-os.makedirs(os.path.join(project, "plaindir"), exist_ok=True)
-nonstaged_silent = engine({"root": project, "action": "inspect", "isolate": True, "operationId": "proof-silent",
-                           "target": {"relativePath": "plaindir", "type": "directory",
-                                      "destination": "clean_dir/" + "job-" + "cd" * 24 + "/plaindir"}})
-userReleaseInspectProof = (nonstaged_silent.get("ok") is True and nonstaged_silent.get("backgroundIsolatedDelete") == 1
-                           and "userConfirmedSlotRelease" not in nonstaged_silent)  # non-staged stays silent
-# Land a real staged slot in the main project tree and prove the POSITIVE answer end to end.
-land(GEN_B1, payload_bytes("PF"), root=project, identity=KEY_B)
-proof_slot_rel = STAGING + "/d-" + KEY_B[:24] + "/0"
-proof_answer = engine({"root": project, "action": "inspect", "isolate": True, "operationId": "proof-answer",
-                       "target": {"relativePath": proof_slot_rel, "type": "directory",
-                                  "destination": "clean_dir/" + "job-" + "ef" * 24 + "/" + proof_slot_rel}})
-userReleaseInspectAnswers = proof_answer.get("userConfirmedSlotRelease") == 1
-assert (userReleaseYoungAccepted and userReleaseAbsentStillRefused and userReleaseTrueStillRefused
-        and userReleaseModeNotBooleanRefused and userReleaseGenerationSwapRefused
-        and userReleaseNonTerminalRefused and userReleaseFreshCommitRefused
-        and userReleaseMalformedTimeRefused and userReleaseFutureTimeRefused
-        and userReleaseCreatedContradictionRefused and userReleaseJournalRemovedRefused
-        and userReleaseJournalRemovedDefaultRefused and userReleaseJournalCorruptRefused
-        and userReleaseJournalCorruptDefaultRefused and userReleaseJournalNonObjectRefused
-        and userReleaseJournalNonObjectDefaultRefused
-        and userReleaseInspectProof and userReleaseInspectAnswers), {
-        "young": release_iso, "absent": userReleaseAbsentStillRefused, "true": userReleaseTrueStillRefused,
-        "shape": mode_shape_isolate, "gswap": userReleaseGenerationSwapRefused,
-        "nonterminal": userReleaseNonTerminalRefused, "fresh": userReleaseFreshCommitRefused,
-        "nullupdate": userReleaseMalformedTimeRefused, "future": userReleaseFutureTimeRefused,
-        "contradict": userReleaseCreatedContradictionRefused, "nojournal": userReleaseJournalRemovedRefused,
-        "silent": userReleaseInspectProof, "answer": proof_answer}
-
 print(json.dumps({"ok": True, "pendingBlocked": True, "leaving": leaving, "thirdGenerationLanded": True,
                   "hardlinkPublication": {"tarPublished": True, "pendingAliasPreserved": True,
                                           "chunkPublished": True, "normalTargetPublished": True,
@@ -829,24 +855,6 @@ print(json.dumps({"ok": True, "pendingBlocked": True, "leaving": leaving, "third
                                     "reclaimBindingCreatedAfterTerminalRefused": reclaimBindingCreatedAfterTerminalRefused,
                                     "reclaimBindingLegacyNullUpdateRefused": reclaimBindingLegacyNullUpdateRefused,
                                     "reclaimBindingUnchangedAccepted": reclaimBindingUnchangedAccepted,
-                                    "userReleaseYoungAccepted": userReleaseYoungAccepted,
-                                    "userReleaseAbsentStillRefused": userReleaseAbsentStillRefused,
-                                    "userReleaseTrueStillRefused": userReleaseTrueStillRefused,
-                                    "userReleaseModeNotBooleanRefused": userReleaseModeNotBooleanRefused,
-                                    "userReleaseGenerationSwapRefused": userReleaseGenerationSwapRefused,
-                                    "userReleaseNonTerminalRefused": userReleaseNonTerminalRefused,
-                                    "userReleaseFreshCommitRefused": userReleaseFreshCommitRefused,
-                                    "userReleaseMalformedTimeRefused": userReleaseMalformedTimeRefused,
-                                    "userReleaseFutureTimeRefused": userReleaseFutureTimeRefused,
-                                    "userReleaseCreatedContradictionRefused": userReleaseCreatedContradictionRefused,
-                                    "userReleaseJournalRemovedRefused": userReleaseJournalRemovedRefused,
-                                    "userReleaseJournalRemovedDefaultRefused": userReleaseJournalRemovedDefaultRefused,
-                                    "userReleaseJournalCorruptRefused": userReleaseJournalCorruptRefused,
-                                    "userReleaseJournalCorruptDefaultRefused": userReleaseJournalCorruptDefaultRefused,
-                                    "userReleaseJournalNonObjectRefused": userReleaseJournalNonObjectRefused,
-                                    "userReleaseJournalNonObjectDefaultRefused": userReleaseJournalNonObjectDefaultRefused,
-                                    "userReleaseInspectProof": userReleaseInspectProof,
-                                    "userReleaseInspectAnswers": userReleaseInspectAnswers,
                                     "slotLockHeldBlocksIsolate": slotLockHeldBlocksIsolate,
                                     "isolateAfterRelease": isolateAfterRelease,
                                     "claimAdmitted": claimAdmitted}}))
