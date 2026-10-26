@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.112
+
+- 修复：托管观察链（managed_tmux/filesystem 隔离）的完成结论此前只随应答返回、从不写入磁盘台账，导致台账永远停留在“执行中”，后台维护删除按持久状态判 NOT_ISOLATED_COMPLETE 而永不放行。现在 status/execute/check 观察到“完成”证明时先持久化再返回：completed 只能由完成证明推进，证据缺失或降级绝不擦除已落盘的 completed；对既有读者（SE、状态界面、status 返回结构）形状逐字不变。多目标 token 的“存在未完成目标整批不删”保护原样保留，:1163 判据与 isolatedMaintenanceDelete 未改动。
+- 测试：batchDeleteApi 新增 r108 四用例——status 一轮后重读台账必须为 completed 且后台删除放行；execute/check 复检已提交的改名即刻持久化、绝不重发；姊妹目标未完成时整批拒删且零变更。
+
 ## 0.2.111
 
 - 隔离热路径只保留一次写前实时检查：改名前不再完整重读同一批固定清单名，改名后不再复查隔离副本顶层身份。完成依据如实表述为“原子不覆盖 rename 成功 + 移动当时源缺失确认 + 登记成功 + 持久完成回执”，回执不声称隔离副本内容被重新核验。唯一一次 renameat2(RENAME_NOREPLACE)（macOS renamex_np / Windows 无 REPLACE 移动）保持不变，跨设备与缺原语一律明确失败，绝不降级复制。
