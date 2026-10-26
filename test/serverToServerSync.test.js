@@ -37,7 +37,20 @@ test('delta stream transfers changed content only and reports compared versus ch
   let dispatched, transferred = false;
   const updates = [];
   const controller = { id: 'one', updateProgress(row) { updates.push(row); } };
+  // r118 closure: the extracted core now also consults the claim-scoped expiry reclaim wiring.
+  // The fixture pins the REAL closure dependencies with deterministic stand-ins: pure scope from
+  // the module itself, fixed lane identities, and reclaim/attach probes that record every call so
+  // a silent skip or a spurious invocation is visible (this scenario never hits a pending error).
+  const reclaimCalls = [], stageBlockAttempts = [];
   const sandbox = { Date, String, Number, Set, Map, Array, Object, Math, Error,
+    vscode: { workspace: { workspaceFolders: [] } },
+    stagedScope: __test.stagedScope, stagedLogicalKey: () => 'e'.repeat(64),
+    stagedSlotExpirySettings: () => ({ enabled: true, expiryMs: 86400000 }),
+    reclaimExpiredStagedSlots: async ({ lane, identity, generation }) => {
+      reclaimCalls.push({ lane, identity, generation });
+      return { attempted: false, outcome: 'not-accepted', reason: 'no-consumer-root', lane }; // mirrors the production skip for a fixture without a consuming project
+    },
+    attachStagedStageBlock: async () => { stageBlockAttempts.push(1); },
     requestedTransferCompression: () => 'none', directSyncTarget: value => value, directSyncRelativePath: value => value,
     transferTimeoutMs: () => 120000, transferContext: { getStore: () => controller },
     selectTransferCompression: async () => ({ compression: 'none' }), FPSYNC_PARALLEL_STREAMS: 2, FPSYNC_MAX_BATCH_BYTES: 512 * 1024 * 1024,
@@ -73,6 +86,11 @@ test('delta stream transfers changed content only and reports compared versus ch
     relativePaths: paths }, { report() {} });
   assert.equal(dispatched.length,0); assert.equal(repeated.transferredFiles,0);
   assert.equal(repeated.unchangedFiles,6); assert.equal(repeated.missingFiles,0); assert.equal(repeated.differentFiles,0);
+  // The reclaim wiring ran exactly once per fixed lane before the planned transfer, with this
+  // run's generation, and again never for the all-identical repeat; the stage-block attach is
+  // never touched by this error-free scenario.
+  assert.deepEqual(reclaimCalls, [{ lane: 0, identity: 'e'.repeat(64), generation: 'one' }, { lane: 1, identity: 'e'.repeat(64), generation: 'one' }]);
+  assert.deepEqual(stageBlockAttempts, []);
 });
 
 test("direct rsync scopes delete to one Plan directory", () => {

@@ -169,8 +169,15 @@ test("r118 reclaim authorizations are recorded explicitly, isolate-only, and rid
     error => error.code === "INVALID_AUTHORIZATION_SOURCE");
   await assert.rejects(api.preview({ ...base, authorizationSource: "auto_delete_please" }),
     error => error.code === "INVALID_AUTHORIZATION_SOURCE");
-  // Ownership rules are unchanged: the recorded row lives only under the consuming project…
+  // files.cleanup.preview keeps its promised {readOnly:true, zeroWrites:true}: an authorization
+  // never persists on its own — only the confirmation writes the owning project's ledger.
+  assert.equal(fs.existsSync(projectFile(ROOT_A, auto.token)), false);
+  assert.equal(fs.existsSync(projectFile(ROOT_A, single.token)), false);
+  await api.confirm({ token: auto.token, digest: auto.digest, confirm: true, phase: 1, consumerRoot: ROOT_A,
+    exactTargets: auto.targets.map(row => row.absolutePath) });
+  // Ownership rules are unchanged: once confirmed, the recorded row lives only under the consuming project…
   assert.ok(fs.existsSync(projectFile(ROOT_A, auto.token)));
+  assert.equal(fs.existsSync(projectFile(ROOT_B, auto.token)), false);
   const cold = mkApi(api.storageRoot);
   assert.equal((await cold.read(auto.token, ROOT_A)).reclaimAuthorizationSource, "auto_expiry_reclaim");
   // …and the marker is ownership metadata: the frozen digest preimage (node/rootIdentity/action/

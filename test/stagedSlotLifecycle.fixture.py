@@ -296,7 +296,12 @@ EXPIRY_MS = 86400000
 
 
 def set_terminal(identity, slot, seconds_ago):
-    edit_journal(exp_root, identity, slot, lambda row: row.update(terminalAt=int(time.time()) - seconds_ago))
+    # A REAL aged generation: createdAt and terminalAt roll back together with terminalAt >= createdAt,
+    # because a terminalAt older than createdAt IS the ruled clock contradiction that must stay
+    # protected — pinning an aged slot to a fresh createdAt would test the guard, not expiry.
+    moment = int(time.time()) - seconds_ago
+    edit_journal(exp_root, identity, slot, lambda row: row.update(
+        terminalAt=moment, createdAt=(moment - 60) * 1_000_000_000))
 
 
 set_terminal(KEY_X, "0", 172800)  # two days old, slot 1 stays fresh
