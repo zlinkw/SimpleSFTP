@@ -52,3 +52,29 @@ test('real executor keeps canonical-parent/type/link/content guards while ignori
   const proc=spawnSync(process.platform==='win32'?'wsl.exe':'python3',args,{encoding:'utf8',timeout:10000,windowsHide:true});
   assert.equal(proc.status,0,proc.stderr||proc.stdout);assert.deepEqual(JSON.parse(proc.stdout),{ok:true,exactPathDeleted:true,guardsRetained:true});
 });
+test('维护后台删除入口不改写通用两次确认链：永久删除 token 被拒、阶段语义原样保留',async()=>{
+  let mutations=0;
+  const JOBREL='clean_dir/job-'+'a'.repeat(48)+'/output/job';
+  const api=new CleanupFileApi({storageRoot:path.join(os.tmpdir(),'confirmed-maint-'+Date.now()),
+    activity:async()=>({}), lease:async(_node,_targets,run)=>run(),
+    transport:async request=>{
+      if(request.action==='batch-inspect')return {ok:true,rootIdentity:{path:'/fixture'},capabilities:{confirmedPathFastDelete:1,batchEntryInspect:1},
+        metrics:{entryReads:request.targets.length},targets:request.targets.map(t=>({relativePath:t.relativePath,type:t.type,absolutePath:'/fixture/'+t.relativePath,device:'7',inode:'9'}))};
+      if(request.action==='delete-fast'){mutations++;return {ok:true,receipt:{metrics:{},receipts:request.entries.map(e=>({relativePath:e.relativePath,mode:'removed'}))}};}
+      if(request.action==='batch-verify')return {ok:true,rootIdentity:{path:'/fixture'},targets:request.entries.map(e=>({...e,status:'gone'}))};
+      assert.fail(request.action);
+    }});
+  const p=await api.preview({consumerRoot:__CONSUMER__,node:{kind:'local',root:'/fixture'},action:'delete',authorizationMode:'confirmed_paths',
+    targets:[{relativePath:JOBREL,type:'directory',destination:JOBREL}]});
+  await assert.rejects(api.isolatedMaintenanceDelete({token:p.token,digest:p.digest}),error => error.code === 'NOT_ISOLATION_TOKEN',
+    '通用永久删除 token 拿不到维护通道：两次确认人工链是它唯一的入口');
+  await assert.rejects(api.execute({consumerRoot:__CONSUMER__,token:p.token,digest:p.digest,index:0}),error => error.code === 'CONFIRM_REQUIRED');
+  await api.confirm({consumerRoot:__CONSUMER__,token:p.token,digest:p.digest,phase:1,confirm:true,exactTargets:['/fixture/'+JOBREL]});
+  await assert.rejects(api.execute({consumerRoot:__CONSUMER__,token:p.token,digest:p.digest,index:0}),error => error.code === 'CONFIRM_REQUIRED',
+    '只完成一次确认仍不得执行永久删除——新入口没有放松既有确认语义');
+  assert.equal(mutations,0,'维护入口与确认链的拒绝都发生在任何 mutation 之前');
+  // 登记形状之外的目的地无法借维护通道进入：派生集合逐条等值检查在 API 层先行拒绝。
+  const forged=await api.preview({consumerRoot:__CONSUMER__,node:{kind:'local',root:'/fixture'},action:'delete',authorizationMode:'confirmed_paths',
+    targets:[{relativePath:JOBREL,type:'directory',destination:'clean_dir/job-'+'a'.repeat(48)+'/output/other'}]}).then(()=>null,error=>error);
+  assert.match(String(forged&&forged.code),/UNSAFE_DESTINATION/,'destination 与 relativePath 不逐条等值的永久删除预览仍被拒');
+});

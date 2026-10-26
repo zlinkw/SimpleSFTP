@@ -54,6 +54,9 @@ function harness(options={}){
           capabilities:{batchCleanupObservation:1,maxTargets:5000},observations:rows,metrics:{}};
       } finally{ stats.active--; stats.per[round] -= 1; }
     }
+    if(request.action==='inspect')
+      return {ok:true,rootIdentity:IDENTITY,target:{type:request.target.type,absolutePath:'/srv/proj/'+request.target.relativePath,
+        fingerprint:'top-'+request.target.relativePath,device:'7',inode:'2'+request.target.relativePath,fingerprintMode:'top_level',inventory:[]}};
     throw Object.assign(Error('UNEXPECTED_ACTION'),{code:'UNEXPECTED_ACTION'});
   };
   const storageRoot=fs.mkdtempSync(path.join(os.tmpdir(),'observe-batch-'));
@@ -212,7 +215,9 @@ test('missing, duplicated, reordered and failed answers stay explicit unknowns a
   const res3=await observe(failed.api,residue(3000)); // expanded 6000 -> [5000,1000], second batch dies
   assert.equal(res3.observations.filter(o=>o.error&&o.error.code==='OBSERVE_ROUND_FAILED').length,500);
   assert.equal(res3.observations.filter(o=>o.status==='present').length,2500,'the surviving batch keeps its facts');
-  assert.ok(res3.observations.every(o=>o.state===undefined&&o.status!=='gone'),'a failed batch never writes anything off');
+  // 0.2.111 契约变更（经裁决）：非应答行由隐式缺字段改为显式 state:'unknown'（unknown≠完成）；
+  // 无台账行的存活应答仍按 :92「no token means no claimed state」不声明 state。
+  assert.ok(res3.observations.every(o=>((o.error&&o.error.code==='OBSERVE_ROUND_FAILED')?o.state==='unknown':o.state===undefined)&&o.status!=='gone'),'a failed batch never writes anything off');
 
   const drift=harness({identityDrift:true});
   const res4=await observe(drift.api,residue(2));
@@ -444,6 +449,69 @@ test('malformed observation requests are refused before anything touches the wir
   ];
   for(const params of bad)await assert.rejects(api.observeBatch(params),/INVALID_REQUEST|PROTECTED_PATH|UNSAFE_DESTINATION/);
   assert.equal(calls.filter(c=>c.action==='batch-observe').length,0);
+});
+test('an isolate token observed through its registered destination answers the deletion lifecycle honestly',async()=>{
+  // 0.2.111: the background delete registers row.isolatedDelete; observation of
+  // the REGISTERED destination path is then bound by the frozen ledger row.
+  // Completion needs BOTH facts: the ledger lifecycle completed AND the absent
+  // destination. Accepted/executing/unknown + gone never complete; anything
+  // else is an explicit unknown; the SOURCE-path derivation stays untouched.
+  const BATCH='job-'+'a'.repeat(48),dest=JOB+'/out/run1';
+  async function isolateRow(options){
+    const h=harness(options);
+    const row=await h.api.preview({consumerRoot: __CONSUMER__, node:NODE,action:'isolate',
+      targets:[{relativePath:'out/run1',type:'directory',archiveBatch:BATCH,destination:dest}]});
+    await h.api.confirm({consumerRoot: __CONSUMER__, token:row.token,digest:row.digest,confirm:true,phase:1,exactTargets:['/srv/proj/out/run1']});
+    const stored=await h.api.read(row.token, __CONSUMER__);
+    stored.states[0]='completed';
+    stored.receipts={[0]:{phase:'completed',isolationCompletionProtocol:1,renameCommitted:true,sourceMissingAtMove:true,registered:true,executorsChecked:true,executors:[]}};
+    await h.api.save(stored);
+    return {h,row,async phase(phase){const s=await h.api.read(row.token, __CONSUMER__);
+      if(phase===undefined)delete s.isolatedDelete;
+      else s.isolatedDelete={capability:'isolationBackgroundDelete',protocol:1,phase,operationId:s.operationId,
+        targets:[{destinationRelativePath:dest,type:'directory'}]};
+      await h.api.save(s);}};
+  }
+  const destTarget=token=>[{key:'g',relativePath:dest,type:'directory',backendToken:token,backendIndex:0}];
+  const sourceTarget=token=>[{key:'s',relativePath:'out/run1',type:'directory',backendToken:token,backendIndex:0}];
+  const statusOf=st=>e=>({key:e.key,status:st,
+    target:{missing:st==='gone',type:e.type,absolutePath:'/srv/proj/'+e.relativePath,device:'7',inode:'9'+e.relativePath},
+    executors:[],executorsChecked:true});
+  const t0=await isolateRow({observe:statusOf('gone')});
+  let res=await observe(t0.h.api,destTarget(t0.row.token));
+  assert.equal(res.observations[0].error.code,'TOKEN_TARGET_MISMATCH','before maintenance starts the token binds the source path only');
+  assert.equal(res.observations[0].state,'unknown');
+  await t0.phase('accepted');
+  res=await observe(t0.h.api,destTarget(t0.row.token));
+  assert.equal(res.observations[0].state,'unknown','an accepted delete with an absent destination is never worded completed');
+  await t0.phase('executing');
+  res=await observe(t0.h.api,destTarget(t0.row.token));
+  assert.equal(res.observations[0].state,'unknown','executing + gone stays unknown: the mutation answer may have been lost');
+  await t0.phase('completed');
+  res=await observe(t0.h.api,destTarget(t0.row.token));
+  assert.equal(res.observations[0].state,'completed','completion needs the ledger phase AND the absent destination together');
+  const t1=await isolateRow({observe:statusOf('present')});
+  await t1.phase('completed');
+  res=await observe(t1.h.api,destTarget(t1.row.token));
+  assert.equal(res.observations[0].state,'unknown','a destination standing again contradicts the ledger: unknown, never a new grant');
+  const t2=await isolateRow({observe:statusOf('present')});
+  await t2.phase('executing');
+  res=await observe(t2.h.api,destTarget(t2.row.token));
+  assert.equal(res.observations[0].state,'executing');
+  await t2.phase('accepted');
+  res=await observe(t2.h.api,destTarget(t2.row.token));
+  assert.equal(res.observations[0].state,'pending');
+  const t3=await isolateRow({observe:statusOf('gone'),dropRow:r=>r.key==='g'});
+  await t3.phase('completed');
+  res=await observe(t3.h.api,destTarget(t3.row.token));
+  assert.equal(res.observations[0].error.code,'ANSWER_MISSING');assert.equal(res.observations[0].state,'unknown','a missing answer never completes');
+  const t4=await isolateRow({observe:statusOf('present')});
+  const before=await observe(t4.h.api,sourceTarget(t4.row.token));
+  await t4.phase('executing');
+  const after=await observe(t4.h.api,sourceTarget(t4.row.token));
+  assert.equal(after.observations[0].state,before.observations[0].state,'the delete lifecycle never leaks into source-path derivation');
+  assert.ok(t3.h.calls.every(c=>['inspect','batch-inspect','batch-observe'].includes(c.action)),
+    'destination rows ride the shared read-only batch-observe round; no mutation action ever leaves this entry');
 });
 test('engine batch_observe answers from current facts with one shared sweep and zero mutation primitives (FakeOS fixture)',()=>{
   const fixture=path.resolve(__dirname,'cleanupObserveBatch.fixture.py'),engine=path.resolve(__dirname,'../cleanup-files.py');
