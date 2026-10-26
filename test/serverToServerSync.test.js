@@ -42,12 +42,18 @@ test('delta stream transfers changed content only and reports compared versus ch
   // the module itself, fixed lane identities, and reclaim/attach probes that record every call so
   // a silent skip or a spurious invocation is visible (this scenario never hits a pending error).
   const reclaimCalls = [], stageBlockAttempts = [];
+  // The production catch{} may swallow reclaim probe problems BY DESIGN — so the fixture must make
+  // "did the wiring actually run?" explicit: every sandbox identifier the reclaim call site
+  // evaluates (extension.js 2294-2303 argument set) is provided here, and the stub records that it
+  // received THE singleton cleanupFileApi object, not an undefined stand-in.
+  const cleanupFileApi = {};
   const sandbox = { Date, String, Number, Set, Map, Array, Object, Math, Error,
     vscode: { workspace: { workspaceFolders: [] } },
+    cleanupFileApi,
     stagedScope: __test.stagedScope, stagedLogicalKey: () => 'e'.repeat(64),
     stagedSlotExpirySettings: () => ({ enabled: true, expiryMs: 86400000 }),
-    reclaimExpiredStagedSlots: async ({ lane, identity, generation }) => {
-      reclaimCalls.push({ lane, identity, generation });
+    reclaimExpiredStagedSlots: async ({ lane, identity, generation, api }) => {
+      reclaimCalls.push({ lane, identity, generation, apiIsSingleton: api === cleanupFileApi });
       return { attempted: false, outcome: 'not-accepted', reason: 'no-consumer-root', lane }; // mirrors the production skip for a fixture without a consuming project
     },
     attachStagedStageBlock: async () => { stageBlockAttempts.push(1); },
@@ -89,7 +95,9 @@ test('delta stream transfers changed content only and reports compared versus ch
   // The reclaim wiring ran exactly once per fixed lane before the planned transfer, with this
   // run's generation, and again never for the all-identical repeat; the stage-block attach is
   // never touched by this error-free scenario.
-  assert.deepEqual(reclaimCalls, [{ lane: 0, identity: 'e'.repeat(64), generation: 'one' }, { lane: 1, identity: 'e'.repeat(64), generation: 'one' }]);
+  assert.deepEqual(reclaimCalls, [
+    { lane: 0, identity: 'e'.repeat(64), generation: 'one', apiIsSingleton: true },
+    { lane: 1, identity: 'e'.repeat(64), generation: 'one', apiIsSingleton: true }]);
   assert.deepEqual(stageBlockAttempts, []);
 });
 

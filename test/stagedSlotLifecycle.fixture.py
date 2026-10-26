@@ -295,13 +295,30 @@ journalTerminalAtCarried = True
 EXPIRY_MS = 86400000
 
 
+def set_times(identity, slot, created_ago, terminal_ago):
+    # Age a slot explicitly on BOTH clocks: eviction orders by createdAt ascending and the expiry
+    # verdict reads the terminalAt basis, so a scenario must state both or the edited row silently
+    # stops being the leaving candidate it claims to test.
+    now = int(time.time())
+    edit_journal(exp_root, identity, slot, lambda row: row.update(
+        createdAt=(now - created_ago) * 1_000_000_000, terminalAt=now - terminal_ago))
+
+
 def set_terminal(identity, slot, seconds_ago):
-    # A REAL aged generation: createdAt and terminalAt roll back together with terminalAt >= createdAt,
+    # A REAL aged generation: createdAt rolls back with terminalAt (terminalAt >= createdAt),
     # because a terminalAt older than createdAt IS the ruled clock contradiction that must stay
     # protected — pinning an aged slot to a fresh createdAt would test the guard, not expiry.
-    moment = int(time.time()) - seconds_ago
-    edit_journal(exp_root, identity, slot, lambda row: row.update(
-        terminalAt=moment, createdAt=(moment - 60) * 1_000_000_000))
+    set_times(identity, slot, seconds_ago + 60, seconds_ago)
+
+
+def edited_leaving(report):
+    # Locate the EDITED slot by its slot path, never by list index: the window evicts the row with
+    # the OLDEST createdAt, so every protection scenario below must first prove that edited slot IS
+    # still that single leaving candidate — otherwise its assertion would silently guard another
+    # (healthy) row. The path suffix check simultaneously pins the ruled eviction-order semantics.
+    rows = [row for row in report["stale"] if row["path"].endswith("/0")]
+    assert len(report["stale"]) == 1 and len(rows) == 1, report["stale"]
+    return rows[0]
 
 
 set_terminal(KEY_X, "0", 172800)  # two days old, slot 1 stays fresh
@@ -336,23 +353,29 @@ assert claimStillPending and structuredPendingFacts, blocked2.stderr[-600:]
 # exactly `expiry` old is expired (>=), one second younger is protected.
 set_terminal(KEY_X, "0", 86400)
 boundary_expired = recv.stale_report(exp_root, KEY_X, GEN_X4, EXPIRY_MS)
-boundaryAtLeastDay = bool(boundary_expired["stale"]) and boundary_expired["stale"][0]["expiredCommitted"] is True
+boundaryAtLeastDay = edited_leaving(boundary_expired)["expiredCommitted"] is True
 set_terminal(KEY_X, "0", 86399)
 boundary_young = recv.stale_report(exp_root, KEY_X, GEN_X4, EXPIRY_MS)
-boundaryJustBelow = not boundary_young["stale"][0]["expiredCommitted"] and boundary_young["stale"][0]["expiryReason"] == "within-threshold"
+boundary_row = edited_leaving(boundary_young)
+boundaryJustBelow = boundary_row["expiredCommitted"] is False and boundary_row["expiryReason"] == "within-threshold"
 assert boundaryAtLeastDay and boundaryJustBelow, (boundary_expired["stale"], boundary_young["stale"])
 
-# --- untrusted time NEVER expires: future stamps and clock contradictions stay protected.
-set_terminal(KEY_X, "0", -3600)  # one hour into the future
+# --- untrusted time NEVER expires: future stamps and clock contradictions stay protected ON THE
+# --- EDITED SLOT ITSELF. It therefore stays a genuine aged generation by createdAt (oldest =>
+# --- still the leaving candidate) while ONLY its terminalAt lies in the future: a future or
+# --- contradictory terminalAt must never promote an aged slot back into the retained window,
+# --- and the untrusted basis must never yield expiredCommitted.
+set_times(KEY_X, "0", 172860, -3600)  # aged slot, terminalAt one hour into the future
 future_report = recv.stale_report(exp_root, KEY_X, GEN_X4, EXPIRY_MS)
-futureProtected = (future_report["stale"][0]["expiredCommitted"] is False
-                   and future_report["stale"][0]["expiryReason"] == "time-future")
+future_row = edited_leaving(future_report)
+futureProtected = (future_row["expiredCommitted"] is False and future_row["expiryReason"] == "time-future")
 created_seconds = int(recv.read_journal(os.open(os.path.join(exp_root, STAGING, "d-" + KEY_X[:24], "0"),
                                                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))["createdAt"] // 1_000_000_000)
 edit_journal(exp_root, KEY_X, "0", lambda row: row.update(terminalAt=created_seconds - 10))
 contradiction_report = recv.stale_report(exp_root, KEY_X, GEN_X4, EXPIRY_MS)
-contradictionProtected = (contradiction_report["stale"][0]["expiredCommitted"] is False
-                          and contradiction_report["stale"][0]["expiryReason"] == "time-contradiction")
+contradiction_row = edited_leaving(contradiction_report)
+contradictionProtected = (contradiction_row["expiredCommitted"] is False
+                          and contradiction_row["expiryReason"] == "time-contradiction")
 assert futureProtected and contradictionProtected, (future_report["stale"], contradiction_report["stale"])
 
 # --- manifest-mtime fallback ONLY for a valid journal with no usable timestamps; slot
