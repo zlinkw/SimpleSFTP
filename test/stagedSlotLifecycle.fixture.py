@@ -80,6 +80,31 @@ assert FIXTURE_MODES <= set(CALL_REQUIRED), ("fixture sends receiver modes the g
                                              sorted(FIXTURE_MODES), sorted(CALL_REQUIRED))
 
 
+def _slot_lock_symbol_consistency(path):
+    # Same technique as the receiver-mode derivation: the slot-lock capability GUARD symbols and
+    # the ACTUAL lock call symbols are derived from cleanup-files.py's own staged_slot_lock
+    # source and must name the SAME modules. The WSL-3.12 regression (probing hasattr(os,
+    # "flock") while fcntl.flock did the real locking) renamed the probe away from the call —
+    # from now on either side drifting apart turns red HERE, naming both sets.
+    with open(path, encoding="utf-8") as handle:
+        source = handle.read()
+    start = source.index("def staged_slot_lock(")
+    body = source[start:source.index("\ndef ", start + 1)]
+    guards = set(re.findall(r'(?:hasattr|getattr)\((\w+), "(?:flock|LOCK_EX|LOCK_NB)"', body))
+    calls = set(re.findall(r'(\w+)\.flock\(', body))
+    assert guards and guards == calls, ("slot-lock probe symbols diverge from lock call symbols",
+                                        sorted(guards), sorted(calls))
+    nt_calls = set(re.findall(r'(\w+)\.locking\(', body))
+    assert nt_calls <= {"msvcrt"} and (not nt_calls or re.search(r'import msvcrt', body)), \
+        ("NT slot-lock call must be msvcrt.locking behind its own import", sorted(nt_calls))
+    assert not re.search(r'os\.flock\(', source), \
+        "engine must never lock through os.flock — that probe/call split is the ruled WSL-3.12 defect"
+    return sorted(guards)
+
+
+SLOT_LOCK_SYMBOLS = _slot_lock_symbol_consistency(engine_path)
+
+
 def call(request, stdin=b""):
     # Fixture-side construction guard: the receiver subscripts its request fields, so a malformed
     # hand-built request must fail HERE naming the missing keys, never later as an opaque wrapped

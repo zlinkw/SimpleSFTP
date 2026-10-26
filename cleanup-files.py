@@ -1031,7 +1031,17 @@ def staged_slot_lock(root, target):
         parent_fd = os.open(parent_full, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
         deny("SLOT_LOCK_UNCERTAIN", parent_full, "无法钉住槽锁所在目录，拒绝隔离")
-    if not getattr(os, "O_NOFOLLOW", 0) or not hasattr(os, "flock") or not hasattr(os, "O_DIRECTORY"):
+    # Same-source capability probe: the symbols checked here are EXACTLY the ones called below
+    # (fcntl.flock / fcntl.LOCK_EX / fcntl.LOCK_NB). Probing os.flock instead once misjudged the
+    # real WSL 3.12 interpreter — where os.flock is absent but fcntl.flock is the working,
+    # receiver-side lock — as "no verification capability" and failed every released isolate
+    # closed forever. A missing probe symbol still refuses: fail closed, never a weaker path.
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    if not getattr(os, "O_NOFOLLOW", 0) or not hasattr(os, "O_DIRECTORY") \
+            or fcntl is None or not hasattr(fcntl, "flock") or not hasattr(fcntl, "LOCK_EX") or not hasattr(fcntl, "LOCK_NB"):
         try:
             os.close(parent_fd)
         finally:
@@ -1044,7 +1054,6 @@ def staged_slot_lock(root, target):
         except OSError:
             deny("SLOT_LOCK_UNCERTAIN", leaf, "槽锁文件无法打开，拒绝隔离")
         try:
-            import fcntl
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             os.close(fd)
