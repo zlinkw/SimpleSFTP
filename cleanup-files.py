@@ -1072,6 +1072,72 @@ def release_staged_slot_lock(handle):
         pass
 
 
+def verify_staged_journal_binding(root, target, binding):
+    """P1-3 ruling: re-prove the expiry-reclaim eligibility against the CURRENT journal WHILE the
+    slot lock is held. A free lock only proves no receiver is streaming — it does NOT prove the
+    journal is still the committed, expired row the reclaim was authorized against; the same
+    generation may have resumed, changed or freshly re-committed after the report. Every missing,
+    corrupt, future, contradictory or simply different fact denies the rename; the earlier
+    committed/expired verdict is never trusted across that window."""
+    identity = binding.get("identity") if isinstance(binding, dict) else None
+    generation = binding.get("generation") if isinstance(binding, dict) else None
+    expiry_ms = binding.get("expiryMs") if isinstance(binding, dict) else None
+    expected_terminal = binding.get("terminalAt") if isinstance(binding, dict) else None
+    if not (isinstance(identity, str) and re.fullmatch(r"[0-9a-f]{64}", identity)
+            and isinstance(generation, str) and re.fullmatch(r"[0-9a-f]{64}", generation)
+            and isinstance(expiry_ms, int) and not isinstance(expiry_ms, bool) and expiry_ms > 0
+            and (expected_terminal is None or (isinstance(expected_terminal, int) and not isinstance(expected_terminal, bool) and expected_terminal > 0))):
+        deny("INVALID_STAGED_JOURNAL_BINDING")
+    rel = str(target.get("relativePath") or "")
+    if not STAGED_SLOT_REL_RE.match(rel):
+        deny("INVALID_STAGED_JOURNAL_BINDING")
+    reason = "锁内复检发现暂存槽 journal 不再符合过期回收资格，拒绝隔离"
+
+    def trusted_int(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+    # Same path-guard discipline the engine's own manifest readers use (the slot lock, already
+    # held by the caller, keeps a racing receiver from rewriting between read and rename).
+    journal_full = path_guard(root, rel + "/manifest.json")
+    try:
+        with open(journal_full, "rb") as handle:
+            payload = handle.read(262144)
+        manifest_mtime = os.stat(journal_full, follow_symlinks=False).st_mtime
+    except OSError:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    try:
+        row = json.loads(payload)
+    except ValueError:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    if not isinstance(row, dict) or row.get("identity") != identity or row.get("generation") != generation \
+            or row.get("status") != "committed":
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    created = trusted_int(row.get("createdAt"))
+    if "createdAt" in row and created is None:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    created_s = created / 1_000_000_000 if created and created > 1_000_000_000_000 else float(created or 0)
+    terminal = row.get("terminalAt")
+    if "terminalAt" in row and terminal is not None and trusted_int(terminal) is None:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    if terminal is not None:
+        # A binding carrying the terminal moment binds it EXACTLY: a fresh re-commit (new or
+        # missing terminalAt) is a different journal, whatever else still matches.
+        if expected_terminal is not None and terminal != expected_terminal:
+            deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+        basis = float(terminal)
+    elif "terminalAt" in row and row["terminalAt"] is None:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    else:
+        updated = row.get("updatedAt")
+        if "updatedAt" in row and updated is not None and trusted_int(updated) is None:
+            deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+        basis = float(updated) if updated is not None else manifest_mtime
+        if created_s and basis < created_s - 1:
+            deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+    if (time.time() - basis) * 1000 < expiry_ms:
+        deny("STAGED_JOURNAL_MISMATCH", rel, reason)
+
+
 def archived_control_rel(target):
     """Exact confirmed-path deletion target for one registered isolated subtree."""
     rel = target.get("relativePath")
@@ -2240,6 +2306,12 @@ def main(request):
         # and this isolation refuses instead of moving an active checkpoint.
         slot_lock = staged_slot_lock(root, target)
         try:
+            # Reclaim-bound isolations re-prove the FULL expiry eligibility here — identity,
+            # generation, committed status, terminal moment and age against the CURRENT journal,
+            # under the held slot lock and before the rename (a free lock alone proves nothing
+            # about the journal); an unbound isolate keeps exactly the previous lock-only gate.
+            if request.get("stagedJournal") is not None:
+                verify_staged_journal_binding(root, target, request["stagedJournal"])
             # Exactly one atomic rename; a missing no-replace primitive or a
             # cross-filesystem target fails closed, never degrades to a copy.
             no_replace(child, value["destination"])

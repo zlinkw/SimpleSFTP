@@ -22,11 +22,12 @@ const ROOT_B = fs.mkdtempSync(path.join(os.tmpdir(), "consumer-B-"));
 const projectFile = (root, token) => path.join(root, "simple_cluster", "state", "simple-sftp", "cleanup-operations", token + ".json");
 const identityOf = root => ({ path: root, device: "7", inode: "2" + root.length, machine: "m", user: "u" });
 const nodeOf = root => ({ kind: "local", root });
-const transport = async request => ({ ok: true, observationId: request.observationId, rootIdentity: identityOf(request.root),
+const sentRequests = [];
+const transport = async request => { sentRequests.push(request); return ({ ok: true, observationId: request.observationId, rootIdentity: identityOf(request.root),
   target: { absolutePath: request.root + "/" + (request.target?.relativePath || request.entries?.[0]?.relativePath || ""),
     fingerprint: "fp", device: "7", inode: "2out/d0" },
   ...(request.action === "batch-observe" ? { observations: (request.entries || []).map(e =>
-    ({ key: e.key, status: "gone", target: { missing: true, type: e.type, absolutePath: request.root + "/" + e.relativePath }, executors: [], executorsChecked: true })) } : {}) });
+    ({ key: e.key, status: "gone", target: { missing: true, type: e.type, absolutePath: request.root + "/" + e.relativePath }, executors: [], executorsChecked: true })) } : {}) }); };
 const mkApi = storageRoot => new CleanupFileApi({ storageRoot, transport, activity: async () => {}, lease: async (n, t, work) => work() });
 
 async function confirmedMove(api, consumerRoot, relative) {
@@ -185,6 +186,41 @@ test("r118 reclaim authorizations are recorded explicitly, isolate-only, and rid
   // not change shape for any older caller.
   assert.equal(auto.digest, hash({ node: auto.node, rootIdentity: auto.rootIdentity, action: "isolate",
     targets: auto.targets, safety: auto.safety, tmuxSessionPrefix: auto.tmuxSessionPrefix }));
+});
+
+test("r118 journal binding: explicit facts ride the frozen row, malformed bindings fail closed, execute carries them to the engine", async () => {
+  const api = mkApi(path.join(os.tmpdir(), "legacy-binding-" + Date.now()));
+  const rel = "simple_cluster/.simple-sftp-staging/d-" + "1".repeat(24) + "/0";
+  const batch = "job-" + "cd".repeat(24);
+  const binding = { identity: "ab".repeat(32), generation: "cd".repeat(32), status: "committed", terminalAt: 172800, expiryMs: 86400000 };
+  const base = { consumerRoot: ROOT_A, node: nodeOf("/srv/target"), action: "isolate",
+    targets: [{ relativePath: rel, type: "directory", archiveBatch: batch, destination: "clean_dir/" + batch + "/" + rel }] };
+  // A malformed or unrelated binding is refused before anything freezes — nothing implicit is inferred.
+  await assert.rejects(api.preview({ ...base, authorizationSource: "auto_expiry_reclaim", stagedJournal: { ...binding, identity: "nope" } }),
+    error => error.code === "INVALID_STAGED_JOURNAL_BINDING");
+  await assert.rejects(api.preview({ ...base, authorizationSource: "auto_expiry_reclaim", stagedJournal: { ...binding, status: "preparing" } }),
+    error => error.code === "INVALID_STAGED_JOURNAL_BINDING");
+  await assert.rejects(api.preview({ ...base, authorizationSource: "auto_expiry_reclaim", stagedJournal: { ...binding, expiryMs: 0 } }),
+    error => error.code === "INVALID_STAGED_JOURNAL_BINDING");
+  await assert.rejects(api.preview({ ...base, authorizationSource: "auto_expiry_reclaim", stagedJournal: { ...binding, terminalAt: 0 } }),
+    error => error.code === "INVALID_STAGED_JOURNAL_BINDING");
+  await assert.rejects(api.preview({ ...base, stagedJournal: binding }),
+    error => error.code === "INVALID_STAGED_JOURNAL_BINDING");
+  // The valid binding rides the frozen row under the consuming project (ownership metadata, like
+  // reclaimAuthorizationSource — the frozen digest preimage above is unchanged by it).
+  const p = await api.preview({ ...base, authorizationSource: "auto_expiry_reclaim", stagedJournal: binding });
+  await api.confirm({ token: p.token, digest: p.digest, confirm: true, phase: 1, consumerRoot: ROOT_A,
+    exactTargets: p.targets.map(row => row.absolutePath) });
+  const cold = mkApi(api.storageRoot);
+  assert.deepEqual((await cold.read(p.token, ROOT_A)).stagedJournal, binding);
+  // Execute hands EXACTLY those expectations to the engine isolate request (the engine re-proves
+  // them under the slot lock before the rename — see the fixture's binding race scenarios).
+  const before = sentRequests.length;
+  await api.execute({ token: p.token, digest: p.digest, index: 0, consumerRoot: ROOT_A });
+  const isolateRequests = sentRequests.slice(before).filter(request => request.action === "isolate");
+  assert.equal(isolateRequests.length, 1, JSON.stringify(isolateRequests.map(request => request.action)));
+  assert.deepEqual(isolateRequests[0].stagedJournal, binding);
+  assert.equal(isolateRequests[0].target.relativePath, rel);
 });
 
 test("upload-state writes into the project managed tree; the legacy .vscode file stays read-only", () => {

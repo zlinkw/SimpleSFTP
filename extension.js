@@ -1934,9 +1934,19 @@ async function reclaimExpiredStagedSlots(options = {}) {
   }
   const relativePath = String(leaving.path || "");
   if (!relativePath) return { attempted: false, reason: "no-leaving-path", lane, identity };
+  // P1-3 ruling: the authorization binds to THIS journal, not merely to a path. identity, the
+  // committed generation, the terminal moment and the expiry threshold ride the frozen preview
+  // row and reach the engine's under-lock rename so a resumed, regenerated or freshly
+  // re-committed slot can never be isolated on the earlier verdict. A candidate whose binding
+  // facts are unusable is fail-closed skipped, never reclaimed.
+  const leavingGeneration = String(leaving.generation || "");
+  if (!/^[0-9a-f]{64}$/.test(leavingGeneration)) return { attempted: false, reason: "no-leaving-generation", lane, identity };
+  const expectedStagedJournal = { identity, generation: leavingGeneration, status: "committed",
+    terminalAt: Number.isInteger(leaving.terminalAt) && leaving.terminalAt > 0 ? leaving.terminalAt : null, expiryMs };
   const archiveBatch = "job-" + crypto.createHash("sha256")
     .update(JSON.stringify(["staged-slot-reclaim", identity, leaving.generation, relativePath, crypto.randomBytes(8).toString("hex")])).digest("hex").slice(0, 48);
   const preview = await api.preview({ node, action: "isolate", consumerRoot: root, authorizationSource: "auto_expiry_reclaim",
+    stagedJournal: expectedStagedJournal,
     targets: [{ relativePath, type: "directory", archiveBatch, destination: "clean_dir/" + archiveBatch + "/" + relativePath }] });
   const pending = preview.targets.map((target, index) => ({ target, index })).filter(({ target }) => !target.missing);
   if (!pending.length) return { attempted: true, outcome: "unknown", reason: "candidate-vanished", lane, identity };
@@ -2284,7 +2294,12 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   // leaving slot is reclaimed through the existing managed isolate-then-delete chain. No scan of
   // any other identity, no background service, and every unknown outcome just leaves the classic
   // fail-closed pending error in place (now enriched with the structured stage block).
-  const stageGeneration = effectiveOptions.generation;
+  // EXACTLY the receiver's own normalization (transferScope64 over options.generation, which the
+  // effective options always set): a plain supported run id like "run-1" must reach the reclaim
+  // check, the reclaim itself and the stage-block probe as the same 64-hex generation the
+  // staging request carries — the raw value would fail invalid-scope/`generation` comparison and
+  // silently disable both new features. transferScope64 is idempotent, so hex ids stay identical.
+  const stageGeneration = transferScope64(effectiveOptions.generation);
   const stageScopeText = stagedScope(effectiveOptions);
   const stageIdentities = [0, 1].map(stagingLane => stagedLogicalKey(destination.remotePath, [], { ...effectiveOptions, stagingLane }));
   const stageExpiry = stagedSlotExpirySettings();
@@ -7267,6 +7282,7 @@ module.exports = {
     mappedStagingPath,
     stagedSlotCleanupCandidates,
     stagedSlotStaleReportCommand,
+    transferScope64,
     stagedScope,
     stagedSlotExpirySettings,
     stagedSlotStageBlock,

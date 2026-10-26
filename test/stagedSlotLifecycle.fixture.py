@@ -504,6 +504,37 @@ mtime_report2 = recv.stale_report(exp_root, KEY_X, GEN_X4, EXPIRY_MS)
 mtimeFreshProtected = mtime_report2["stale"][0]["expiredCommitted"] is False
 assert mtimeAgedExpired and mtimeFreshProtected, (mtime_report["stale"], mtime_report2["stale"])
 
+# --- P1-1 ruling: PRESENT-but-MALFORMED never falls back to older evidence. The written commit
+# --- time is untrusted, so neither a stale updatedAt nor the manifest mtime may prove expiry;
+# --- every unusable value shape stays protected.
+KEY_M, GEN_M1, GEN_M2 = identity_key("99"), "e1" * 32, "e2" * 32
+mal_root = os.path.join(project, "malformedcase")
+os.makedirs(mal_root)
+land(GEN_M1, payload_bytes("M1"), root=mal_root, identity=KEY_M)
+land(GEN_M2, payload_bytes("M2"), root=mal_root, identity=KEY_M)
+malformedTimeProtected = True
+malformedNoOlderFallback = True
+for bad in ("172800000", True, 172800000.5, None):
+    edit_journal(mal_root, KEY_M, "0", lambda row, value=bad: row.update(
+        terminalAt=value, updatedAt=int(time.time()) - 172800, createdAt=(int(time.time()) - 172860) * 1_000_000_000))
+    bad_row = edited_leaving(recv.stale_report(mal_root, KEY_M, "d1" * 32, EXPIRY_MS))
+    # The same row carries a two-day-old updatedAt: expiring it would PROVE an illegal fallback.
+    assert bad_row["expiredCommitted"] is False and bad_row["expiryReason"] == "time-format", (bad, bad_row)
+    assert bad_row["timeSource"] is None, (bad, bad_row)
+# --- the manifest-mtime fallback is NOT exempt from the createdAt contradiction rule.
+edit_journal(mal_root, KEY_M, "0", strip_times)
+edit_journal(mal_root, KEY_M, "0", lambda row: row.update(createdAt=(int(time.time()) - 100) * 1_000_000_000))
+os.utime(os.path.join(mal_root, STAGING, "d-" + KEY_M[:24], "0", "manifest.json"), (time.time() - 172800,) * 2)
+mtime_bad_row = edited_leaving(recv.stale_report(mal_root, KEY_M, "d1" * 32, EXPIRY_MS))
+mtimeContradictionProtected = (mtime_bad_row["expiredCommitted"] is False
+                               and mtime_bad_row["expiryReason"] == "time-contradiction")
+# --- but a LEGITIMATE legacy row (fields genuinely absent, consistent times) still expires.
+edit_journal(mal_root, KEY_M, "0", lambda row: row.update(createdAt=(int(time.time()) - 172860) * 1_000_000_000))
+legacy_row = edited_leaving(recv.stale_report(mal_root, KEY_M, "d1" * 32, EXPIRY_MS))
+legacyFallbackStillWorks = legacy_row["expiredCommitted"] is True and legacy_row["timeSource"] == "manifestMtime"
+assert (malformedTimeProtected and malformedNoOlderFallback and mtimeContradictionProtected
+        and legacyFallbackStillWorks), (malformedNoOlderFallback, mtime_bad_row, legacy_row)
+
 # --- same-generation retry proposes nothing; inventory keeps every slot held.
 own_report = recv.stale_report(exp_root, KEY_X, GEN_X1)  # GEN_X1 still owns slot 0 (only times were edited)
 sameGenerationNoReclaim = own_report["stale"] == [] and own_report["slots"][0]["role"] == "held"
@@ -569,6 +600,55 @@ claimAfterIsolate = call({"mode": "chunkStatus", "root": lock_root, "identity": 
 claimAdmitted = claimAfterIsolate.returncode == 0 and json.loads(claimAfterIsolate.stdout)["offset"] == 0
 assert isolateAfterRelease and claimAdmitted, (released_isolate, claimAfterIsolate.stderr[-400:])
 
+# --- P1-3 ruling: the reclaim authorization binds to the journal, not the path, and the engine
+# --- re-proves identity/generation/committed-status/terminal-moment/age UNDER the held slot lock
+# --- before the rename. Same-generation resume, regeneration or fresh re-commit between report
+# --- and isolate must each refuse and leave the slot untouched; the untouched expired slot still
+# --- isolates (the gate is not a blanket denial).
+KEY_B, GEN_B1, GEN_B2 = identity_key("bb"), "a8" * 32, "b8" * 32
+
+
+def resume_checkpoint(row):
+    row["status"] = "preparing"
+    row["entries"] = []
+    row.pop("terminalAt", None)
+
+
+def reclaim_binding_case(name, mutate_before_isolate):
+    case_root = os.path.join(project, "binding-" + name)
+    os.makedirs(case_root)
+    land(GEN_B1, payload_bytes("B1"), root=case_root, identity=KEY_B)
+    land(GEN_B2, payload_bytes("B2"), root=case_root, identity=KEY_B)
+    aged_terminal = int(time.time()) - 172800
+    edit_journal(case_root, KEY_B, "0", lambda row: row.update(
+        createdAt=(aged_terminal - 60) * 1_000_000_000, terminalAt=aged_terminal))
+    assert edited_leaving(recv.stale_report(case_root, KEY_B, "c8" * 32, EXPIRY_MS))["expiredCommitted"] is True, name
+    if mutate_before_isolate is not None:
+        edit_journal(case_root, KEY_B, "0", mutate_before_isolate)
+    slot_rel = STAGING + "/d-" + KEY_B[:24] + "/0"
+    batch = "job-" + hashlib.sha256(("binding-" + name).encode("utf-8")).hexdigest()[:48]
+    isolate = engine({"root": case_root, "action": "isolate", "operationId": "binding-" + name,
+                      "target": {"relativePath": slot_rel, "type": "directory", "archiveBatch": batch,
+                                 "destination": "clean_dir/" + batch + "/" + slot_rel},
+                      "stagedJournal": {"identity": KEY_B, "generation": GEN_B1, "status": "committed",
+                                        "terminalAt": aged_terminal, "expiryMs": EXPIRY_MS}})
+    return isolate, os.path.exists(os.path.join(case_root, STAGING, "d-" + KEY_B[:24], "0"))
+
+
+def refused_untouched(name, mutate):
+    isolate, still_there = reclaim_binding_case(name, mutate)
+    return (isolate["ok"] is False and isolate["error"]["code"] == "STAGED_JOURNAL_MISMATCH"
+            and still_there)
+
+
+reclaimBindingNonTerminalRefused = refused_untouched("nonterminal", resume_checkpoint)
+reclaimBindingGenerationChangedRefused = refused_untouched("regen", lambda row: row.update(generation="f8" * 32))
+reclaimBindingFreshCommitRefused = refused_untouched("fresh", lambda row: row.update(terminalAt=int(time.time())))
+control_isolate, control_slot_still_there = reclaim_binding_case("accepted", None)
+reclaimBindingUnchangedAccepted = control_isolate["ok"] is True and not control_slot_still_there
+assert (reclaimBindingNonTerminalRefused and reclaimBindingGenerationChangedRefused
+        and reclaimBindingFreshCommitRefused and reclaimBindingUnchangedAccepted), control_isolate
+
 print(json.dumps({"ok": True, "pendingBlocked": True, "leaving": leaving, "thirdGenerationLanded": True,
                   "hardlinkPublication": {"tarPublished": True, "pendingAliasPreserved": True,
                                           "chunkPublished": True, "normalTargetPublished": True,
@@ -588,6 +668,14 @@ print(json.dumps({"ok": True, "pendingBlocked": True, "leaving": leaving, "third
                                     "inventoryRolesHeld": inventoryRolesHeld,
                                     "corruptProtected": corruptProtected,
                                     "lockedProtected": lockedProtected,
+                                    "malformedTimeProtected": malformedTimeProtected,
+                                    "malformedNoOlderFallback": malformedNoOlderFallback,
+                                    "mtimeContradictionProtected": mtimeContradictionProtected,
+                                    "legacyFallbackStillWorks": legacyFallbackStillWorks,
+                                    "reclaimBindingNonTerminalRefused": reclaimBindingNonTerminalRefused,
+                                    "reclaimBindingGenerationChangedRefused": reclaimBindingGenerationChangedRefused,
+                                    "reclaimBindingFreshCommitRefused": reclaimBindingFreshCommitRefused,
+                                    "reclaimBindingUnchangedAccepted": reclaimBindingUnchangedAccepted,
                                     "slotLockHeldBlocksIsolate": slotLockHeldBlocksIsolate,
                                     "isolateAfterRelease": isolateAfterRelease,
                                     "claimAdmitted": claimAdmitted}}))

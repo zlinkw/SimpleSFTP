@@ -152,11 +152,24 @@ def created_seconds(row):
         return 0
     return created / 1_000_000_000 if created > 1_000_000_000_000 else float(created)
 
+def time_field(row, field):
+    # (present, parsed) — rules out the ruled confusion: a LEGACY row simply lacks the field and may
+    # fall back; a row that CARRIES the field with an unusable value (string, bool, float, null,
+    # non-positive or non-integer) is malformed and must NEVER fall through to older evidence.
+    if field not in row:
+        return False, None
+    value = row[field]
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return True, value
+    return True, None
+
 def time_facts(row, slot_fd):
-    # Expiry-age basis facts, remote clock only, never mutated here. Preference: terminalAt (new journals),
-    # legacy fallback updatedAt, and ONLY when a valid journal carries no usable timestamp at all, the
-    # NON-FOLLOWING manifest.json mtime. Slot-directory, lock-file and data-file mtimes are never trusted.
-    # A missing, malformed, future or clock-contradictory basis yields expiryProblem (callers never expire).
+    # Expiry-age basis facts, remote clock only, never mutated here. Preference: terminalAt (new
+    # journals), legacy fallback updatedAt, and ONLY when a valid journal carries no usable
+    # timestamp at all, the NON-FOLLOWING manifest.json mtime. Slot-directory, lock-file and
+    # data-file mtimes are never trusted. PRESENT-but-MALFORMED yields time-format immediately —
+    # never an older basis; a future or createdAt-contradictory basis yields its problem
+    # (callers never expire), and the manifest-mtime fallback is contradiction-checked too.
     now = time.time()
     created_s = created_seconds(row)
     def basis(source, seconds):
@@ -165,15 +178,19 @@ def time_facts(row, slot_fd):
         if created_s and seconds < created_s - 1:
             return {"timeSource": source, "ageMs": None, "expiryProblem": "time-contradiction"}
         return {"timeSource": source, "ageMs": int((now - seconds) * 1000), "expiryProblem": None}
-    terminal = as_int(row.get("terminalAt"))
-    if terminal is not None:
-        if terminal <= 0:
-            return {"timeSource": None, "ageMs": None, "expiryProblem": "time-format"}
+    malformed = {"timeSource": None, "ageMs": None, "expiryProblem": "time-format"}
+    created_present, created_parsed = time_field(row, "createdAt")
+    if created_present and created_parsed is None:
+        return malformed
+    terminal_present, terminal = time_field(row, "terminalAt")
+    if terminal_present and terminal is None:
+        return malformed  # a written-but-unusable commit time outranks every older fallback
+    if terminal_present:
         return basis("terminalAt", float(terminal))
-    updated = as_int(row.get("updatedAt"))
-    if updated is not None:
-        if updated <= 0:
-            return {"timeSource": None, "ageMs": None, "expiryProblem": "time-format"}
+    updated_present, updated = time_field(row, "updatedAt")
+    if updated_present and updated is None:
+        return malformed
+    if updated_present:
         return basis("updatedAt", float(updated))
     try:
         # Valid journal without any timestamp: only the journal manifest's own non-followed mtime may answer.
@@ -182,6 +199,8 @@ def time_facts(row, slot_fd):
         return {"timeSource": None, "ageMs": None, "expiryProblem": "mtime-unreadable"}
     if moment > now:
         return {"timeSource": "manifestMtime", "ageMs": None, "expiryProblem": "time-future"}
+    if created_s and moment < created_s - 1:
+        return {"timeSource": "manifestMtime", "ageMs": None, "expiryProblem": "time-contradiction"}
     return {"timeSource": "manifestMtime", "ageMs": int((now - moment) * 1000), "expiryProblem": None}
 
 def slot_report(did, leaf, journal_row, locked=False):

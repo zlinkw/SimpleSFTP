@@ -33,7 +33,12 @@ test("staged slots keep two generations end to end: preview, fail-closed third, 
         claimStillPending: true, structuredPendingFacts: true, boundaryAtLeastDay: true, boundaryJustBelow: true,
         futureProtected: true, contradictionProtected: true, mtimeAgedExpired: true, mtimeFreshProtected: true,
         sameGenerationNoReclaim: true, inventoryRolesHeld: true, corruptProtected: true, lockedProtected: true,
-        slotLockHeldBlocksIsolate: true, isolateAfterRelease: true, claimAdmitted: true } });
+        slotLockHeldBlocksIsolate: true, isolateAfterRelease: true, claimAdmitted: true,
+        // r118 final review: malformed times never fall back; the reclaim binding is re-proven under lock.
+        malformedTimeProtected: true, malformedNoOlderFallback: true, mtimeContradictionProtected: true,
+        legacyFallbackStillWorks: true, reclaimBindingNonTerminalRefused: true,
+        reclaimBindingGenerationChangedRefused: true, reclaimBindingFreshCommitRefused: true,
+        reclaimBindingUnchangedAccepted: true } });
 });
 
 // The extension-side production request builder must encode the SAME read-only protocol the
@@ -169,6 +174,7 @@ function fakeCleanupApi(calls, options = {}) {
     preview: async params => {
       calls.push("preview:" + String(params.authorizationSource));
       calls.push("preview-consumer:" + String(params.consumerRoot));
+      (options.bindings || []).push(params.stagedJournal);
       return { token: "t".repeat(48), digest: "d".repeat(64),
         targets: [{ missing: false, absolutePath: "/srv/project/" + params.targets[0].relativePath,
           relativePath: params.targets[0].relativePath, destination: params.targets[0].destination }] };
@@ -182,21 +188,59 @@ function fakeCleanupApi(calls, options = {}) {
 
 function expiredLeavingReport() {
   return { stale: [{ path: "simple_cluster/.simple-sftp-staging/d-" + identity.slice(0, 24) + "/0", status: "committed",
-    identity, generation, locked: false, expiredCommitted: true, expiryReason: "expired", ageMs: 90000000 }], held: [], slots: [] };
+    identity, generation, locked: false, expiredCommitted: true, expiryReason: "expired", ageMs: 90000000,
+    terminalAt: 172800 }], held: [], slots: [] };
 }
 
 test("claim-scoped reclaim drives preview→confirm→isolate→registered-delete exactly once for an expired committed slot", async () => {
-  const calls = [];
+  const calls = [], bindings = [];
   let transmitted = null;
   __test.setRemoteBatchTransport(async (source, command) => { transmitted = requestPayload(command); return JSON.stringify(expiredLeavingReport()); });
   try {
     const result = await __test.reclaimExpiredStagedSlots({ destination: { host: "127.0.0.1", username: "u", port: 22, remotePath: "/srv/project" },
-      identity, generation, scope: "project-files", lane: 0, consumerRoot: "/fixture/project", api: fakeCleanupApi(calls), expiryMs: 86400000 });
+      identity, generation, scope: "project-files", lane: 0, consumerRoot: "/fixture/project", api: fakeCleanupApi(calls, { bindings }), expiryMs: 86400000 });
     assert.equal(result.outcome, "accepted");
     assert.equal(result.isolationProven, true);
     assert.equal(transmitted.mode, "staleReport");
     assert.deepEqual(transmitted.expiry, { ms: 86400000 });
     assert.deepEqual(calls, ["preview:auto_expiry_reclaim", "preview-consumer:/fixture/project", "confirm:1", "execute", "status", "delete"]);
+    // P1-3 ruling: the authorization rides the preview as an EXPLICIT journal binding — the
+    // engine re-proves these exact facts under the slot lock before any rename.
+    assert.deepEqual(bindings, [{ identity, generation, status: "committed", terminalAt: 172800, expiryMs: 86400000 }]);
+  } finally { __test.setRemoteBatchTransport(null); }
+});
+
+test("a plain (non-hex) run id normalizes to the receiver generation everywhere — real helpers, no stubs", async () => {
+  // The receiver always sends transferScope64(options.generation); check, reclaim and stage block
+  // must carry the IDENTICAL string or a supported run id like "run-1" silently disables both
+  // features (invalid-scope / generation mismatch / swallowed probe errors).
+  const archive = requestPayload(__test.stagedTarUnpackingCommand({ remotePath: "/srv/project" }, "none",
+    { retentionKey: "plans/a.yaml|task-0", generation: "run-1" }, { "out/a": { sha256: "a".repeat(64), size: 1 } }, ["out/a"]));
+  const receiverGeneration = archive.generation;
+  assert.match(receiverGeneration, /^[0-9a-f]{64}$/);
+  assert.notEqual(receiverGeneration, "run-1");
+  const destination = { host: "127.0.0.1", username: "u", port: 22, remotePath: "/srv/project" };
+  let transmitted = null;
+  const calls = [], bindings = [];
+  __test.setRemoteBatchTransport(async (source, command) => { transmitted = requestPayload(command); return JSON.stringify(expiredLeavingReport()); });
+  try {
+    const result = await __test.reclaimExpiredStagedSlots({ destination, identity, generation: receiverGeneration,
+      scope: "plans/a.yaml|task-0", lane: 0, consumerRoot: "/fixture/project", api: fakeCleanupApi(calls, { bindings }), expiryMs: 86400000 });
+    assert.equal(result.outcome, "accepted");
+    assert.equal(transmitted.generation, receiverGeneration); // byte-for-byte the receiver request value
+    assert.equal(transmitted.identity, identity);
+    assert.deepEqual(bindings, [{ identity, generation, status: "committed", terminalAt: 172800, expiryMs: 86400000 }]);
+  } finally { __test.setRemoteBatchTransport(null); }
+  // The stage-block attach asks for THIS run's generation too, never a raw id.
+  let attached = null;
+  __test.setRemoteBatchTransport(async (source, command) => { attached = requestPayload(command); return JSON.stringify({ stale: [], held: [], slots: [] }); });
+  try {
+    const error = new Error("TRANSFER_STAGE_PENDING: 暂存槽仍被上一代占用");
+    await __test.attachStagedStageBlock(error, { destination, profile: "zlk-prod", scope: "plans/a.yaml|task-0",
+      lane: 0, identity, incomingGeneration: receiverGeneration, expiryMs: 86400000 });
+    assert.equal(attached.generation, receiverGeneration);
+    assert.equal(error.stageBlock.incomingGeneration, receiverGeneration);
+    assert.ok(error.message.startsWith("TRANSFER_STAGE_PENDING: 暂存槽仍被上一代占用"));
   } finally { __test.setRemoteBatchTransport(null); }
 });
 

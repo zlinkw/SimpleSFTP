@@ -50,6 +50,9 @@ test('delta stream transfers changed content only and reports compared versus ch
   const sandbox = { Date, String, Number, Set, Map, Array, Object, Math, Error,
     vscode: { workspace: { workspaceFolders: [] } },
     cleanupFileApi,
+    // The core now normalizes the run generation EXACTLY like the receiver request builder does;
+    // the fixture ships the real module function so this pins that closure dependency too.
+    transferScope64: __test.transferScope64,
     stagedScope: __test.stagedScope, stagedLogicalKey: () => 'e'.repeat(64),
     stagedSlotExpirySettings: () => ({ enabled: true, expiryMs: 86400000 }),
     reclaimExpiredStagedSlots: async ({ lane, identity, generation, api }) => {
@@ -95,9 +98,11 @@ test('delta stream transfers changed content only and reports compared versus ch
   // The reclaim wiring ran exactly once per fixed lane before the planned transfer, with this
   // run's generation, and again never for the all-identical repeat; the stage-block attach is
   // never touched by this error-free scenario.
+  // The controller id 'one' is a PLAIN run id: the core must hand the reclaim wiring the same
+  // 64-hex normalization the staging request carries, never the raw value.
   assert.deepEqual(reclaimCalls, [
-    { lane: 0, identity: 'e'.repeat(64), generation: 'one', apiIsSingleton: true },
-    { lane: 1, identity: 'e'.repeat(64), generation: 'one', apiIsSingleton: true }]);
+    { lane: 0, identity: 'e'.repeat(64), generation: __test.transferScope64('one'), apiIsSingleton: true },
+    { lane: 1, identity: 'e'.repeat(64), generation: __test.transferScope64('one'), apiIsSingleton: true }]);
   assert.deepEqual(stageBlockAttempts, []);
 });
 

@@ -517,4 +517,8 @@ test("r118 capability descriptors advertise claim-scoped expiry reclaim and stru
   assert.match(apiSource, /INVALID_AUTHORIZATION_SOURCE/);
   assert.match(apiSource, /"auto_expiry_reclaim", "single_confirmation_release"/);
   assert.match(apiSource, /reclaimAuthorizationSource: row\.reclaimAuthorizationSource/);
+  // r118 final review: reclaim previews validate the journal binding EXPLICITLY and execute
+  // hands the frozen binding to the engine isolate (which re-proves it under the slot lock).
+  assert.match(apiSource, /INVALID_STAGED_JOURNAL_BINDING/);
+  assert.match(apiSource, /\.\.\.\(row\.stagedJournal \? \{ stagedJournal: copy\(row\.stagedJournal\) \} : \{\}\)/);
 });
