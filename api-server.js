@@ -190,7 +190,7 @@ class LocalApiServer {
         return;
       }
       const controller = new AbortController();
-      const readOnly = /\.(list|get|status|schema)$/.test(payload.method) || ["files.cleanup.check", "files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.verify", "files.cleanup.observeBatch"].includes(payload.method) || /^(project\.(inventory|fileStats|tree)|sync\.(?:projectInventory|projectFileStats|projectTree|projectTreeState|planLogPaths|listPlanLogs)|transfers\.reconcile)$/.test(payload.method)
+      const readOnly = /\.(list|get|status|schema)$/.test(payload.method) || ["files.cleanup.check", "files.cleanup.preview", "files.cleanup.isolationParentsPreview", "files.cleanup.inspect", "files.cleanup.verify", "files.cleanup.observeBatch"].includes(payload.method) || /^(project\.(inventory|fileStats|tree)|sync\.(?:projectInventory|projectFileStats|projectTree|projectTreeState|planLogPaths|listPlanLogs)|transfers\.reconcile)$/.test(payload.method)
         || payload.method === "sync.downloadMappedPaths" && payload.params?.memoryOnly === true;
       let queued = true;
       const cancelRead = () => { if (queued || readOnly) controller.abort(new Error("API_READ_CANCELLED")); };
@@ -199,7 +199,7 @@ class LocalApiServer {
       let result;
       try {
         const lane = payload.method === 'sync.projectInventory' && payload.params?.metadataOnly === true ? 'summary'
-          : /^files\.cleanup\.(preview|inspect|check|verify)$/.test(payload.method) ? 'review'
+          : /^files\.cleanup\.(preview|isolationParentsPreview|inspect|check|verify)$/.test(payload.method) ? 'review'
           : /^(sync\.project(?:Tree|TreeState|FileStats)|remote\.listDirs)$/.test(payload.method) ? 'browse'
           : /^(sync\.|upload\.|download\.|agents\.|project\.|handoff\.|downloadScope\.|transfers\.reconcile$|files\.cleanup\.(?:preview|inspect|execute|verify))/.test(payload.method) ? 'files' : 'control';
         result = await this.rpcLanes[lane].run([Symbol(payload.method)], controller.signal, () => {
