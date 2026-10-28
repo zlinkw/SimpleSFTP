@@ -1695,6 +1695,7 @@ const API_METHOD_CAPABILITIES = {
       "files.cleanup.verify": { readOnly: true, completedReceiptRequired: true },
       "files.cleanup.settle": { frozenApprovalRequired: true, receiptOnly: true, startsNewMoves: false },
       "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: 1, requiredInputGuard: 1, registeredIsolationDeletion: 1, backgroundIsolatedDelete: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
+      "files.cleanup.isolationParentsPreview": { readOnly: true, zeroWrites: true, emptyDirectoriesOnly: 1, exactParentPaths: 1, deleteConfirmationCount: 2 },
       "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
       "files.cleanup.stagedSlots": { readOnly: true, incomingGenerationPreview: true, retainedGenerations: 2, expiredCommittedReclaim: 1, defaultExpiryMs: 86400000, virtualRetentionWindow: 2, structuredBlockEvidence: 1, releaseConfirmationCount: 1 },
       "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1, tmuxSessionPrefix: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1, isolationCompletionReceipt: 1 },
@@ -4367,6 +4368,7 @@ function createLocalApiMethods() {
     "files.cleanup.inspect": params => cleanupFileApi.inspect(params),
     "files.cleanup.observeBatch": params => cleanupFileApi.observeBatch(params),
     "files.cleanup.preview": params => cleanupFileApi.preview(params),
+    "files.cleanup.isolationParentsPreview": params => cleanupFileApi.previewIsolationParents(params),
     "files.cleanup.stagedSlots": async params => {
       // params.generation (a stable incoming run id) turns this into an admission preview; without
       // it the call is a pure read-only inventory that never lists the retained two generations.
@@ -4890,7 +4892,7 @@ function createLocalApiMethods() {
         const codeInventory = name === "sync.projectInventory" && params.inventoryPurpose === "code-sync"
           && Array.isArray(params.scopePaths) && params.scopePaths.length > 0 && !params.scopePaths.includes(".");
         const memoryRead = name === "sync.downloadMappedPaths" && params.memoryOnly === true && params.metricsOnly === true;
-        const cleanupRead = ["files.cleanup.preview", "files.cleanup.inspect", "files.cleanup.check", "files.cleanup.verify", "files.cleanup.status", "files.cleanup.observeBatch", "files.cleanup.stagedSlots"].includes(name);
+        const cleanupRead = ["files.cleanup.preview", "files.cleanup.isolationParentsPreview", "files.cleanup.inspect", "files.cleanup.check", "files.cleanup.verify", "files.cleanup.status", "files.cleanup.observeBatch", "files.cleanup.stagedSlots"].includes(name);
         const metadataInventory = name === "sync.projectInventory" && params.metadataOnly === true;
         const maintenanceDelete = name === "files.cleanup.isolatedMaintenanceDelete";
         const pool = maintenanceDelete ? maintenanceCleanupCapacity : cleanupRead ? cleanupReadCapacity : metadataInventory ? metadataInventoryCapacity : memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
@@ -5388,7 +5390,7 @@ async function cleanupFileTransport(request) {
     output = await new Promise((resolve, reject) => {
       const child = spawn(process.platform === "win32" ? "python" : "python3", ["-B", "-X", "utf8", path.join(__dirname, "cleanup-files.py")], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
       let text = "";
-      const monitor = watchTransferProcess(child, reject, true, [], !["inspect", "check", "batch-inspect", "batch-verify"].includes(request.action));
+      const monitor = watchTransferProcess(child, reject, true, [], !["inspect", "check", "batch-inspect", "batch-verify", "inspect-isolation-parents", "check-isolation-parents"].includes(request.action));
       child.stdout.on("data", chunk => { text += chunk.toString("utf8"); if (text.length > 16 * 1024 * 1024) { child.kill(); reject(new Error("INVENTORY_LIMIT")); } });
       child.on("error", error => { monitor.dispose(); reject(error); });
       child.on("close", code => { monitor.dispose(); code === 0 ? resolve(text) : reject(new Error("LOCAL_CLEANUP_FAILED")); });
@@ -5408,7 +5410,7 @@ async function cleanupFileTransport(request) {
     if (knownIdentity) runtime.request.rootIdentity = knownIdentity;
     const programPath = node.root.replace(/\/+$/, "") + "/" + runtime.programRelativePath;
     const command = remoteRuntimeCommand(programPath, shellQuote);
-    const options = { remoteMutation: !["check", "inspect", "inventory", "verify", "managed-observe", "batch-inspect", "batch-verify"].includes(request.action), stage: "PLAN 安全文件操作" };
+    const options = { remoteMutation: !["check", "inspect", "inventory", "verify", "managed-observe", "batch-inspect", "batch-verify", "inspect-isolation-parents", "check-isolation-parents"].includes(request.action), stage: "PLAN 安全文件操作" };
     const missingProgram = error => /can't open file|No such file or directory|RUNTIME_PROGRAM_MISSING|RUNTIME_CODE_MISMATCH/i.test(String(error?.stderr || "") + String(error?.message || ""));
     if (!remoteRuntimePrograms.has(runtime.cacheKey)) await ensureRemoteRuntimeProgram(source, runtime);
     try {
