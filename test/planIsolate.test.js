@@ -112,7 +112,7 @@ test('controlled fast isolation, subtree single-writer locks and registered perm
 });
 
 test('the isolate hot path runs one live inspect, one rename and no post-rename re-check of the isolated copy',()=>{
-  const source=fs.readFileSync(path.resolve(__dirname,'../cleanup-files.py'),'utf8');
+  const source=fs.readFileSync(path.resolve(__dirname,'../cleanup-files.py'),'utf8').replace(/\r\n/g,'\n');
   const start=source.indexOf('    if action == "isolate":\n');
   const end=source.indexOf('    archived_control = archived_control_rel(target)',start);
   assert.ok(start>0&&end>start,'isolate branch anchors missing');

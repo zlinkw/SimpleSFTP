@@ -149,10 +149,13 @@ test("tar writer preserves UTF-8 and long POSIX paths", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "simple-sftp-tar-"));
   const extract = path.join(root, "extract");
   const unicodeRelative = "数据/实验配置.yaml";
+  const dottedRelative = "experiments/runs/bus_source_trace_20261028/tree_..json";
   const longRelative = `${Array.from({ length: 12 }, (_, index) => `directory-${index}`).join("/")}/final-result.txt`;
   fs.mkdirSync(path.dirname(path.join(root, unicodeRelative)), { recursive: true });
   fs.mkdirSync(path.dirname(path.join(root, longRelative)), { recursive: true });
   fs.writeFileSync(path.join(root, unicodeRelative), "中文内容\n");
+  fs.mkdirSync(path.dirname(path.join(root, dottedRelative)), { recursive: true });
+  fs.writeFileSync(path.join(root, dottedRelative), "dotted filename\n", "utf8");
   fs.writeFileSync(path.join(root, longRelative), "ok\n");
 
   try {
@@ -162,6 +165,7 @@ test("tar writer preserves UTF-8 and long POSIX paths", async () => {
       localPath: root,
       files: [
         { relativePath: unicodeRelative, fullPath: path.join(root, unicodeRelative) },
+        { relativePath: dottedRelative, fullPath: path.join(root, dottedRelative) },
         { relativePath: longRelative, fullPath: path.join(root, longRelative) },
       ],
       stream: archive,
@@ -176,8 +180,9 @@ test("tar writer preserves UTF-8 and long POSIX paths", async () => {
     fs.mkdirSync(extract);
     await execFileAsync("tar", ["-xf", path.join(root, "workspace.tar"), "-C", extract], { timeout: 10000, windowsHide: true });
     assert.equal(fs.readFileSync(path.join(extract, unicodeRelative), "utf8"), "中文内容\n");
+    assert.equal(fs.readFileSync(path.join(extract, dottedRelative), "utf8"), "dotted filename\n");
     assert.equal(fs.readFileSync(path.join(extract, longRelative), "utf8"), "ok\n");
-    assert.equal(transferredBytes, Buffer.byteLength("中文内容\n") + Buffer.byteLength("ok\n"));
+    assert.equal(transferredBytes, Buffer.byteLength("中文内容\n") + Buffer.byteLength("dotted filename\n") + Buffer.byteLength("ok\n"));
   } finally {
     fs.writeFileSync(path.join(root, "KEEP.txt"), "Isolated test evidence retained.\n", "utf8");
   }
@@ -200,6 +205,10 @@ test("managed manifest trusts caller-selected data files while retaining path sa
     source.slice(source.indexOf("function getManagedManifest("), source.indexOf("function getMissingManagedFiles(")),
     source.slice(source.indexOf("function isSafeRemoteManagedPath("), source.indexOf("function targetScopeKey(")),
     "this.getPaths = getManifestUploadRelativePaths;",
+    extractFunction("getMissingManagedFiles"),
+    extractFunction("isIgnoredLocalPath"),
+    extractFunction("patternMatchesPath"),
+    "this.missing = getMissingManagedFiles;",
   ].join("\n"), sandbox);
   try {
     const allowed = [
@@ -215,6 +224,8 @@ test("managed manifest trusts caller-selected data files while retaining path sa
       "data/weights/model.pt",
       "data/patients/subject.py",
       "datasets/loader.py",
+      "experiments/runs/bus_source_trace_20261028/tree_..json",
+      "data/dots..within/scan...json",
     ];
     for (const relativePath of allowed) {
       const file = path.join(localPath, relativePath);
@@ -223,9 +234,19 @@ test("managed manifest trusts caller-selected data files while retaining path sa
     }
     const paths = sandbox.getPaths({ localPath, manifest: Object.fromEntries(allowed.map((name) => [name, {}])) });
     assert.deepEqual([...paths].sort(), allowed.sort());
-    for (const blocked of [".git/config", ".vscode/settings.json", ".codex/state.json", "../outside.py"]) {
+    const blockedPaths = [
+      ".git/config", ".vscode/settings.json", ".codex/state.json", "../outside.py",
+      "experiments/../outside.py", "experiments/./outside.py", "experiments//outside.py",
+      "/outside.py", "\\outside.py", "C:/outside.py", "C:outside.py",
+      "experiments\\..\\outside.py", "experiments/file\0.py", "experiments/file\n.py",
+    ];
+    for (const blocked of blockedPaths) {
       assert.throws(() => sandbox.getPaths({ localPath, manifest: { [blocked]: {} } }), /不安全的受管理代码路径|非法远端相对路径/);
     }
+    const missing = "experiments/runs/bus_source_trace_20261028/tree_..json";
+    const stillPresent = "data/still..json", ignored = "data/ignored..json";
+    const previous = { files: Object.fromEntries([...blockedPaths, missing, stillPresent, ignored, "clean_dir/old..json"].map((name) => [name, {}])) };
+    assert.deepEqual([...sandbox.missing(previous, { [stillPresent]: {} }, ["ignored..json"])], [missing]);
   } finally {
     fs.writeFileSync(path.join(localPath, "KEEP.txt"), "Isolated test evidence retained.\n", "utf8");
   }

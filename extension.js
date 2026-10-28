@@ -3042,9 +3042,9 @@ async function writeRemoteCodeSyncState(sftp, state, manifest) {
 }
 
 function isSafeRemoteManagedPath(relativePath) {
-  const normalized = toPosixPath(relativePath).replace(/^\/+/, "");
-  if (!normalized || normalized.includes("..") || path.posix.isAbsolute(normalized)) return false;
-  if (/[\\]|\0/.test(normalized)) return false;
+  let normalized;
+  try { normalized = sanitizeRelativeUploadPath(relativePath); }
+  catch { return false; }
   const segments = normalized.toLowerCase().split("/");
   const top = segments[0];
   // The manifest producer owns file-type and size policy. Reapplying a
@@ -3056,8 +3056,11 @@ function isSafeRemoteManagedPath(relativePath) {
 }
 
 function sanitizeRelativeUploadPath(value) {
-  const normalized = toPosixPath(String(value || "").replace(/^\/+/, ""));
-  if (!normalized || normalized.includes("..") || path.posix.isAbsolute(normalized)) {
+  const normalized = toPosixPath(String(value || ""));
+  // A filename such as tree_..json is valid; only a complete '..' segment traverses.
+  // Keep the same canonical relative-path boundary as the tar writer.
+  if (!normalized || path.posix.isAbsolute(normalized) || /[:\0\r\n]/.test(normalized)
+      || normalized.split("/").some((part) => !part || part === "." || part === "..")) {
     throw new Error(`非法远端相对路径：${value}`);
   }
   return normalized;

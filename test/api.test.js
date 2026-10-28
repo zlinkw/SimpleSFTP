@@ -504,7 +504,7 @@ test("r118 capability descriptors advertise claim-scoped expiry reclaim and stru
   assert.match(extensionSource, /"files\.cleanup\.stagedSlots": \{ readOnly: true, incomingGenerationPreview: true, retainedGenerations: 2, expiredCommittedReclaim: 1, defaultExpiryMs: 86400000, virtualRetentionWindow: 2, structuredBlockEvidence: 1, releaseConfirmationCount: 1 \}/);
   assert.match(extensionSource, /"sync\.serverToServerFpsync": \{ retentionKey: "stable-logical-source", generation: "stable-run-id", retainedGenerations: 2, claimScopedExpiredReclaim: 1, stageBlockEvidence: 1/);
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "../package.json"), "utf8"));
-  assert.equal(pkg.version, "0.2.114");
+  assert.equal(pkg.version, "0.2.115");
   const props = pkg.contributes.configuration.properties;
   assert.equal(props["simpleSftp.autoReclaimExpiredCommittedSlots"].default, true);
   assert.equal(props["simpleSftp.stagedSlotCommittedExpiryMs"].default, 86400000);
