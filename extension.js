@@ -173,6 +173,7 @@ const transferLedgerWriter = new LatestSnapshotWriter(async ({ context, rows }) 
 let defaultConnectTimeoutSeconds = 15;
 let extensionContext;
 let localApiServer;
+let localApiReady;
 let serverStatusButton;
 let sharedWatcher;
 const hostOperationLease = new HostOperationLeaseManager();
@@ -279,6 +280,16 @@ function activate(context) {
     vscode.window.showWarningMessage(`SimpleSFTP 工作区路径检查失败：${formatError(error)}`);
   });
   startLocalApiServer(context);
+  if (typeof vscode.workspace.onDidChangeWorkspaceFolders === 'function') context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => { void localApiReady.then(() => localApiServer?.writeDiscovery()).catch(error => console.warn(formatError(error))); }));
+  return Object.freeze({
+    apiVersion: 1,
+    getLocalApiDiscovery: async () => {
+      await localApiReady;
+      if (!localApiServer || localApiServer.disposed || !localApiServer.port) throw new Error('SimpleSFTP 当前窗口 API 未就绪');
+      return localApiServer.discovery();
+    },
+  });
 }
 
 
@@ -304,6 +315,7 @@ function startLocalApiServer(context) {
     version: String(PACKAGE_JSON.version || "0.2.0"),
     preferredPort: 19766,
     discoveryPath: path.join(APPDATA, "SimpleSFTP", "api.json"),
+    getWorkspace: currentApiWorkspace,
     methods: createLocalApiMethods(),
     methodOptions: API_METHOD_CAPABILITIES,
   });
@@ -313,10 +325,18 @@ function startLocalApiServer(context) {
       void server.dispose().catch(() => undefined);
     },
   });
-  void server.start().catch((error) => {
+  localApiReady = server.start();
+  void localApiReady.catch((error) => {
     console.warn(`SimpleSFTP local API failed to start: ${formatError(error)}`);
   });
   return server;
+}
+
+function currentApiWorkspace() {
+  const folder = getPrimaryWorkspaceFolder();
+  const workspaceUri = String(folder?.uri?.toString?.(true) || '');
+  try { return { workspace: folder ? workspaceLocationForFolder(folder).hostPath : '', workspaceUri }; }
+  catch { return { workspace: '', workspaceUri }; }
 }
 
 function createStatusButton(text, tooltip, command, priority) {

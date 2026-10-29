@@ -128,6 +128,8 @@ API 调用危险动作必须传 `confirm: true`。SFTP 路径动作还需要 `pa
 
 ## 本机 API
 
+每个 VS Code 窗口拥有独立 API 实例，并在 `SimpleSFTP/instances/` 发布带项目根目录的发现记录。配套 SimpleExperiment 从同窗口扩展导出读取 API；全局 `api.json` 仅保留兼容提示用途。请求可携带 `X-Simple-Api-Instance` 和 URI 编码的 `X-Simple-Api-Workspace`，接收及实际出队时均核对归属。另一个窗口或切换项目后留下的旧请求会被拒绝，不自动改投新窗口。更新配套插件后，请重载所有已打开的 VS Code 窗口。
+
 扩展启动后监听本机回环端口，默认首选：
 
 ```text
