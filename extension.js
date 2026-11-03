@@ -1,4 +1,5 @@
 const vscode = require("vscode");
+const { registerQuickAccess } = require("./quick-access");
 const { AsyncLocalStorage } = require("node:async_hooks");
 const { ProgressInactivity } = require("./progress-inactivity");
 const { startRemoteFileProgress } = require("./transfer-file-progress");
@@ -175,12 +176,14 @@ let extensionContext;
 let localApiServer;
 let localApiReady;
 let serverStatusButton;
+let quickAccess;
 let sharedWatcher;
 const hostOperationLease = new HostOperationLeaseManager();
 
 function activate(context) {
   extensionDeactivating = false;
   extensionContext = context;
+  quickAccess = registerQuickAccess(vscode, context);
   loadTransferOperationLedger();
   refreshConnectTimeoutFromConfig();
   const command = vscode.commands.registerCommand(
@@ -347,8 +350,7 @@ function createStatusButton(text, tooltip, command, priority) {
   button.text = text;
   button.tooltip = tooltip;
   button.command = command;
-  button.show();
-  return button;
+  return quickAccess.track(button, command);
 }
 
 function createServerStatusButton() {
@@ -358,8 +360,7 @@ function createServerStatusButton() {
   );
   serverStatusButton.command = "simpleSftp.selectServer";
   serverStatusButton.tooltip = "选择共享服务器配置。";
-  serverStatusButton.show();
-  return serverStatusButton;
+  return quickAccess.track(serverStatusButton, "simpleSftp.selectServer");
 }
 
 function emptySharedServers() {
@@ -502,6 +503,12 @@ class ActionTreeProvider {
 
   getChildren() {
     return [
+      new ActionTreeItem({
+        label: "快捷入口与快捷键设置",
+        description: "控制底部按钮显示，并设置对应键盘快捷键",
+        icon: "settings-gear",
+        command: "simpleSftp.openQuickAccessSettings",
+      }),
       new ActionTreeItem({
         label: "创建或打开项目",
         description: "选择远端项目目录并创建本地工作区",

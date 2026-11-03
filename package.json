@@ -2,7 +2,7 @@
 	"name": "simple-sftp",
 	"displayName": "SimpleSFTP",
 	"description": "为远端项目创建本地 SFTP 同步工作区，并提供批量文件上传下载与进度反馈。",
-  "version": "0.2.117",
+  "version": "0.2.118",
 	"publisher": "simple-local",
 	"extensionKind": [
 		"ui"
@@ -17,6 +17,7 @@
 	},
 	"files": [
 		"extension.js",
+		"quick-access.js",
 		"api-server.js",
 		"host-operation-lease.js",
 		"progress-inactivity.js",
@@ -63,6 +64,10 @@
 	"main": "./extension.js",
 	"contributes": {
 		"commands": [
+			{
+				"command": "simpleSftp.openQuickAccessSettings",
+				"title": "SimpleSFTP：快捷入口与快捷键设置"
+			},
 			{
 				"command": "simpleSftp.createOrOpen",
 				"title": "SimpleSFTP：创建或打开远端项目"
@@ -113,8 +118,27 @@
 			]
 		},
 		"configuration": {
-			"title": "SimpleSFTP",
+			"title": "SimpleSFTP 设置",
 			"properties": {
+				"simpleSftp.快捷入口.显示底部按钮": {
+					"type": "boolean",
+					"default": true,
+					"scope": "application",
+					"order": 1,
+					"description": "显示底部快捷按钮。默认开启；关闭后仍可通过资源管理器中的“快捷入口与快捷键设置”、命令面板和已配置的键盘快捷键操作。"
+				},
+				"simpleSftp.快捷入口.显示的按钮": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"enum": ["选择服务器", "创建或打开项目", "远端同步到本地", "上传并标记交接", "设置下载文件范围"]
+					},
+					"uniqueItems": true,
+					"default": ["选择服务器", "创建或打开项目", "远端同步到本地", "上传并标记交接", "设置下载文件范围"],
+					"scope": "application",
+					"order": 2,
+					"description": "选择在底部显示的按钮，默认全部显示；空列表隐藏全部。命令“SimpleSFTP：快捷入口与快捷键设置”可逐项勾选，并打开对应操作的键盘快捷键编辑器；快捷键由用户自行录入、修改或移除，不预设传输按键。"
+				},
 				"simpleSftp.workspaceHostRoot": {
 					"type": "string",
 					"default": "",
