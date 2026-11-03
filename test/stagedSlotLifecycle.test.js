@@ -125,7 +125,8 @@ test("production archive builder keeps the scope across changed selections and r
 test("expiry defaults are registered and can never fall below the ruled one-day floor", () => {
   const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../package.json"), "utf8"));
   const props = pkg.contributes.configuration.properties;
-  assert.equal(pkg.version, "0.2.117");
+  assert.match(pkg.version, /^\d+\.\d+\.\d+$/);
+  assert.equal(pkg.version, require("../package-lock.json").version);
   assert.equal(props["simpleSftp.autoReclaimExpiredCommittedSlots"].type, "boolean");
   assert.equal(props["simpleSftp.autoReclaimExpiredCommittedSlots"].default, true);
   assert.equal(props["simpleSftp.stagedSlotCommittedExpiryMs"].default, 86400000);
