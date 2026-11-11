@@ -74,7 +74,7 @@ def lifecycle_machine():
 
 
 def lifecycle_contract(params):
-    root = lifecycle_canonical(params["projectDir"])
+    root = lifecycle_canonical(params["projectDir"], exists=False)
     install = lifecycle_canonical(params["installDir"], exists=False)
     namespace = os.path.basename(root) + "." + hashlib.sha256(root.encode()).hexdigest()[:16]
     state = lifecycle_canonical(params.get("stateDir") or os.path.join(install, "state", "projects", namespace), exists=False)
