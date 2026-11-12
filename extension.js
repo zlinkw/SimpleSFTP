@@ -202,6 +202,11 @@ function activate(context) {
     "simpleSftp.uploadFiles",
     (options) => uploadFiles(options)
   );
+  context.subscriptions.push(vscode.commands.registerCommand("simpleSftp.downloadPaths", async (options = {}) => {
+    await localApiReady;
+    if (!localApiServer || localApiServer.disposed) throw new Error("SimpleSFTP 当前窗口 API 未就绪。");
+    return localApiServer.downloadPathsFromHost(options, getWorkspaceRoot());
+  }));
   context.subscriptions.push(vscode.commands.registerCommand("simpleSftp.agentLifecycle", options => agentLifecycle(options)));
   const selectServerCommand = vscode.commands.registerCommand(
     "simpleSftp.selectServer",

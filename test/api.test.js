@@ -17,6 +17,42 @@ const {
 } = require("../api-server.js");
 
 const extensionSource = fs.readFileSync(path.join(__dirname, "../extension.js"), "utf8");
+
+test('host scoped download retains the parent writer context and refuses another workspace', async () => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'host-download-lease-'));
+  const root = path.join(scratch, 'project'); fs.mkdirSync(root);
+  const leasePath = path.join(scratch, 'lease.json');
+  const parent = new HostOperationLeaseManager({ leasePath, windowId: 'host-window', heartbeatMs: 0 });
+  const download = new HostOperationLeaseManager({ leasePath, windowId: 'host-window', heartbeatMs: 0 });
+  const other = new HostOperationLeaseManager({ leasePath, windowId: 'other-window', heartbeatMs: 0 });
+  const input = { pluginId: 'test', workspaceUri: root, hostProjectPath: root, actionType: 'retain',
+    resources: [{ server: 'local', project: root, target: root }] };
+  let calls = 0;
+  let workspace = root;
+  const api = new LocalApiServer({ getWorkspace: () => ({ workspace }), methods: { 'sync.downloadPaths': async params => {
+    calls++;
+    assert.deepEqual(params.paths, ['artifacts/sample.txt']);
+    return download.run(input, async () => {
+      await assert.rejects(other.acquire(input), /正在|修改|目标/);
+      return { ok: true, paths: params.paths };
+    });
+  } } });
+  await parent.run(input, async () => {
+    const result = await api.downloadPathsFromHost({ localPath: root, paths: ['artifacts/sample.txt'] }, root);
+    assert.equal(result.ok, true);
+  });
+  await assert.rejects(api.downloadPathsFromHost({ localPath: root + '-other', paths: ['x'] }, root), /WORKSPACE_MISMATCH/);
+  assert.equal(calls, 1);
+  api.rpcLanes.files = new (require('../transfer-capacity').TransferCapacity)({ concurrency: 1 });
+  let release, entered;
+  const ready = new Promise(resolve => entered = resolve), held = new Promise(resolve => release = resolve);
+  const blocker = api.rpcLanes.files.run([Symbol('occupied')], undefined, async () => { entered(); await held; });
+  await ready;
+  const queued = api.downloadPathsFromHost({ localPath: root, paths: ['artifacts/sample.txt'] }, root);
+  workspace = root + '-other'; release(); await blocker;
+  await assert.rejects(queued, /WORKSPACE_MISMATCH/);
+  assert.equal(calls, 1, 'changing workspace while queued cannot reach the writer');
+});
 test('two SFTP windows retain independent discovery and reject foreign or changed-project calls',async()=>{
  let workspace='C:/project-A',calls=0;
  const a=await startServer({mark:()=>++calls},{getWorkspace:()=>({workspace,workspaceUri:'file:///project-A'})});

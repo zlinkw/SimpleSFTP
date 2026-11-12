@@ -97,6 +97,24 @@ class LocalApiServer {
     return this.discovery();
   }
 
+  async downloadPathsFromHost(params, expectedWorkspace) {
+    const assertScope = () => {
+      if (this.disposed || !expectedWorkspace
+        || normalizeWorkspace(params.localPath) !== normalizeWorkspace(expectedWorkspace)
+        || normalizeWorkspace(this.workspaceInfo().workspace) !== normalizeWorkspace(expectedWorkspace))
+        throw apiError(409, 'API_WORKSPACE_MISMATCH');
+    };
+    assertScope();
+    const controller = new AbortController();
+    return this.rpcLanes.files.run([Symbol('sync.downloadPaths')], controller.signal, () => {
+      assertScope();
+      // Keep the Extension Host caller's resource lease through the normal API handler.
+      // HTTP starts a separate async chain and would conflict with that same writer.
+      return apiRequestContext.run({ readOnly: false, signal: controller.signal, assertCurrent: assertScope },
+        () => this.methods['sync.downloadPaths'](normalParams(params), this, { signal: controller.signal }));
+    });
+  }
+
   async listen() {
     const startPort = Math.max(1024, Math.min(this.preferredPort, MAX_PORT));
     for (let port = startPort; port <= MAX_PORT; port += 1) {
