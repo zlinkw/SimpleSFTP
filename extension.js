@@ -2485,6 +2485,18 @@ async function markHandoffReady(options = {}) {
   return withHostOperationLease("mark-handoff-ready", "上传并标记交接", localPath, () => markHandoffReadyCore({ ...options, localPath }));
 }
 
+function resolveHandoffTarget(localPath, options) {
+  if (!options.server && !options.host && !options.sftpHost && !options.sshHost && !options.sshConfigHost
+    && !options.sshConfigAlias && !options.remotePath && !options.remoteBase) return readSftpConfig(localPath);
+  const server = options.server || {};
+  if (!firstNonEmpty(server.transferHost, server.resolvedHost, server.sftpHost, server.sshHost, server.host,
+    server.sshConfigHost, server.sshConfigAlias, options.sftpHost, options.sshHost, options.host, options.sshConfigHost, options.sshConfigAlias)
+    || !firstNonEmpty(server.user, server.username, options.user, options.username) || !requestedRemotePath(options)) {
+    throw new Error("交接的明确服务器目标不完整，未使用工作区默认目标。");
+  }
+  return resolveUploadSftp(localPath, { ...options, port: options.port || options.sshPort || server.sshPort || server.port || 22 });
+}
+
 async function markHandoffReadyCore(options = {}) {
   try {
     const workspaceFolder = getPrimaryWorkspaceFolder();
@@ -2495,7 +2507,7 @@ async function markHandoffReadyCore(options = {}) {
       vscode.window.showErrorMessage(message);
       return { ok: false, error: message };
     }
-    const sftp = readSftpConfig(localPath);
+    const sftp = resolveHandoffTarget(localPath, options);
     if (!sftp || !sftp.remotePath || !sftp.host) {
       const message = "当前工作区没有可用的 .vscode/sftp.json。";
       if (options.apiMode) throw new Error(message);
@@ -2503,6 +2515,14 @@ async function markHandoffReadyCore(options = {}) {
       return { ok: false, error: message };
     }
 
+    if (options.expectedTransferTarget) assertTransferTargetUnchanged(options.expectedTransferTarget, sftp);
+    const workspace = workspaceFolder ? workspaceLocationForFolder(workspaceFolder).hostPath : "";
+    const assertCurrent = () => {
+      const currentFolder = getPrimaryWorkspaceFolder();
+      const currentWorkspace = currentFolder ? workspaceLocationForFolder(currentFolder).hostPath : "";
+      if (currentWorkspace !== workspace) throw new Error("工作区已变化，未继续交接。");
+      assertTransferTargetUnchanged(sftp, resolveHandoffTarget(localPath, options));
+    };
     await confirmTransferPath({ localPath, sftp, operation: "写入交接标记", detail: "远端项目交接标记；若选择上传则包含全部本地文件", options });
 
     let uploadRequested = false;
@@ -2519,6 +2539,7 @@ async function markHandoffReadyCore(options = {}) {
       uploadRequested = action === "上传全部并标记";
     }
 
+    assertCurrent();
     if (uploadRequested) {
       await uploadAllLocalToRemote({ localPath, sftp, pathConfirmed: true });
     }
@@ -2537,6 +2558,7 @@ async function markHandoffReadyCore(options = {}) {
 
     const cfg = vscode.workspace.getConfiguration("simpleSftp");
     const markerName = cfg.get("handoffMarkerName") || DEFAULT_HANDOFF_MARKER;
+    assertCurrent();
     await writeRemoteHandoffMarker(sftp, markerName, marker);
     writeLocalSessionRecord(localPath, {
       action: "handoffReady",
@@ -4848,7 +4870,7 @@ function createLocalApiMethods() {
     "handoff.markReady": async (params = {}) => {
       const localPath = String(params.localPath || "").trim();
       if (!localPath) throw new Error("缺少本地工作区 localPath。");
-      const sftp = readSftpConfig(localPath) || apiTransferSftp(params);
+      const sftp = resolveHandoffTarget(localPath, params);
       requireApiConfirmation(params, {
         method: "handoff.markReady",
         operation: "上传并标记交接",
@@ -4856,7 +4878,7 @@ function createLocalApiMethods() {
         localPath,
         pathRequired: true,
       });
-      const result = await markHandoffReady({ ...params, apiMode: true, localPath });
+      const result = await markHandoffReady({ ...params, apiMode: true, localPath, expectedTransferTarget: sftp });
       publishLocalApiEvent("handoff.markReady", {
         localPath,
         remotePath: result && result.remotePath,
