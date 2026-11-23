@@ -4761,12 +4761,24 @@ function createLocalApiMethods() {
       if (!id && !operationId) throw new Error("缺少 transferId 或 operationId。");
       const reason = String(params.reason || "用户通过 API 取消");
       let operation = operationId ? transferOperationLedger.get(operationId) : undefined;
+      const selectedTransfer = id ? activeTransfers.get(id) : undefined;
+      const selectedTransferOperationId = selectedTransfer?.operationId;
+      const transferOperation = selectedTransfer?.operationId ? transferOperationLedger.get(selectedTransfer.operationId) : undefined;
+      if (id && operationId && selectedTransfer && selectedTransfer.operationId !== operationId)
+        return { ok: true, transferId: id, operationId, cancelled: false, status: "identityMismatch", settled: false, instanceId: currentTransferApiInstanceId() };
+      if (id && operation && !selectedTransfer)
+        return { ok: true, transferId: id, operationId, cancelled: false, status: "outcomeUnknown", settled: false, operationInstanceId: operation.operationInstanceId, instanceId: currentTransferApiInstanceId() };
+      if (id && !operationId && params.operationInstanceId && (!transferOperation || params.operationInstanceId !== transferOperation.operationInstanceId))
+        return { ok: true, transferId: id, operationId, cancelled: false, status: transferOperation ? "identityMismatch" : "outcomeUnknown", settled: false, instanceId: currentTransferApiInstanceId() };
       if (operation && params.operationInstanceId && params.operationInstanceId !== operation.operationInstanceId)
         return { ok: true, transferId: id, operationId, cancelled: false, status: "identityMismatch", settled: false, operationInstanceId: operation.operationInstanceId, instanceId: currentTransferApiInstanceId() };
       if (operation && operation.status === "settled") {
+        const settledOperation = operation;
         await transferLedgerWrite.catch(() => undefined);
+        if (id && (activeTransfers.get(id) !== selectedTransfer || selectedTransfer.operationId !== selectedTransferOperationId))
+          return { ok: true, transferId: id, operationId, cancelled: false, status: "outcomeUnknown", settled: false, instanceId: currentTransferApiInstanceId() };
         operation = transferOperationLedger.get(operationId);
-        if (operation?.status === "settled" && operation.persisted)
+        if (operation === settledOperation && operation.status === "settled" && operation.persisted)
           return { ok: true, transferId: id, operationId, cancelled: true, status: "settled", settled: true, operationInstanceId: operation.operationInstanceId, instanceId: currentTransferApiInstanceId() };
         return { ok: true, transferId: id, operationId, cancelled: false, status: "outcomeUnknown", settled: false, operationInstanceId: operation?.operationInstanceId || "", instanceId: currentTransferApiInstanceId() };
       }
@@ -4783,7 +4795,11 @@ function createLocalApiMethods() {
         operation.reason = reason;
         await persistTransferOperationLedger();
       }
-      const targets = [...activeTransfers.values()].filter(t => id ? t.id === id : t.operationId === operationId);
+      if (operationId && (transferOperationLedger.get(operationId) !== operation || operation.status !== "cancelling"))
+        return { ok: true, transferId: id, operationId, cancelled: false, status: "outcomeUnknown", settled: false, instanceId: currentTransferApiInstanceId() };
+      if (id && (activeTransfers.get(id) !== selectedTransfer || selectedTransfer && selectedTransfer.operationId !== selectedTransferOperationId))
+        return { ok: true, transferId: id, operationId, cancelled: false, status: "outcomeUnknown", settled: false, instanceId: currentTransferApiInstanceId() };
+      const targets = id ? (selectedTransfer ? [selectedTransfer] : []) : [...activeTransfers.values()].filter(t => t.operationId === operationId);
       if (!targets.length && !operationId) throw new Error("未找到活动传输：" + id);
       for (const transfer of targets) transfer.cancel(reason);
       if (operation) await maybeSettleTransferOperation(operationId);
