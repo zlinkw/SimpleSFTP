@@ -1305,10 +1305,18 @@ class CleanupFileApi {
     }
     if (typeof params.digest !== "string" || params.digest !== row.digest) fail("CONFIRM_REQUIRED", undefined, { reason: "后台删除必须绑定该隔离 token 的冻结摘要" });
     if (row.action !== "isolate") fail("NOT_ISOLATION_TOKEN", "后台删除入口只接受已登记的隔离 token，永久删除的通用确认链不变");
-    if (params.parentCleanupToken !== undefined) {
-      const parents = await this.read(params.parentCleanupToken, params.consumerRoot);
-      if (!parents.isolationParentCleanup || !parents.sourceIsolationTokens.includes(row.token) || parents.confirmations !== 2
-          || !parents.includeIsolatedArtifacts || hash(parents.node) !== hash(row.node)) fail("CONFIRM_REQUIRED");
+    // Existing accepted requests may only be observed below. A new delete
+    // requires a real, twice-confirmed review of the same isolated targets.
+    const lifecycle = row.isolatedDelete;
+    if (!lifecycle || !["accepted", "executing", "unknown", "completed"].includes(lifecycle.phase)) {
+      if (params.parentCleanupToken === undefined) fail("CONFIRM_REQUIRED");
+      const parents = await this.read(params.parentCleanupToken, params.consumerRoot ?? row.consumerRoot);
+      const destinations = row.targets.filter(target => !target.missing).map(target => target.destination);
+      if (!parents.isolationParentCleanup || !Number.isFinite(parents.expiresAt) || Date.now() > parents.expiresAt
+          || !Array.isArray(parents.sourceIsolationTokens) || !parents.sourceIsolationTokens.includes(row.token) || parents.confirmations !== 2
+          || !parents.includeIsolatedArtifacts || hash(parents.node) !== hash(row.node)
+          || hash(parents.rootIdentity) !== hash(row.rootIdentity)
+          || !Array.isArray(parents.destinations) || destinations.some(destination => !parents.destinations.includes(destination))) fail("CONFIRM_REQUIRED");
     }
     // Caller bindings { index, relativePath, destination } are verified ONLY.
     if (params.targets !== undefined) {
@@ -1360,7 +1368,6 @@ class CleanupFileApi {
       // type 只有 file/directory 两种取值，"路径 + 空格 + 类型" 的组合键是单射的，不会串号。
       for (const answer of Array.isArray(inspected.targets) ? inspected.targets : []) map.set(String(answer.relativePath) + " " + String(answer.type), answer);
       return map; };
-    const lifecycle = row.isolatedDelete;
     // "accepted"/"already_accepted" both only ever mean "maintenance was
     // accepted" — never "deleted"; the internal phase and receipt hold the truth.
     if (lifecycle && lifecycle.phase === "completed")
@@ -1373,11 +1380,10 @@ class CleanupFileApi {
       const answers = answersByKey(inspected);
       const resolved = derived.every(({ target }) => { const answer = answers.get(target.destination + " " + target.type);
         return Boolean(answer) && answer.missing === true && answer.isolationState === "deleted"; });
-      if (!resolved) return { ok: true, state: "unknown", operationId: row.operationId, isolatedDelete: copy(lifecycle),
-        reason: "上一次后台删除结果未知：只读复检显示尚未全部删除，稍后再查即可，绝不重复执行删除" };
-      row.isolatedDelete = { ...copy(lifecycle), phase: "completed", verifiedBy: "isolation_deleted", completedAt: new Date().toISOString() };
-      await this.saveIsolatedDelete(row);
-      return { ok: true, state: "already_accepted", operationId: row.operationId, verifiedBy: "isolation_deleted", isolatedDelete: copy(row.isolatedDelete) };
+      return { ok: true, state: "unknown", operationId: row.operationId, isolatedDelete: copy(lifecycle),
+        targetsAbsent: resolved,
+        reason: resolved ? "目标已不存在，但原删除执行器是否结束仍未确认；不会重复执行删除"
+          : "上一次后台删除结果未知；可继续只读核查，不会重复执行删除" };
     }
     this.busy.add(row.token);
     try {

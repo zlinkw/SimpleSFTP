@@ -1729,14 +1729,14 @@ const API_METHOD_CAPABILITIES = {
       "files.cleanup.preview": { readOnly: true, maxTargets: 500, fixedTypes: ["file", "directory"], zeroWrites: true, gitRepositoryAncestors: true, readOnlyReceiptCheck: true, formalJobOwnerGuard: 1, immutableArchiveBatch: 1, confirmedPathDeletion: 1, confirmedPathMetadata: 1, confirmedPathNestedRepositories: 1, isolateFast: 1, requiredInputGuard: 1, registeredIsolationDeletion: 1, backgroundIsolatedDelete: 1, handleScan: "visible_same_user_processes", procVisibilityLimit: "reported", activeHandleBlocks: true },
       "files.cleanup.isolationParentsPreview": { readOnly: true, zeroWrites: true, emptyDirectoriesOnly: 1, exactParentPaths: 1, deleteConfirmationCount: 2 },
       "files.cleanup.confirm": { exactBatchDigest: true, deleteConfirmationCount: 2, rememberedPaths: false },
-      "files.cleanup.stagedSlots": { readOnly: true, incomingGenerationPreview: true, retainedGenerations: 2, expiredCommittedReclaim: 1, defaultExpiryMs: 86400000, virtualRetentionWindow: 2, structuredBlockEvidence: 1, releaseConfirmationCount: 1 },
+      "files.cleanup.stagedSlots": { readOnly: true, incomingGenerationPreview: true, retainedGenerations: 2, expiredCommittedReclaim: 0, defaultExpiryMs: 86400000, virtualRetentionWindow: 2, structuredBlockEvidence: 1, releaseConfirmationCount: 2 },
       "files.cleanup.execute": { noOverwrite: true, parentCwdRequired: true, targetArgument: "./direct-child", journaled: true, managedObservation: 1, tmuxSessionPrefix: 1, subtreeSingleWriter: 1, serverWindowSelfClose: 1, isolationCompletionReceipt: 1 },
       // 0.2.111 后台删除入口：只接受已登记隔离 token，删除集合由插件登记记录派生；
       // 它仍是远端修改（不声明 readOnly），但作为隔离区维护任务不长期占用传输忙。
-      "files.cleanup.isolatedMaintenanceDelete": { registeredIsolationTokenOnly: 1, pluginDerivedDeleteSet: 1, isolationCompletionReceiptRequired: 1, clientSuppliedDestinations: false, maintenanceChannel: 1, executorEvidenceAtMoveOnly: 1, userConfirmedSlotRelease: 1 },
+      "files.cleanup.isolatedMaintenanceDelete": { registeredIsolationTokenOnly: 1, pluginDerivedDeleteSet: 1, isolationCompletionReceiptRequired: 1, clientSuppliedDestinations: false, maintenanceChannel: 1, executorEvidenceAtMoveOnly: 1, userConfirmedSlotRelease: 1, twiceConfirmedParentRequired: 1 },
       "sync.projectInventory": { scopeTransport: "stdin",
         readOnly: true, ownCacheWritesOnly: true, maxScopePaths: 5000, maxScopeBytes: 1048576, idlePolicy: "observe-filesystem", scopedTraversal: "direct-roots-v1", codeInventoryLane: 1, capacityTiming: 1, metadataOnly: 1, contentIdentity: 1 },
-      "sync.serverToServerFpsync": { retentionKey: "stable-logical-source", generation: "stable-run-id", retainedGenerations: 2, claimScopedExpiredReclaim: 1, stageBlockEvidence: 1, compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
+      "sync.serverToServerFpsync": { retentionKey: "stable-logical-source", generation: "stable-run-id", retainedGenerations: 2, claimScopedExpiredReclaim: 0, stageBlockEvidence: 1, compression: ["auto", "gzip", "zstd", "none"], singleStream: "boolean", compressionPolicy: "bounded-sample-cpu-link-v1", maxBatchBytes: FPSYNC_MAX_BATCH_BYTES, chunkBytes: 8 * 1024 * 1024, fileProgress: "committed-files-v1" },
       "sync.downloadMappedPaths": { compression: ["auto", "gzip", "none"], maxBatchBytes: "number", memoryOnly: true, memoryWrapperResults: true, maxMemoryBytes: 4 * 1024 * 1024, manifestTransport: "stdin", maxManifestBytes: 1024 * 1024, memoryReadLane: 1, capacityTiming: 1 },
     };
 
@@ -1947,13 +1947,9 @@ async function attachStagedStageBlock(error, context) {
 }
 
 async function reclaimExpiredStagedSlots(options = {}) {
-  // Ruled claim-scoped reclaim: inspect ONLY this run's identity/lane, act ONLY on the single
-  // leaving slot the REMOTE clock proves committed and older than the threshold, and route it
-  // through the existing preview → one confirm → isolate → completion-proven → registered-delete
-  // chain. No global scan, no background service. Any non-completed observation, unknown receipt
-  // or refused delete STOPS without replay; the transfer then surfaces its unchanged
-  // TRANSFER_STAGE_PENDING plus the structured stage block.
-  const { destination, identity, generation, scope, lane, consumerRoot, api, expiryMs } = options;
+  // Expired slots are only discovered here. Permanent deletion requires the
+  // user's exact-path review and two confirmations in the cleanup workflow.
+  const { destination, identity, generation, lane, expiryMs, consumerRoot, api } = options;
   if (!api || typeof api.preview !== "function") return { attempted: false, reason: "no-cleanup-api" };
   if (!/^[0-9a-f]{64}$/.test(String(identity || "")) || !/^[0-9a-f]{64}$/.test(String(generation || ""))) return { attempted: false, reason: "invalid-scope" };
   const root = String(consumerRoot || "");
@@ -1962,54 +1958,10 @@ async function reclaimExpiredStagedSlots(options = {}) {
   const report = await stagedSlotStaleReport(node, identity, generation, expiryMs);
   const leaving = (report.stale || [])[0];
   if (!leaving) return { attempted: false, reason: "no-leaving-candidate", lane, identity };
-  if (leaving.expiredCommitted !== true || leaving.status !== "committed" || leaving.locked === true) {
+  if (leaving.expiredCommitted !== true || leaving.status !== "committed" || leaving.locked === true)
     return { attempted: false, reason: String(leaving.expiryReason || "not-expired"), lane, identity };
-  }
-  const relativePath = String(leaving.path || "");
-  if (!relativePath) return { attempted: false, reason: "no-leaving-path", lane, identity };
-  // P1-3 ruling: the authorization binds to THIS journal, not merely to a path. identity, the
-  // committed generation, the terminal moment and the expiry threshold ride the frozen preview
-  // row and reach the engine's under-lock rename so a resumed, regenerated or freshly
-  // re-committed slot can never be isolated on the earlier verdict. A candidate whose binding
-  // facts are unusable is fail-closed skipped, never reclaimed.
-  const leavingGeneration = String(leaving.generation || "");
-  if (!/^[0-9a-f]{64}$/.test(leavingGeneration)) return { attempted: false, reason: "no-leaving-generation", lane, identity };
-  const expectedStagedJournal = { identity, generation: leavingGeneration, status: "committed",
-    terminalAt: Number.isInteger(leaving.terminalAt) && leaving.terminalAt > 0 ? leaving.terminalAt : null, expiryMs };
-  const archiveBatch = "job-" + crypto.createHash("sha256")
-    .update(JSON.stringify(["staged-slot-reclaim", identity, leaving.generation, relativePath, crypto.randomBytes(8).toString("hex")])).digest("hex").slice(0, 48);
-  const preview = await api.preview({ node, action: "isolate", consumerRoot: root, authorizationSource: "auto_expiry_reclaim",
-    stagedJournal: expectedStagedJournal,
-    targets: [{ relativePath, type: "directory", archiveBatch, destination: "clean_dir/" + archiveBatch + "/" + relativePath }] });
-  const pending = preview.targets.map((target, index) => ({ target, index })).filter(({ target }) => !target.missing);
-  if (!pending.length) return { attempted: true, outcome: "unknown", reason: "candidate-vanished", lane, identity };
-  try {
-    await api.confirm({ token: preview.token, digest: preview.digest, confirm: true, phase: 1, consumerRoot: root,
-      exactTargets: preview.targets.filter(target => !target.missing).map(target => target.absolutePath) });
-    for (const { index } of pending) await api.execute({ token: preview.token, digest: preview.digest, index, consumerRoot: root });
-    // Bounded wait for the ISOLATION completion proof only (the delete itself is the maintenance
-    // channel and never blocks this decision). "unknown" states stop the wait — never re-sent.
-    let isolated = false;
-    for (let attempt = 0; attempt < 40; attempt++) {
-      const row = await api.status({ token: preview.token, consumerRoot: root });
-      if (pending.every(({ index }) => row.states[index] === "completed")) { isolated = true; break; }
-      if (pending.some(({ index }) => row.states[index] === "unknown")) break;
-      await new Promise(resolve => setTimeout(resolve, 3000));
-    }
-    if (!isolated) return { attempted: true, outcome: "unknown", reason: "isolation-completion-not-proven", lane, identity, token: preview.token };
-    // Permanent deletion derives its set EXCLUSIVELY from this frozen ledger token; without the
-    // move-time completion proof the entry itself refuses (NOT_ISOLATION_COMPLETION_RECEIPT).
-    const deletion = await api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, consumerRoot: root,
-      targets: pending.map(({ index, target }) => ({ index, relativePath: target.relativePath, destination: target.destination })) });
-    const state = String(deletion && deletion.state || "unknown");
-    return { attempted: true, outcome: ["accepted", "already_accepted"].includes(state) ? "accepted" : "not-accepted",
-      deleteState: state, isolationProven: true, lane, identity, token: preview.token, digest: preview.digest };
-  } catch (error) {
-    // An error after mutations were sent is an UNKNOWN outcome, not a retry signal: the ledger
-    // (batchExecuting / isolatedDelete lifecycle) is what later readers resolve against.
-    return { attempted: true, outcome: "unknown", reason: String(error && error.code || error && error.message || "reclaim-failed").slice(0, 200),
-      lane, identity, token: preview.token, digest: preview.digest };
-  }
+  return { attempted: false, reason: "manual-review-required", manualReviewRequired: true,
+    relativePath: String(leaving.path || ""), lane, identity };
 }
 
 function stagedTarUnpackingCommand(destination, compression, options = {}, expectedFiles = {}, paths = Object.keys(expectedFiles)) {
@@ -2322,11 +2274,8 @@ async function syncServerToServerFpsyncCore(options = {}, progress) {
   const effectiveOptions = { ...options, generation: options.generation || options._operationId || transferController?.operationId || transferController?.id || nextTransferId("staging"), compression, expectedFiles: sourceHashes, wireTelemetry: true, onWireBytes: (count) => { wireBytes += count; } };
   const planned = partitionTransferPaths(changed, options.singleStream === true ? Math.max(changed.length, 1) : 80,
     FPSYNC_PARALLEL_STREAMS, fileSizes, FPSYNC_MAX_BATCH_BYTES);
-  // Claim-scoped expiry reclaim for THIS run's identities only (ruled Q2): before the receiver
-  // claims, each lane of this scope gets one read-only admission report; an expired committed
-  // leaving slot is reclaimed through the existing managed isolate-then-delete chain. No scan of
-  // any other identity, no background service, and every unknown outcome just leaves the classic
-  // fail-closed pending error in place (now enriched with the structured stage block).
+  // Inspect only this run's identities. An expired slot requires manual
+  // review; the transfer never confirms, isolates or deletes it automatically.
   // EXACTLY the receiver's own normalization (transferScope64 over options.generation, which the
   // effective options always set): a plain supported run id like "run-1" must reach the reclaim
   // check, the reclaim itself and the stage-block probe as the same 64-hex generation the

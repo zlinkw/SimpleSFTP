@@ -225,7 +225,7 @@
 				"simpleSftp.autoReclaimExpiredCommittedSlots": {
 					"type": "boolean",
 					"default": true,
-					"description": "Worker 同步在 claim 前就地回收本次身份已过期的最旧 committed 暂存槽（仅限本次 identity/lane，无后台扫描；journal 不完整、非终态、锁被持有或时间不可信一律不回收）。"
+					"description": "Worker 同步前仅检查本次 identity/lane 的过期暂存槽；需由用户审核精确路径并两次确认后才能永久删除。"
 				},
 				"simpleSftp.stagedSlotCommittedExpiryMs": {
 					"type": "integer",

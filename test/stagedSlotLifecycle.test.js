@@ -218,21 +218,19 @@ function expiredLeavingReport() {
     terminalAt: 172800 }], held: [], slots: [] };
 }
 
-test("claim-scoped reclaim drives preview→confirm→isolate→registered-delete exactly once for an expired committed slot", async () => {
+test("expired committed slots are reported for manual review without mutations", async () => {
   const calls = [], bindings = [];
   let transmitted = null;
   __test.setRemoteBatchTransport(async (source, command) => { transmitted = requestPayload(command); return JSON.stringify(expiredLeavingReport()); });
   try {
     const result = await __test.reclaimExpiredStagedSlots({ destination: { host: "127.0.0.1", username: "u", port: 22, remotePath: "/srv/project" },
       identity, generation, scope: "project-files", lane: 0, consumerRoot: "/fixture/project", api: fakeCleanupApi(calls, { bindings }), expiryMs: 86400000 });
-    assert.equal(result.outcome, "accepted");
-    assert.equal(result.isolationProven, true);
+    assert.equal(result.reason, "manual-review-required");
+    assert.equal(result.manualReviewRequired, true);
     assert.equal(transmitted.mode, "staleReport");
     assert.deepEqual(transmitted.expiry, { ms: 86400000 });
-    assert.deepEqual(calls, ["preview:auto_expiry_reclaim", "preview-consumer:/fixture/project", "confirm:1", "execute", "status", "delete"]);
-    // P1-3 ruling: the authorization rides the preview as an EXPLICIT journal binding — the
-    // engine re-proves these exact facts under the slot lock before any rename.
-    assert.deepEqual(bindings, [{ identity, generation, status: "committed", terminalAt: 172800, expiryMs: 86400000 }]);
+    assert.deepEqual(calls, []);
+    assert.deepEqual(bindings, []);
   } finally { __test.setRemoteBatchTransport(null); }
 });
 
@@ -252,10 +250,11 @@ test("a plain (non-hex) run id normalizes to the receiver generation everywhere 
   try {
     const result = await __test.reclaimExpiredStagedSlots({ destination, identity, generation: receiverGeneration,
       scope: "plans/a.yaml|task-0", lane: 0, consumerRoot: "/fixture/project", api: fakeCleanupApi(calls, { bindings }), expiryMs: 86400000 });
-    assert.equal(result.outcome, "accepted");
+    assert.equal(result.reason, "manual-review-required");
     assert.equal(transmitted.generation, receiverGeneration); // byte-for-byte the receiver request value
     assert.equal(transmitted.identity, identity);
-    assert.deepEqual(bindings, [{ identity, generation, status: "committed", terminalAt: 172800, expiryMs: 86400000 }]);
+    assert.deepEqual(bindings, []);
+    assert.deepEqual(calls, []);
   } finally { __test.setRemoteBatchTransport(null); }
   // The stage-block attach asks for THIS run's generation too, never a raw id.
   let attached = null;
@@ -270,7 +269,7 @@ test("a plain (non-hex) run id normalizes to the receiver generation everywhere 
   } finally { __test.setRemoteBatchTransport(null); }
 });
 
-test("reclaim does not touch anything for protected candidates and never replays after an unknown isolation", async () => {
+test("slot discovery never mutates protected or expired candidates", async () => {
   const base = { destination: { host: "127.0.0.1", username: "u", port: 22, remotePath: "/srv/project" },
     identity, generation, scope: "project-files", lane: 0, consumerRoot: "/fixture/project", expiryMs: 86400000 };
   const noCalls = [];
@@ -284,12 +283,11 @@ test("reclaim does not touch anything for protected candidates and never replays
     assert.deepEqual(noCalls, []);
     assert.equal((await __test.reclaimExpiredStagedSlots({ ...base, api: fakeCleanupApi(noCalls), consumerRoot: "" })).reason, "no-consumer-root");
     assert.deepEqual(noCalls, []);
-    // Isolation outcome unknown: the delete entry is never attempted and nothing is re-sent.
+    // Even an eligible candidate cannot implicitly authorize isolation or deletion.
     __test.setRemoteBatchTransport(async () => JSON.stringify(expiredLeavingReport()));
     const unknownCalls = [];
     const unknown = await __test.reclaimExpiredStagedSlots({ ...base, api: fakeCleanupApi(unknownCalls, { isolationState: "unknown" }) });
-    assert.equal(unknown.outcome, "unknown");
-    assert.equal(unknown.reason, "isolation-completion-not-proven");
-    assert.ok(!unknownCalls.includes("delete"));
+    assert.equal(unknown.reason, "manual-review-required");
+    assert.deepEqual(unknownCalls, []);
   } finally { __test.setRemoteBatchTransport(null); }
 });

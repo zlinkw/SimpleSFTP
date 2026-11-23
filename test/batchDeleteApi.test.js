@@ -80,6 +80,7 @@ function harness(options = {}) {
     }
     if (request.action === 'managed-start') return options.managedStart ? options.managedStart(request) : { ok: true, state: 'requested', rootIdentity: IDENTITY };
     if (request.action === 'managed-observe') return options.managedObserve ? options.managedObserve(request) : { ok: true, state: 'pending', rootIdentity: IDENTITY };
+    if (request.action === 'inspect-isolation-parents') return { ok: true, eligible: true, rootIdentity: IDENTITY, targets: [] };
     throw new Error('UNEXPECTED_ACTION:' + request.action);
   };
   const storageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'batch-delete-api-'));
@@ -337,30 +338,37 @@ const isolatedProbe = (target, extra = {}) => ({ relativePath: target.relativePa
   archived: true, isolationState: 'isolated',
   isolationCompletion: { ...ISO_COMPLETION, archiveBatch: ISO_BATCH, sourceRelativePath: target.relativePath.slice(('clean_dir/' + ISO_BATCH + '/').length),
     destinationRelativePath: target.relativePath }, ...extra });
+async function authorizeParent(h, preview) {
+  const parent = await h.api.previewIsolationParents({ consumerRoot: __CONSUMER__, isolationToken: preview.token, forReplacement: true });
+  for (const phase of [1, 2]) await h.api.confirm({ consumerRoot: __CONSUMER__, token: parent.token, digest: parent.digest,
+    phase, confirm: true, exactTargets: parent.confirmationPaths });
+  preview.parentCleanupToken = parent.token;
+  return preview;
+}
 async function isolatedToken(h) {
   const preview = await h.api.preview({ consumerRoot: __CONSUMER__, node: { kind: 'local', root: '/srv/proj' }, action: 'isolate',
     targets: [{ relativePath: ISO_SRC, type: 'directory', archiveBatch: ISO_BATCH, destination: ISO_DEST }] });
   assert.equal(preview.safety.backgroundIsolatedDelete, 1, 'the isolate preview must advertise the SE-published capability verbatim');
   await h.api.confirm({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, confirm: true, phase: 1, exactTargets: ['/srv/proj/' + ISO_SRC] });
   await h.api.execute({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
-  return preview;
+  return authorizeParent(h, preview);
 }
 
 test('isolatedMaintenanceDelete derives the delete set from the ledger; a replaced caller destination is refused before any RPC', async () => {
   const h = harness({ entryRow: target => target.relativePath === ISO_DEST ? isolatedProbe(target) : null });
   const preview = await isolatedToken(h);
-  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest,
+  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken,
     targets: [{ index: 0, relativePath: ISO_SRC, destination: 'clean_dir/' + ISO_BATCH + '/out/OTHER' }] }), error => error.code === 'TARGET_BINDINGS_MISMATCH');
-  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest,
+  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken,
     targets: [{ index: 1, relativePath: ISO_SRC, destination: ISO_DEST }] }), error => error.code === 'TARGET_BINDINGS_MISMATCH', 'index must name the frozen target');
-  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest,
+  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken,
     targets: [{ index: 0, relativePath: ISO_SRC, destination: ISO_DEST }, { index: 0, relativePath: ISO_SRC, destination: ISO_DEST }] }),
     error => error.code === 'TARGET_BINDINGS_MISMATCH', 'one ledger target may only be claimed once');
   await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: 'f'.repeat(64) }), error => error.code === 'CONFIRM_REQUIRED',
     'the frozen digest is mandatory');
   assert.equal(h.counts('delete-fast'), 0, 'every refusal above happened before the wire');
   assert.equal(h.counts('batch-inspect'), 0, 'even the read-only re-check is refused until the request shape and bindings hold');
-  const bound = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest,
+  const bound = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken,
     targets: [{ index: 0, relativePath: ISO_SRC, destination: ISO_DEST }] });
   assert.equal(bound.ok, true);
   assert.equal(bound.state, 'accepted', 'accepted is the highest claim this entry may make');
@@ -377,7 +385,7 @@ test('isolatedMaintenanceDelete derives the delete set from the ledger; a replac
   const stored = await h.api.read(preview.token, __CONSUMER__);
   assert.equal(stored.isolatedDelete.phase, 'completed');
   assert.deepEqual(stored.isolatedDelete.targets, [{ destinationRelativePath: ISO_DEST, type: 'directory' }]);
-  const again = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest,
+  const again = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken,
     targets: [{ index: 0, relativePath: ISO_SRC, destination: ISO_DEST }] });
   assert.equal(again.state, 'already_accepted');
   assert.equal(h.counts('delete-fast'), 1, 'a finished maintenance delete is never re-run');
@@ -387,7 +395,7 @@ test('non-isolate tokens, missing ledger residency and unregistered archive stat
   const h = harness({ entryRow: target => target.relativePath === ISO_DEST ? isolatedProbe(target) : null });
   const del = await h.preview([file('out/x.log')]);
   await confirmed(h, del);
-  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: del.token, digest: del.digest }), error => error.code === 'NOT_ISOLATION_TOKEN',
+  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: del.token, digest: del.digest, parentCleanupToken: del.parentCleanupToken }), error => error.code === 'NOT_ISOLATION_TOKEN',
     'the generic two-confirmation permanent delete chain keeps its own entry');
   // a token that lives in no ledger of THIS plugin process stops at the owner contract:
   await assert.rejects(h.api.isolatedMaintenanceDelete({ token: 'a'.repeat(48), digest: 'f'.repeat(64) }), error => error.code === 'PREVIEW_EXPIRED',
@@ -399,7 +407,7 @@ test('non-isolate tokens, missing ledger residency and unregistered archive stat
   ]) {
     const g = harness({ entryRow: target => target.relativePath === ISO_DEST ? probe(target) : null });
     const preview = await isolatedToken(g);
-    await assert.rejects(g.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest,
+    await assert.rejects(g.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken,
       targets: [{ index: 0, relativePath: ISO_SRC, destination: ISO_DEST }] }), error => error.code === 'NOT_REGISTERED_ISOLATION', label);
     assert.equal(g.counts('delete-fast'), 0, label + ': refusal happens before the mutation');
     const stored = await g.api.read(preview.token, __CONSUMER__);
@@ -415,7 +423,7 @@ test('a ledger without any move-moment receipt keeps the manual chain: NOT_ISOLA
     receipt: { operationId: 'cleanup-op', action: 'isolate', phase: 'completed' } }),
   entryRow: target => target.relativePath === ISO_DEST ? isolatedProbe(target, { isolationCompletion: undefined }) : null });
   const preview = await isolatedToken(plain);
-  await assert.rejects(plain.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest }),
+  await assert.rejects(plain.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken }),
     error => error.code === 'NOT_ISOLATION_COMPLETION_RECEIPT');
   assert.equal(plain.counts('delete-fast'), 0);
   // the same ledger WITHOUT the local receipt still runs when the persisted
@@ -424,7 +432,7 @@ test('a ledger without any move-moment receipt keeps the manual chain: NOT_ISOLA
     receipt: { operationId: 'cleanup-op', action: 'isolate', phase: 'completed' } }),
   entryRow: target => target.relativePath === ISO_DEST ? isolatedProbe(target) : null });
   const echoPreview = await isolatedToken(echo);
-  const ran = await echo.api.isolatedMaintenanceDelete({ token: echoPreview.token, digest: echoPreview.digest });
+  const ran = await echo.api.isolatedMaintenanceDelete({ token: echoPreview.token, digest: echoPreview.digest, parentCleanupToken: echoPreview.parentCleanupToken });
   assert.equal(ran.state, 'accepted');
   assert.equal(echo.counts('delete-fast'), 1);
 });
@@ -436,50 +444,51 @@ test('an incomplete isolate batch is never deleted: pending and absent siblings 
       { relativePath: 'out/run2', type: 'directory', archiveBatch: ISO_BATCH, destination: 'clean_dir/' + ISO_BATCH + '/out/run2' }] });
   await h.api.confirm({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, confirm: true, phase: 1,
     exactTargets: ['/srv/proj/' + ISO_SRC, '/srv/proj/out/run2'] });
+  await authorizeParent(h, preview);
   await h.api.execute({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
-  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest }), error => error.code === 'NOT_ISOLATED_COMPLETE',
+  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken }), error => error.code === 'NOT_ISOLATED_COMPLETE',
     'one unfinished target blocks the whole token; partial maintenance deletion is not offered');
   assert.equal(h.counts('delete-fast'), 0);
   await h.api.execute({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 1 });
-  const done = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  const done = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken });
   assert.equal(done.state, 'accepted');
   assert.deepEqual(h.lastOf('delete-fast').entries.map(e => e.relativePath).sort(),
     [ISO_DEST, 'clean_dir/' + ISO_BATCH + '/out/run2']);
 });
 
-test('lost mutation answers stay unknown and resolve read-only; only the proven zero-mutation fact is a retryable failed', async () => {
+test('lost mutation answers stay unknown on read-only checks; only the proven zero-mutation fact is a retryable failed', async () => {
   let gone = false;
   const h = harness({ entryRow: target => target.relativePath !== ISO_DEST ? null
     : gone ? { relativePath: ISO_DEST, type: 'directory', missing: true, archived: true, isolationState: 'deleted' } : isolatedProbe(target) });
   const preview = await isolatedToken(h);
   h.deleteFastReplies.push({ ok: false, error: { code: 'REQUEST_TIMEOUT', message: 'the mutation answer was lost' } });
-  const lost = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  const lost = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken });
   assert.equal(lost.ok, true, 'a maintenance failure is never thrown back into the dispatch chain');
   assert.equal(lost.state, 'unknown');
   assert.match(lost.reason, /REQUEST_TIMEOUT/, 'the failure carries a displayable reason');
   const mid = await h.api.read(preview.token, __CONSUMER__);
   assert.equal(mid.isolatedDelete.phase, 'unknown');
   // still-present destinations while unknown: NOT re-mutated, answered unknown.
-  const stillThere = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  const stillThere = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken });
   assert.equal(stillThere.state, 'unknown');
   assert.equal(h.counts('delete-fast'), 1, 'unknown is resolved by read-only re-inspection, never by a second mutation');
-  // read-only facts show every destination gone with persisted deleted markers.
+  // Missing destinations and deleted markers still do not prove the executor ended.
   gone = true;
-  const resolved = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
-  assert.equal(resolved.state, 'already_accepted');
-  assert.equal(resolved.verifiedBy, 'isolation_deleted');
+  const resolved = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken });
+  assert.equal(resolved.state, 'unknown');
+  assert.equal(resolved.targetsAbsent, true);
   assert.equal(h.counts('delete-fast'), 1);
   const done = await h.api.read(preview.token, __CONSUMER__);
-  assert.equal(done.isolatedDelete.phase, 'completed');
+  assert.equal(done.isolatedDelete.phase, 'unknown');
   // a refusal with the explicit zero-mutation fact is a displayable failed and stays retryable.
   const g = harness({ entryRow: target => target.relativePath === ISO_DEST ? isolatedProbe(target) : null });
   const gPreview = await isolatedToken(g);
   g.deleteFastReplies.push({ ok: false, error: { code: 'ENTRY_IDENTITY_CHANGED', message: 'identity drifted before any unlink', mutationStarted: false } });
-  const refused = await g.api.isolatedMaintenanceDelete({ token: gPreview.token, digest: gPreview.digest });
+  const refused = await g.api.isolatedMaintenanceDelete({ token: gPreview.token, digest: gPreview.digest, parentCleanupToken: gPreview.parentCleanupToken });
   assert.equal(refused.state, 'failed', 'only the engine-proven zero-mutation fact may claim failed');
   assert.match(refused.reason, /ENTRY_IDENTITY_CHANGED/);
   assert.equal((await g.api.read(gPreview.token, __CONSUMER__)).isolatedDelete.phase, 'failed');
-  const retried = await g.api.isolatedMaintenanceDelete({ token: gPreview.token, digest: gPreview.digest });
+  const retried = await g.api.isolatedMaintenanceDelete({ token: gPreview.token, digest: gPreview.digest, parentCleanupToken: gPreview.parentCleanupToken });
   assert.equal(retried.state, 'accepted');
   assert.equal(g.counts('delete-fast'), 2, 'a proven no-op failed is retryable exactly once per call, with no parallel executor');
 });
@@ -492,10 +501,10 @@ test('concurrent calls for one token never create a second executor', async () =
   // hold the delete-fast reply so the second call arrives while the first runs
   base.api.transport = async request => { const value = await original(request);
     if (request.action === 'delete-fast') await gate; return value; };
-  const first = base.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  const first = base.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken });
   await new Promise(resolve => setImmediate(resolve));
   let second;
-  try { second = await base.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest }); }
+  try { second = await base.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken }); }
   finally { release(); }
   assert.equal(second.state, 'already_accepted', 'a running maintenance delete answers already_accepted, never a second mutation');
   assert.match(second.reason, /不创建第二个删除执行器/);
@@ -519,7 +528,7 @@ async function managedIsolateToken(h, targets) {
     observationMode: 'managed_tmux', targets });
   await h.api.confirm({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, confirm: true, phase: 1,
     exactTargets: targets.map(t => '/srv/proj/' + t.relativePath) });
-  return preview;
+  return authorizeParent(h, preview);
 }
 
 test('r108 a completed managed observation is durable before the answer returns and admits the background delete', async () => {
@@ -534,7 +543,7 @@ test('r108 a completed managed observation is durable before the answer returns 
   assert.equal(returned.states[0], 'completed'); assert.equal(returned.observations[0].verifiedBy, 'completion_receipt');
   assert.equal((await h.api.read(preview.token, __CONSUMER__)).states[0], 'completed',
     'the completion proof must be durable, not merely returned — this is the r108 field defect');
-  const ran = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  const ran = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken });
   assert.equal(ran.state, 'accepted', 'a durable completed isolation token enters the background delete; NOT_ISOLATED_COMPLETE is gone');
   assert.equal(h.counts('delete-fast'), 1);
 });
@@ -566,7 +575,7 @@ test('r108 protection lock: one completed target never releases the whole-token 
   assert.deepEqual(round.states, ['completed', 'pending'], 'each target advances only on its own completed proof');
   const stored = await h.api.read(preview.token, __CONSUMER__);
   assert.deepEqual(stored.states, ['completed', 'pending']);
-  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest }),
+  await assert.rejects(h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken }),
     error => error.code === 'NOT_ISOLATED_COMPLETE', 'an unfinished sibling blocks the whole token — the protection is not relaxed');
   assert.equal(h.counts('delete-fast'), 0, 'refusal happens before any mutation');
 });
@@ -606,7 +615,7 @@ test('r110 two concurrent observations of one token each persist their own compl
     'each concurrent round may advance only its own target: neither completed may be erased by the other');
   assert.deepEqual(readLedgerFile(preview.token).states, ['completed', 'completed'],
     'P2: the durable ledger FILE must hold both completions, not only the memory preview');
-  const ran = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  const ran = await h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken });
   assert.equal(ran.state, 'accepted', 'both completions are durable, so the background delete admits at the first attempt');
   assert.equal(h.counts('delete-fast'), 1);
 });
@@ -689,7 +698,7 @@ test('r110b a rollback during a running background delete keeps the maintenance 
   await started; // the pending observation and the held managed-start are in flight
   await h.api.check({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 0 });
   await h.api.check({ consumerRoot: __CONSUMER__, token: preview.token, digest: preview.digest, index: 1 });
-  const maintenance = h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest });
+  const maintenance = h.api.isolatedMaintenanceDelete({ token: preview.token, digest: preview.digest, parentCleanupToken: preview.parentCleanupToken });
   await deleting; // acceptance and executing lifecycle are saved; the engine is still running
   releaseStart();
   const waited = await running;
