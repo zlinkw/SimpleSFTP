@@ -551,12 +551,12 @@ test("SimpleSFTP config and server API helpers are defined and validate types", 
   assert.match(extensionSource, /target\.update.*updateWorkspaceTarget/s);
 });
 
-test("r118 capability descriptors advertise claim-scoped expiry reclaim and structured stage blocks", () => {
+test("slot capabilities require manual review and two deletion confirmations", () => {
   // The API descriptor map in extension.js is the single capability authority for this repo
   // (there is no separate generated capabilities file); SE gates its release button on exactly
   // these fields PLUS the existing backgroundIsolatedDelete/isolationCompletionReceipt proofs.
-  assert.match(extensionSource, /"files\.cleanup\.stagedSlots": \{ readOnly: true, incomingGenerationPreview: true, retainedGenerations: 2, expiredCommittedReclaim: 1, defaultExpiryMs: 86400000, virtualRetentionWindow: 2, structuredBlockEvidence: 1, releaseConfirmationCount: 1 \}/);
-  assert.match(extensionSource, /"sync\.serverToServerFpsync": \{ retentionKey: "stable-logical-source", generation: "stable-run-id", retainedGenerations: 2, claimScopedExpiredReclaim: 1, stageBlockEvidence: 1/);
+  assert.match(extensionSource, /"files\.cleanup\.stagedSlots": \{ readOnly: true, incomingGenerationPreview: true, retainedGenerations: 2, expiredCommittedReclaim: 0, defaultExpiryMs: 86400000, virtualRetentionWindow: 2, structuredBlockEvidence: 1, releaseConfirmationCount: 2 \}/);
+  assert.match(extensionSource, /"sync\.serverToServerFpsync": \{ retentionKey: "stable-logical-source", generation: "stable-run-id", retainedGenerations: 2, claimScopedExpiredReclaim: 0, stageBlockEvidence: 1/);
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "../package.json"), "utf8"));
   assert.match(pkg.version, /^\d+\.\d+\.\d+$/);
   assert.equal(pkg.version, require("../package-lock.json").version);
@@ -564,10 +564,9 @@ test("r118 capability descriptors advertise claim-scoped expiry reclaim and stru
   assert.equal(props["simpleSftp.autoReclaimExpiredCommittedSlots"].default, true);
   assert.equal(props["simpleSftp.stagedSlotCommittedExpiryMs"].default, 86400000);
   assert.equal(props["simpleSftp.stagedSlotCommittedExpiryMs"].minimum, 86400000);
-  // Stage-block transport: the structured block must travel with the RPC error payload, and the
-  // automatic reclaim chain must bind its authorization source to the frozen isolate ledger.
+  // Stage-block transport retains its structured evidence; expiry cannot authorize deletion.
   assert.match(extensionSource, /error\.apiData = \{ \.\.\.\(error\.apiData[\s\S]*stageBlock/);
-  assert.match(extensionSource, /authorizationSource: "auto_expiry_reclaim"/);
+  assert.doesNotMatch(extensionSource, /authorizationSource: "auto_expiry_reclaim"/);
   const apiSource = fs.readFileSync(path.join(__dirname, "../cleanup-file-api.js"), "utf8");
   assert.match(apiSource, /INVALID_AUTHORIZATION_SOURCE/);
   assert.match(apiSource, /"auto_expiry_reclaim", "single_confirmation_release"/);

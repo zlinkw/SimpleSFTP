@@ -118,8 +118,7 @@ test("production archive builder keeps the scope across changed selections and r
 // ---------------------------------------------------------------------------
 // r118 extension-side contracts: the stage block fields are FROZEN here (SE wires
 // against exactly this shape), expiry defaults come from the registered package
-// configuration, and the claim-scoped reclaim drives the managed chain exactly
-// once — an unknown isolation outcome is never replayed.
+// configuration, and expiry discovery remains read-only.
 // ---------------------------------------------------------------------------
 
 test("expiry defaults are registered and can never fall below the ruled one-day floor", () => {
@@ -131,7 +130,7 @@ test("expiry defaults are registered and can never fall below the ruled one-day 
   assert.equal(props["simpleSftp.autoReclaimExpiredCommittedSlots"].default, true);
   assert.equal(props["simpleSftp.stagedSlotCommittedExpiryMs"].default, 86400000);
   assert.equal(props["simpleSftp.stagedSlotCommittedExpiryMs"].minimum, 86400000);
-  // The stubbed vscode config falls back to the schema defaults: the automatic chain is ON by default.
+  // The stubbed vscode config enables expiry discovery by default, without automatic deletion.
   const settings = __test.stagedSlotExpirySettings();
   assert.equal(settings.enabled, true);
   assert.equal(settings.expiryMs, 86400000);
