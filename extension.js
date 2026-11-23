@@ -2432,6 +2432,7 @@ async function syncFromRemoteCore(options = {}) {
       return { ok: false, error: message };
     }
 
+    const savedScope = options.requireSavedScope === true ? readTargetDownloadScope(localPath, options, sftp, true) : undefined;
     await confirmTransferPath({ localPath, sftp, operation: "远端同步到本地", detail: "远端项目文件覆盖到当前工作区", options });
 
     const cfg = vscode.workspace.getConfiguration("simpleSftp");
@@ -2447,8 +2448,9 @@ async function syncFromRemoteCore(options = {}) {
     }
 
     const syncStartedAt = new Date();
-    const scopedPaths = Array.isArray(options.paths) ? options.paths : null;
-    const downloadScope = scopedPaths ? explicitDownloadScope(options) : readTargetDownloadScope(localPath, options, sftp);
+    const scopedPaths = options.requireSavedScope !== true && Array.isArray(options.paths) ? options.paths : null;
+    const downloadScope = options.requireSavedScope === true ? savedScope
+      : scopedPaths ? explicitDownloadScope(options) : readTargetDownloadScope(localPath, options, sftp);
     if (scopedPaths) assertSafeScopedLocalPaths(localPath, downloadScope.paths);
     await downloadRemoteToLocal({ localPath, sftp, downloadScope });
     if (!scopedPaths) {
@@ -3379,15 +3381,22 @@ function assertSafeScopedLocalPaths(localPath, paths) {
   }
 }
 
-function readTargetDownloadScope(localPath, options, sftp) {
+function readTargetDownloadScope(localPath, options, sftp, required = false) {
   const file = targetDownloadScopeStatePath(localPath);
-  if (!fs.existsSync(file)) return null;
+  if (!required && !fs.existsSync(file)) return null;
   try {
     const state = JSON.parse(fs.readFileSync(file, "utf8"));
     const item = state && typeof state === "object" ? state[targetScopeKey(options || {}, sftp || {})] : null;
-    if (!item || !Array.isArray(item.paths) || !item.paths.length) return null;
-    return normalizeDownloadScope(item);
-  } catch {
+    if (!item || !Array.isArray(item.paths) || !item.paths.length
+      || required && item.paths.some(value => typeof value !== "string" || !value.trim())) {
+      if (required) throw new Error("所选 Worker 没有有效的已保存下载范围。");
+      return null;
+    }
+    const scope = normalizeDownloadScope(item);
+    if (required && !scope.paths.length) throw new Error("所选 Worker 的下载范围为空。");
+    return scope;
+  } catch (error) {
+    if (required) throw new Error("无法读取所选 Worker 的已保存下载范围：" + String(error.message || error), { cause: error });
     return null;
   }
 }
