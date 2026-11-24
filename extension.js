@@ -8,6 +8,9 @@ const { TransferCapacity } = require("./transfer-capacity");
 const transferCapacity = new TransferCapacity();
 const metadataTreeCapacity = new TransferCapacity();
 const metadataInventoryCapacity = new TransferCapacity();
+const cleanupReadCapacity = new TransferCapacity();
+// 0.2.111 隔离区后台删除走独立的受限并发维护通道：既不与批量传输抢容量，也不得被借用为读池。
+const maintenanceCleanupCapacity = new TransferCapacity();
 // Short, exact code checks cannot queue behind a recursive artifact inventory.
 // Each lane remains bounded to two servers globally and one read per server.
 const codeInventoryCapacity = new TransferCapacity();
@@ -4883,16 +4886,15 @@ function createLocalApiMethods() {
     methods[name] = async (params = {}) => {
       const controllerId = nextTransferId(name);
       const operationId = String(params._operationId || controllerId);
-      // Cleanup mutations keep a server-assigned identity and remain writes;
-      // path leases and the cleanup engine protect their concrete targets.
-      const cleanupRequest = name.startsWith("files.cleanup.");
-      const cleanupRead = ["files.cleanup.preview", "files.cleanup.isolationParentsPreview", "files.cleanup.inspect", "files.cleanup.check", "files.cleanup.verify", "files.cleanup.status", "files.cleanup.observeBatch", "files.cleanup.stagedSlots"].includes(name);
-      const cleanupMutation = cleanupRequest && !cleanupRead;
-      const remoteMutation = cleanupMutation || /^(upload[.]|handoff[.]|sync[.](?:serverToServer|deletePath)|remote[.])/.test(name);
+      // 隔离区后台删除是远端修改（只删已登记隔离副本，范围由引擎按登记约束），
+      // 它不获得 readObserver 只读身份；它对传输忙的豁免来自下面显式登记的维护事实。
+      const remoteMutation = name === "files.cleanup.isolatedMaintenanceDelete"
+        || /^(upload[.]|handoff[.]|sync[.](?:serverToServer|deletePath)|remote[.])/.test(name);
       const recoveryContext = name === "sync.serverToServerFpsync" || READ_ONLY_SETTLEMENT_METHODS.includes(name)
         ? { method: name, params: retryIdentity(params) } : undefined;
       // Metadata is a cancellable read, never a durable modifying transaction.
       // Stale receipts cannot lock a fresh file-tree refresh.
+      const cleanupRequest = name.startsWith("files.cleanup.");
       // downloadMappedPaths reads the server but writes local destinations.
       // It needs writer settlement/cancellation receipts, unlike pure metadata.
       const metadataRead = (READ_ONLY_SETTLEMENT_METHODS.includes(name) && (name !== "sync.downloadMappedPaths" || params.memoryOnly === true))
@@ -4905,8 +4907,9 @@ function createLocalApiMethods() {
       const controller = createTransferController({ id: controllerId, operation: name, localPath: params.localPath || params.localBase || "", remotePath: params.remotePath || "", host: params.source?.host || params.host || "",
         // No file operation is failed or killed because a filesystem call is slow.
         // Errors and explicit cancellation still settle through the original path.
-        // Only the server route assigns this identity; clients cannot mark transfers as cleanup.
-        observeOnlyIdle: true, readObserver, remoteMutation, maintenanceCleanup: cleanupMutation });
+        // 维护豁免事实由本路由按方法名固定登记（客户端参数无法伪装或删除执行不得自称）：
+        // 只有 files.cleanup.isolatedMaintenanceDelete 这一个入口的控制器携带它。
+        observeOnlyIdle: true, readObserver, remoteMutation, maintenanceCleanup: name === "files.cleanup.isolatedMaintenanceDelete" });
       controller.operationId = operationId;
       const requestContext = currentApiRequestContext();
       const readSignal = requestContext?.readOnly ? requestContext.signal : undefined;
@@ -4918,12 +4921,12 @@ function createLocalApiMethods() {
         const codeInventory = name === "sync.projectInventory" && params.inventoryPurpose === "code-sync"
           && Array.isArray(params.scopePaths) && params.scopePaths.length > 0 && !params.scopePaths.includes(".");
         const memoryRead = name === "sync.downloadMappedPaths" && params.memoryOnly === true && params.metricsOnly === true;
+        const cleanupRead = ["files.cleanup.preview", "files.cleanup.isolationParentsPreview", "files.cleanup.inspect", "files.cleanup.check", "files.cleanup.verify", "files.cleanup.status", "files.cleanup.observeBatch", "files.cleanup.stagedSlots"].includes(name);
         const metadataInventory = name === "sync.projectInventory" && params.metadataOnly === true;
-        const pool = metadataInventory ? metadataInventoryCapacity : memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
+        const maintenanceDelete = name === "files.cleanup.isolatedMaintenanceDelete";
+        const pool = maintenanceDelete ? maintenanceCleanupCapacity : cleanupRead ? cleanupReadCapacity : metadataInventory ? metadataInventoryCapacity : memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
           : ["sync.projectTree", "sync.projectTreeState", "sync.projectFileStats"].includes(name) ? metadataTreeCapacity : transferCapacity;
-        const invoke = () => apiRouteController.run(controller, () => method(params));
-        const runCleanup = async () => { try { return await invoke(); } finally { if (controller.operationId) await waitLocalTransferResources(controller.operationId); } };
-        const result = await transferContext.run(controller, () => cleanupRequest ? runCleanup() : withTransferCapacity(params, invoke, pool));
+        const result = await transferContext.run(controller, () => withTransferCapacity(params, () => apiRouteController.run(controller, () => method(params)), pool));
         if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认");
         if (name === "sync.projectInventory" || memoryRead) return { ...result, queryTiming: {
           capacityQueuedAt: controller.capacityQueuedAt, capacityGrantedAt: controller.capacityGrantedAt,
