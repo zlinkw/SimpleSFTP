@@ -8,7 +8,6 @@ const { TransferCapacity } = require("./transfer-capacity");
 const transferCapacity = new TransferCapacity();
 const metadataTreeCapacity = new TransferCapacity();
 const metadataInventoryCapacity = new TransferCapacity();
-const cleanupReadCapacity = new TransferCapacity();
 // Short, exact code checks cannot queue behind a recursive artifact inventory.
 // Each lane remains bounded to two servers globally and one read per server.
 const codeInventoryCapacity = new TransferCapacity();
@@ -4920,11 +4919,11 @@ function createLocalApiMethods() {
           && Array.isArray(params.scopePaths) && params.scopePaths.length > 0 && !params.scopePaths.includes(".");
         const memoryRead = name === "sync.downloadMappedPaths" && params.memoryOnly === true && params.metricsOnly === true;
         const metadataInventory = name === "sync.projectInventory" && params.metadataOnly === true;
-        const pool = cleanupRead ? cleanupReadCapacity : metadataInventory ? metadataInventoryCapacity : memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
+        const pool = metadataInventory ? metadataInventoryCapacity : memoryRead ? memoryResultCapacity : codeInventory ? codeInventoryCapacity
           : ["sync.projectTree", "sync.projectTreeState", "sync.projectFileStats"].includes(name) ? metadataTreeCapacity : transferCapacity;
         const invoke = () => apiRouteController.run(controller, () => method(params));
         const runCleanup = async () => { try { return await invoke(); } finally { if (controller.operationId) await waitLocalTransferResources(controller.operationId); } };
-        const result = await transferContext.run(controller, () => cleanupMutation ? runCleanup() : withTransferCapacity(params, invoke, pool));
+        const result = await transferContext.run(controller, () => cleanupRequest ? runCleanup() : withTransferCapacity(params, invoke, pool));
         if (controller.status === "cancelled") throw new Error("传输已取消，执行结果待确认");
         if (name === "sync.projectInventory" || memoryRead) return { ...result, queryTiming: {
           capacityQueuedAt: controller.capacityQueuedAt, capacityGrantedAt: controller.capacityGrantedAt,

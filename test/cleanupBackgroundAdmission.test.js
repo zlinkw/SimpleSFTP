@@ -15,17 +15,26 @@ try {
 
 test('independent cleanup requests enter while earlier cleanup remains pending', async () => {
   const entered = [], release = {}, reject = {};
-  subject.setTransferSettlementTestContext({ cleanupApi: { execute: params => {
+  const pending = params => {
     entered.push(params.id);
     return new Promise((resolve, fail) => { release[params.id] = resolve; reject[params.id] = fail; });
-  } }, globalState: { get: (_key, fallback) => fallback, update: async () => {} }, instanceId: 'fixture' });
+  };
+  subject.setTransferSettlementTestContext({ cleanupApi: { execute: pending, preview: pending,
+    status: async () => ({ state: 'running' }) },
+    globalState: { get: (_key, fallback) => fallback, update: async () => {} }, instanceId: 'fixture' });
   const methods = subject.createLocalApiMethods();
   const a = methods['files.cleanup.execute']({ id: 'a' });
   const b = methods['files.cleanup.execute']({ id: 'b' });
   assert.deepEqual(entered, ['a', 'b']);
+  const previewA = methods['files.cleanup.preview']({ id: 'preview-a', host: 'worker' });
+  const previewB = methods['files.cleanup.preview']({ id: 'preview-b', host: 'worker' });
+  assert.deepEqual(entered, ['a', 'b', 'preview-a', 'preview-b']);
+  assert.deepEqual(await methods['files.cleanup.status']({}), { state: 'running' });
   assert.equal(subject.cleanupActivityGuard().blockingTransferCount, 0);
   release.a({ ok: true }); release.b({ ok: true });
+  release['preview-a']({ ok: true }); release['preview-b']({ ok: true });
   assert.deepEqual(await Promise.all([a, b]), [{ ok: true }, { ok: true }]);
+  await Promise.all([previewA, previewB]);
   const failed = methods['files.cleanup.execute']({ id: 'failed' });
   reject.failed(Error('cleanup failed'));
   await assert.rejects(failed, /cleanup failed/);
