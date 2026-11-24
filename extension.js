@@ -315,7 +315,8 @@ function startLocalApiServer(context) {
     storageRoot: path.join(context.globalStorageUri.fsPath, "cleanup-operations"),
     transport: cleanupFileTransport,
     activity: async () => { cleanupActivityGuard(); },
-    lease: (node, targets, work) => withFileResourceLease("PLAN 安全清理", node.root, [""],
+    lease: (node, targets, work) => withFileResourceLease("PLAN 安全清理", node.root,
+      targets.flatMap(target => [target.relativePath, target.destination].filter(value => typeof value === "string" && value)),
       node.kind === "local" ? "local" : remoteResourceServer({ host: node.host, port: node.port }), work),
   });
   const server = new LocalApiServer({
