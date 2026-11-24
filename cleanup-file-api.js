@@ -229,8 +229,8 @@ const busyStatusText = status => typeof status === "string" ? busyText(status, 3
 // 队列键是一向哈希：无法文本化的键也要计入忙（原版 uploadQueues.size 无条件计数），但绝不外泄原值。
 const queueKeyHash = key => { let text; try { text = String(key).toLowerCase(); } catch { text = "unstringifiable:" + typeof key; }
   return crypto.createHash("sha256").update(text).digest("hex").slice(0, 12); };
-// 隔离区维护删除的生产事实：只能由服务端路由在创建控制器时登记（maintenanceCleanup 严格 true
-// 且 remoteMutation 严格 true —— 它仍是远端修改，只是范围被引擎限定在已登记隔离副本）。
+// 清理请求身份只能由服务端路由在创建控制器时登记（maintenanceCleanup 严格 true
+// 且 remoteMutation 严格 true）；具体目标仍由路径租约和清理引擎保护。
 // 方法名、客户端参数、非布尔标记都换不到豁免；同时声明只读观测身份的自相矛盾行也无效；
 // 缺事实的行一律继续按写入计忙（fail closed）。
 const maintenanceCleanupRow = row => Boolean(row) && row.maintenanceCleanup === true && row.remoteMutation === true && row.readObserver !== true;
