@@ -89,10 +89,10 @@ function normalizeResourceTarget(value) {
     const project = normalizedPath(value.project), target = normalizedPath(value.target || value.project);
     if (!within(project, target))
         throw new Error("资源锁目标不在对应项目内。");
-    return { server, project, target };
+    return { server, project, target, ...(value.access === "read" ? { access: "read" } : {}) };
 }
 function resourceTargetsConflict(a, b) {
-    return a.some(x => b.some(y => x.server === y.server && (within(x.target, y.target) || within(y.target, x.target))));
+    return a.some(x => b.some(y => !(x.access === "read" && y.access === "read") && x.server === y.server && (within(x.target, y.target) || within(y.target, x.target))));
 }
 async function canonicalResourceTarget(value) {
     const normalized = normalizeResourceTarget(value);
@@ -118,7 +118,7 @@ async function canonicalResourceTarget(value) {
             }
         }
     }
-    return normalizeResourceTarget({ server: "local", project: await physical(normalized.project), target: await physical(normalized.target) });
+    return normalizeResourceTarget({ server: "local", project: await physical(normalized.project), target: await physical(normalized.target), access: normalized.access });
 }
 /** Per-window bakery admission protects only registry writes, never business operations.
  * Registry release and crash recovery are logical: no filesystem cleanup is required.
@@ -183,7 +183,7 @@ class ResourceOperationLeaseManager {
                 const row = await this.readRegistry(source);
                 const oldPid = row.processId ?? Number(row.windowId.split(":")[1]);
                 // Released registries only. Unknown or live owners and recovery records stay protected.
-                if (!Number.isInteger(oldPid) || oldPid <= 0 || oldPid === this.processId || row.leases.length || row.choosing || row.ticket ||
+                if (row.pendingCleanupKey || !Number.isInteger(oldPid) || oldPid <= 0 || oldPid === this.processId || row.leases.length || row.choosing || row.ticket ||
                     row.admissionExpiresAt > this.now() || this.ownerAlive({ processId: oldPid }))
                     continue;
                 // Atomic rename claims one idle slot: two new owners cannot both consume the source.
@@ -334,13 +334,96 @@ class ResourceOperationLeaseManager {
             await handle.release();
         }
     }
+    async reservePendingCleanup(key, input) {
+        return this.reservePendingOperation(key, input, "cleanup");
+    }
+    async reservePendingTransfer(key, input) {
+        return this.reservePendingOperation(key, input, "transfer");
+    }
+    async reservePendingOperation(key, input, kind) {
+        if (!String(key || "").trim()) throw new Error("清理范围缺少请求身份。");
+        const targets = await Promise.all(input.resources.map(canonicalResourceTarget));
+        if (!targets.length) throw new Error("清理范围缺少目标路径。");
+        const file = path.join(this.directory, crypto.createHash("sha256").update("cleanup:" + key).digest("hex") + ".json");
+        return this.admission(async rows => {
+            let previous;
+            try { previous = await this.readRegistry(file); }
+            catch (error) { if (error.code !== "ENOENT") throw error; }
+            if (previous && (previous.pendingCleanupKey !== key || previous.leases.length))
+                throw Object.assign(new Error("清理请求仍在执行或结果未知，不能重复执行。"), { code: "RESOURCE_CONFLICT" });
+            const parents = contexts.getStore() || [];
+            for (const row of rows) for (const lease of row.leases) {
+                if (kind === "transfer" && parents.some(parent => parent.leaseId === lease.leaseId && parent.resourceFile === lease.resourceFile)) continue;
+                if ((lease.pendingCleanup === true || lease.pendingTransfer === true || Date.parse(lease.expiresAt) > this.now() && this.ownerAlive(lease)) && resourceTargetsConflict(targets, lease.resources)) {
+                    const error = this.options.conflictError?.(lease) || new Error("清理目标与正在执行的文件操作冲突。");
+                    error.message = `目标与在途操作冲突：${lease.resources.map(resource => resource.target).join("、")}；操作 ${lease.actionLabel || lease.actionType}。`;
+                    error.code = "RESOURCE_CONFLICT"; throw error;
+                }
+            }
+            const lease = { ...input, resources: targets, leaseId: key, resourceFile: file,
+                ...(kind === "cleanup" ? { pendingCleanup: true } : { pendingTransfer: true }),
+                windowId: this.windowId, processId: this.processId, heartbeatAt: new Date(this.now()).toISOString(),
+                actionLabel: input.actionLabel || input.actionType, expiresAt: "9999-12-31T23:59:59.999Z" };
+            const record = { schemaVersion: 2, windowId: this.windowId, processId: this.processId,
+                pendingCleanupKey: key, ticket: 0, choosing: false, admissionExpiresAt: 0, leases: [lease] };
+            const text = JSON.stringify(record);
+            await (0, StateStore_1.atomicWriteText)(file + ".ownership", text);
+            await (0, StateStore_1.atomicWriteText)(file, text);
+            return lease;
+        });
+    }
+    async runPendingTransfer(key, input, work, onAdmitted) {
+        const targets = await Promise.all(input.resources.map(canonicalResourceTarget));
+        const parents = contexts.getStore() || [];
+        const parent = parents.find(row => row.pendingTransfer === true && targets.every(target => row.resources.some(held =>
+            held.server === target.server && (held.access !== "read" || target.access === "read") && within(held.target, target.target))));
+        if (parent) return { borrowed: true, value: await work() };
+        const record = await this.reservePendingTransfer(key, input);
+        onAdmitted();
+        return { borrowed: false, value: await contexts.run([...parents, record], work) };
+    }
+    async resolvePendingCleanup(key) {
+        const file = path.join(this.directory, crypto.createHash("sha256").update("cleanup:" + key).digest("hex") + ".json");
+        return this.admission(async () => {
+            let row;
+            try { row = await this.readRegistry(file); }
+            catch (error) { if (error.code === "ENOENT") return; throw error; }
+            if (row.pendingCleanupKey !== key) throw new Error("清理资源登记身份不匹配。");
+            row.leases = [];
+            const text = JSON.stringify(row);
+            await (0, StateStore_1.atomicWriteText)(file + ".ownership", text);
+            await (0, StateStore_1.atomicWriteText)(file, text);
+        });
+    }
+    validPendingTransferKey(operationId, key) {
+        const prefix = "transfer:" + String(operationId || "") + ":";
+        return Boolean(operationId && typeof key === "string" && key.startsWith(prefix)
+            && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(key.slice(prefix.length)));
+    }
+    async resolvePendingTransfer(key, operationId) {
+        if (!this.validPendingTransferKey(operationId, key)) throw new Error("传输资源登记身份不匹配。");
+        const file = path.join(this.directory, crypto.createHash("sha256").update("cleanup:" + key).digest("hex") + ".json");
+        return this.admission(async () => {
+            let row;
+            try { row = await this.readRegistry(file); }
+            catch (error) { if (error.code === "ENOENT") return; throw error; }
+            if (row.pendingCleanupKey !== key || row.leases.length > 1 || row.leases.some(lease =>
+                lease.leaseId !== key || lease.pendingTransfer !== true || lease.pendingCleanup === true))
+                throw new Error("传输资源登记类型或身份不匹配。");
+            if (!row.leases.length) return;
+            row.leases = [];
+            const text = JSON.stringify(row);
+            await (0, StateStore_1.atomicWriteText)(file + ".ownership", text);
+            await (0, StateStore_1.atomicWriteText)(file, text);
+        });
+    }
     async acquire(input) {
         const targets = await Promise.all((input.resources?.length ? input.resources : [{ server: "local", project: input.hostProjectPath }]).map(canonicalResourceTarget));
         for (const field of ["pluginId", "workspaceUri", "hostProjectPath", "actionType"])
             if (!String(input[field] || "").trim())
                 throw new Error(`资源锁缺少 ${field}。`);
         const parents = contexts.getStore() || [];
-        const parent = parents.find(row => row.windowId === this.windowId && row.resourceFile === this.file && targets.every((target) => row.resources.some((held) => held.server === target.server && within(held.target, target.target))));
+        const parent = parents.find(row => row.windowId === this.windowId && row.resourceFile === this.file && targets.every((target) => row.resources.some((held) => held.server === target.server && (held.access !== "read" || target.access === "read") && within(held.target, target.target))));
         if (parent)
             return { record: parent, assertHeld: () => this.assertOwned(parent), release: async () => undefined };
         const time = this.now();
@@ -354,8 +437,10 @@ class ResourceOperationLeaseManager {
                     input.signal?.throwIfAborted();
                     for (const row of rows)
                         for (const lease of row.leases) {
-                            if (Date.parse(lease.expiresAt) > this.now() && this.ownerAlive(lease) && resourceTargetsConflict(targets, lease.resources)) {
+                            if (lease.pendingTransfer === true && input.settlementKeys?.includes(lease.leaseId)) continue;
+                            if ((lease.pendingCleanup === true || lease.pendingTransfer === true || Date.parse(lease.expiresAt) > this.now() && this.ownerAlive(lease)) && resourceTargetsConflict(targets, lease.resources)) {
                                 const conflict = this.options.conflictError?.(lease) || new Error(`目标正在由 ${lease.windowId} 的“${lease.actionLabel}”修改，请等待该操作完成后重试。`);
+                                if (lease.pendingCleanup === true || lease.pendingTransfer === true) conflict.message = `目标与未结算操作冲突：${lease.resources.map(resource => resource.target).join("、")}；请求 ${lease.leaseId}。请查询该操作的实际状态后重试。`;
                                 conflict.code = "RESOURCE_CONFLICT";
                                 throw conflict;
                             }

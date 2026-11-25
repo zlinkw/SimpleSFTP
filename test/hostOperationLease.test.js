@@ -31,6 +31,46 @@ test('same file and parent/child directory conflict; sibling-prefix is independe
   }
   const sibling=await f.manager('b').acquire(f.input('D:/project/output-other'));await sibling.release();await held.release();
 });
+test('pending cleanup survives owner loss and conflicts only on overlapping paths until resolved',async()=>{
+  const f=fixture(), owner=f.manager('cleanup-owner',{processId:1234}), next=f.manager('next',{ownerAlive:()=>false});
+  await owner.reservePendingCleanup('operation:0',f.input('D:/project/output'));
+  for(const target of ['D:/project/output','D:/project/output/result','D:/project'])
+    await assert.rejects(next.acquire(f.input(target)),HostOperationLeaseConflictError);
+  const sibling=await next.acquire(f.input('D:/project/other'));await sibling.release();
+  await assert.rejects(next.reservePendingCleanup('operation:0',f.input('D:/project/output')),/重复执行/);
+  await next.resolvePendingCleanup('operation:0');
+  const released=await next.acquire(f.input('D:/project/output'));await released.release();
+  const transfer=await next.acquire(f.input('D:/project/output/file'));
+  await assert.rejects(owner.reservePendingCleanup('operation:1',f.input('D:/project/output')),HostOperationLeaseConflictError);
+  await transfer.release();
+});
+test('transfer settlement cannot release cleanup or another transfer identity',async()=>{
+  const f=fixture(), owner=f.manager('owner'), next=f.manager('next');
+  const operation='op-a', key='transfer:op-a:12345678-1234-4123-8123-123456789abc';
+  const cleanup='cleanup-request:batch';
+  const cleanupShapedLikeTransfer='transfer:op-a:12345678-1234-4123-8123-123456789abd';
+  await owner.reservePendingCleanup(cleanup,f.input('D:/project/cleanup'));
+  await owner.reservePendingCleanup(cleanupShapedLikeTransfer,f.input('D:/project/other-cleanup'));
+  await owner.reservePendingTransfer(key,f.input('D:/project/upload'));
+  await assert.rejects(owner.resolvePendingTransfer(cleanup,operation),/身份不匹配/);
+  await assert.rejects(owner.resolvePendingTransfer(cleanupShapedLikeTransfer,operation),/类型或身份不匹配/);
+  await assert.rejects(owner.resolvePendingTransfer(key,'op-b'),/身份不匹配/);
+  await assert.rejects(next.acquire(f.input('D:/project/cleanup')),HostOperationLeaseConflictError);
+  await assert.rejects(next.acquire(f.input('D:/project/other-cleanup')),HostOperationLeaseConflictError);
+  await assert.rejects(next.acquire(f.input('D:/project/upload')),HostOperationLeaseConflictError);
+  await owner.resolvePendingTransfer(key,operation); await owner.resolvePendingTransfer(key,operation);
+  const upload=await next.acquire(f.input('D:/project/upload'));await upload.release();
+  await assert.rejects(next.acquire(f.input('D:/project/cleanup')),HostOperationLeaseConflictError);
+  await owner.resolvePendingCleanup(cleanup);
+  await owner.resolvePendingCleanup(cleanupShapedLikeTransfer);
+});
+test('shared reads coexist but conflict with a writer on the same range',async()=>{
+  const f=fixture(), first=f.manager('first'), second=f.manager('second');
+  const input=f.input('D:/project/output');input.resources[0].access='read';
+  const a=await first.acquire(input), b=await second.acquire(input);
+  await assert.rejects(second.acquire(f.input('D:/project/output/child')),HostOperationLeaseConflictError);
+  await a.release();await b.release();
+});
 test('simultaneous conflicting claims admit exactly one writer',async()=>{
   const f=fixture();const result=await Promise.allSettled(['a','b','c'].map(id=>f.manager(id).acquire(f.input())));
   assert.equal(result.filter(r=>r.status==='fulfilled').length,1);
@@ -46,6 +86,22 @@ test('same-window unrelated work is parallel; only genuine nested operations ree
   });
   const held=await a.acquire(f.input());
   await assert.rejects(a.acquire(f.input()),HostOperationLeaseConflictError);await held.release();
+});
+test('nested transfer phases borrow the enclosing pending range',async()=>{
+  const f=fixture(),owner=f.manager('owner'),other=f.manager('other'),whole=f.input('D:/project/output'),child=f.input('D:/project/output/a.csv');
+  whole.resources.push({server:'worker:22',project:'/project',target:'/project/output',access:'read'});
+  child.resources.push({server:'worker:22',project:'/project',target:'/project/output/a.csv',access:'read'});
+  await owner.run(whole,async()=>{
+    await owner.runPendingTransfer('whole',whole,async()=>{
+      await owner.run(child,async()=>{
+        const nested=await owner.runPendingTransfer('child',child,async()=>42,()=>assert.fail('covered phase must borrow'));
+        assert.equal(nested.borrowed,true);assert.equal(nested.value,42);
+      });
+      await assert.rejects(other.acquire(child),HostOperationLeaseConflictError);
+      const independent=await other.acquire(f.input('D:/project/other'));await independent.release();
+    },()=>{});
+    await owner.resolvePendingCleanup('whole');
+  });
 });
 test('read-only queries bypass writers and stop callbacks need no resource admission',async()=>{
   const f=fixture(), a=f.manager('a'), b=f.manager('b');const held=await a.acquire(f.input());
