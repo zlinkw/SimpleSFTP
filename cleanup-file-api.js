@@ -359,28 +359,53 @@ async function ensureConsumerCleanupDir(consumerRoot) {
 const sameNode = (a, b) => Boolean(a && b) && ["kind", "root", "host", "port", "user"].every(field => String(a[field] ?? "") === String(b[field] ?? ""))
   && (a.id === undefined || a.id === null || a.id === "" || b.id === undefined || b.id === null || b.id === "" || String(a.id) === String(b.id));
 
+function observationScope(node, items) {
+  const windows = node.kind === "local" && (/^[a-z]:[\\/]/i.test(node.root) || node.root.startsWith("\\\\"));
+  const paths = new Set();
+  for (const item of items) for (const rel of [item.relativePath, item.isolationRelativePath]) if (rel !== undefined) {
+    let value = windows ? path.win32.resolve(node.root, rel).replace(/\\/g, "/").toLowerCase() : path.posix.resolve(node.root, rel);
+    paths.add(value.replace(/\/$/, "") || "/");
+  }
+  return { node, paths };
+}
+function observationScopesOverlap(a, b) {
+  if (a.node.kind !== b.node.kind) return false;
+  if (a.node.kind === "remote" && (String(a.node.host || "").toLowerCase() !== String(b.node.host || "").toLowerCase()
+      || Number(a.node.port || 22) !== Number(b.node.port || 22))) return false;
+  const containsAncestor = (paths, other) => {
+    for (const value of paths) {
+      let part = value;
+      for (;;) {
+        if (other.has(part)) return true;
+        const slash = part.lastIndexOf("/");
+        if (slash < 0 || part === "/") break;
+        part = slash === 0 ? "/" : part.slice(0, slash);
+      }
+    }
+    return false;
+  };
+  return containsAncestor(a.paths, b.paths) || containsAncestor(b.paths, a.paths);
+}
+
 /** A path capability authorizes one frozen batch, never a later or remembered path. */
 class CleanupFileApi {
-  /** ONE instance per window stays the design: observe slots, busy set and leases are global
-   * read/mutation guards and must not be split into per-project instances. storageRoot is the
+  /** ONE instance per window stays the design: scoped observe slots, busy set and leases
+   * must not be split into per-project instances. storageRoot is the
    * LEGACY global folder, kept ONLY as the read-only byte source for exact digest-verified
    * imports; every new record lives under the consuming project's managed tree. */
   constructor({ storageRoot, transport, activity, lease }) {
     this.storageRoot = storageRoot; this.transport = transport; this.activity = activity; this.lease = lease;
     this.previews = new Map(); this.busy = new Set(); this.localExecutions = new Map();
-    this.observeInFlight = 0; this.observeWaiters = []; this.ledgerChains = new Map();
+    this.observeInFlight = 0; this.observeActive = new Set(); this.observeWaiters = []; this.ledgerChains = new Map();
   }
-  /** Shared read-only in-flight budget for the whole API instance: exactly two
-   *  engine reads at once, independent of any request's readConcurrency. Each
-   *  request bounds only itself through its batch windows, so two concurrent
-   *  readConcurrency=1 rounds may legitimately hold both global slots together,
-   *  while readConcurrency=2 rounds can never stack past two. The finally path
-   *  releases the slot on failed reads so later rounds keep running. */
-  async observeSlot(run) {
-    while (this.observeInFlight >= 2) await new Promise(resolve => this.observeWaiters.push(resolve));
+  /** Overlapping request scopes share two read slots; independent scopes proceed. */
+  async observeSlot(scope, run) {
+    while ([...this.observeActive].filter(active => observationScopesOverlap(active.scope, scope)).length >= 2)
+      await new Promise(resolve => this.observeWaiters.push(resolve));
+    const active = { scope }; this.observeActive.add(active);
     this.observeInFlight += 1;
     try { return await run(); }
-    finally { this.observeInFlight -= 1; const next = this.observeWaiters.shift(); if (next) next(); }
+    finally { this.observeInFlight -= 1; this.observeActive.delete(active); this.observeWaiters.splice(0).forEach(resolve => resolve()); }
   }
   async checked(request) {
     const value = await this.transport(copy(request));
@@ -851,7 +876,8 @@ class CleanupFileApi {
     }
     // Original and its explicit isolation probe travel together; batches are
     // capped in EXPANDED entries (engine FAST_BATCH_LIMIT parity) and issued
-    // inside the caller's read budget, instance-capped at two in flight.
+    // inside the caller's read budget and the overlapping request-scope budget.
+    const scope = observationScope(node, planned);
     const groups = new Map();
     for (const item of planned) {
       const id = item.rootIdentity === undefined ? "absent" : hash(item.rootIdentity);
@@ -878,7 +904,7 @@ class CleanupFileApi {
           ...(item.inode === undefined ? {} : { inode: item.inode }),
           ...(item.isolationRelativePath === undefined ? {} : { isolationRelativePath: item.isolationRelativePath }) }));
         const rootIdentity = part.items[0].rootIdentity;
-        return this.observeSlot(() => this.checked({ node, root: node.root,
+        return this.observeSlot(scope, () => this.checked({ node, root: node.root,
           ...(rootIdentity === undefined ? {} : { rootIdentity }), action: "batch-observe", observationId, entries }));
       }));
       settled.forEach((outcome, k) => {

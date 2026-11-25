@@ -75,6 +75,59 @@ async function confirmed(api,targets){
 const observe=(api,targets,options={})=>api.observeBatch({consumerRoot: __CONSUMER__, node:options.node||NODE,observationId:options.observationId||'round-1',
   readConcurrency:options.readConcurrency??2,...(options.rootIdentity===undefined?{}:{rootIdentity:options.rootIdentity}),targets});
 
+test('an independent observation enters while two overlapping reads are held',async()=>{
+  const {api}=harness();
+  const original=api.transport;
+  let release, entered=0, independent=false;
+  const held=new Promise(resolve=>{release=resolve;});
+  let bothEntered;
+  const both=new Promise(resolve=>{bothEntered=resolve;});
+  api.transport=async request=>{
+    if(request.action==='batch-observe' && request.observationId.startsWith('held')) {
+      if(++entered===2) bothEntered();
+      await held;
+    }
+    if(request.action==='batch-observe' && request.observationId==='independent') independent=true;
+    return original(request);
+  };
+  const target=rel=>[{key:'item',relativePath:rel,type:'file'}];
+  const running=[observe(api,target('out/shared'),{observationId:'held-a'}),
+    observe(api,target('out/shared/child'),{observationId:'held-b'})];
+  try {
+    await Promise.race([both,Promise.all(running).then(()=>{throw Error('held reads ended early');})]);
+    running.push(observe(api,target('other/item'),{observationId:'independent'}));
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(independent,true,'unrelated target reaches transport before held reads finish');
+  } finally {
+    release();
+    await Promise.allSettled(running);
+    api.transport=original;
+  }
+  assert.equal(api.observeInFlight,0);
+});
+test('overlapping remote roots share observation slots with the default SSH port',async()=>{
+  const {api}=harness(),original=api.transport;
+  let release,entered=0,third=false,bothEntered;
+  const held=new Promise(resolve=>{release=resolve;}),both=new Promise(resolve=>{bothEntered=resolve;});
+  api.transport=async request=>{
+    if(request.action==='batch-observe' && request.observationId.startsWith('held')) {
+      if(++entered===2) bothEntered();
+      await held;
+    }
+    if(request.action==='batch-observe' && request.observationId==='third') third=true;
+    return original(request);
+  };
+  const node={kind:'remote',root:'/srv/proj',host:'example',user:'u'},target=rel=>[{key:'x',relativePath:rel,type:'file'}];
+  const running=[observe(api,target('out/item'),{node,observationId:'held-a'}),observe(api,target('out/item'),{node,observationId:'held-b'})];
+  try {
+    await Promise.race([both,Promise.all(running).then(()=>{throw Error('held reads ended early');})]);
+    running.push(observe(api,target('proj/out/item'),{node:{...node,root:'/srv',port:22,user:'other'},observationId:'third'}));
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(third,false,'ancestor root and default port identify the same target scope across accounts');
+  } finally { release(); await Promise.allSettled(running); api.transport=original; }
+  assert.equal(third,true);assert.equal(api.observeInFlight,0);
+});
+
 test('one round answers 1200 residue dirs in ONE expanded batch with the contract echo',async()=>{
   const {api,calls,stats}=harness();
   const res=await observe(api,residue(1200),{observationId:'round-a'});
