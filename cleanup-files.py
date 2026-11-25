@@ -1354,10 +1354,12 @@ def batch_verify(root, identity, request):
         rel = item.get("relativePath") if isinstance(item, dict) else None
         if not isinstance(rel, str):
             deny("UNSAFE_PATH")
+        if item.get("type") not in ("file", "directory"):
+            deny("INVALID_TARGET")
         relative(rel)
         full = path_guard(root, rel, allow_clean=bool(ARCHIVED_BATCH_RE.match(rel)), missing=True)
         if not os.path.lexists(full):
-            rows.append({"relativePath": rel, "status": "gone"})
+            rows.append({"relativePath": rel, "type": item["type"], "status": "gone"})
             continue
         st = os.lstat(full)
         same = (item.get("device") is None or str(st.st_dev) == str(item["device"])) \
@@ -1536,8 +1538,11 @@ def inspect_isolation_parents(root, identity, request):
     destinations = request.get("destinations")
     paths = isolation_parent_paths(destinations)
     future = request.get("forReplacement") is True
-    if not future and any((isolation_state(root, destination) or {}).get("state") != "deleted" for destination in destinations):
-        return {"ok": True, "rootIdentity": identity, "eligible": False, "targets": []}
+    if not future:
+        for destination in destinations:
+            full = path_guard(root, destination, True, True)
+            if os.path.lexists(full) or current_cleanup_executors(root, full):
+                return {"ok": True, "rootIdentity": identity, "eligible": False, "targets": []}
     targets = []
     for rel in paths:
         full = path_guard(root, rel, True, True)
@@ -1570,8 +1575,10 @@ def prune_isolation_parents(root, identity, request):
     if request.get("rootIdentity") != identity or request.get("parentConfirmations") != 2:
         deny("CONFIRM_REQUIRED")
     allowed = set(isolation_parent_paths(request.get("destinations")))
-    if any((isolation_state(root, destination) or {}).get("state") != "deleted" for destination in request["destinations"]):
-        deny("ISOLATION_DELETE_NOT_COMPLETED")
+    for destination in request["destinations"]:
+        full = path_guard(root, destination, True, True)
+        if os.path.lexists(full) or current_cleanup_executors(root, full):
+            deny("ISOLATION_DELETE_NOT_COMPLETED")
     entries = request.get("entries")
     if not isinstance(entries, list) or not all(isinstance(row, dict) for row in entries) or len(entries) > 5000 or len({row.get("relativePath") for row in entries}) != len(entries):
         deny("EMPTY_ISOLATION_SCOPE_INVALID")
@@ -1608,7 +1615,8 @@ def prune_isolation_parents(root, identity, request):
         if read_control_json(root, isolation_parent_control(rel)):
             write_control_json(root, isolation_parent_control(rel), {"removed": True})
     return {"ok": True, "state": "completed", "rootIdentity": identity,
-            "receipt": {"phase": "completed", "emptyDirectoriesRemoved": removed}}
+            "receipt": {"operationId": request.get("operationId"), "action": "prune-isolation-parents",
+                        "phase": "completed", "emptyDirectoriesRemoved": removed}}
 
 
 def fast_tree_remove(root, entry_abs, allow_clean, stats):
