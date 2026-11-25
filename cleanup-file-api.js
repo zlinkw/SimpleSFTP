@@ -1012,7 +1012,7 @@ class CleanupFileApi {
         row.parentOutcome = "executing"; await this.save(row);
         let result;
         try { result = await this.checked({ node: row.node, root: row.node.root, rootIdentity: row.rootIdentity,
-          action: "prune-isolation-parents", parentConfirmations: 2, destinations: row.destinations, entries: row.targets }); }
+          action: "prune-isolation-parents", operationId: row.operationId, parentConfirmations: 2, destinations: row.destinations, entries: row.targets }); }
         catch (error) { row.parentOutcome = "unknown"; await this.save(row); throw error; }
         if (result.state !== "completed") fail("CLEANUP_NOT_VERIFIED");
         row.parentOutcome = "completed"; row.isolationParentsCompleted = true; row.parentReceipt = result.receipt;
